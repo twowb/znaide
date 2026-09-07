@@ -104,7 +104,7 @@ Input/output box border colors follow the permission mode (ask=green / acceptEdi
 | `/skills` | List installed skills (with scan warnings) |
 | `/config` | Open config panel (provider/model/endpoint/key, applies instantly) |
 | `/undo` `/undo <n>` | List snapshots / roll back to one |
-| `/resume` `/resume <n\|fragment>` | List / resume history sessions (`[headless]` = created by `-p`) |
+| `/resume` `/resume <n\|fragment>` | **No arg**: opens the full-screen **session manager** ("sessions / memory" tabs: `↑↓` pick, `space` multi-select, `d` batch delete, `n` edit note, `/` filter, Enter resume/view; the current session can't be deleted). **With arg**: resume that session directly (`[headless]` = created by `-p`) |
 | `/clear` | Clear session context + history file (confirmed; unrecoverable) |
 | `/compact` | Compress context: older turns collapsed into a summary, context freed (full history kept for `--resume`) |
 | `/update` | Check & update to the latest GitHub release (`znaide --update` also works; startup auto-checks once). Needs `HTTPS_PROXY` where GitHub is blocked; Linux/macOS replace on next start, Windows swaps after exit |
@@ -218,7 +218,7 @@ Precedence: **CLI args > env vars > config.json > built-in presets**.
 ├─ skills/          user skills (skills/<name>/SKILL.md, may carry scripts/)
 ├─ builtin-skills/  hydrated built-in samples (archive-downloads / clean-junk / weekly-report)
 ├─ personas/        persona files (<name>.md, body = persona description)
-├─ sessions/        session history *.jsonl
+├─ sessions/        session history *.jsonl (may carry a sibling *.meta.json note)
 ├─ memories/        long-term memory (*.md + MEMORY.md index)
 └─ undo/            pre-write snapshots (manifest.jsonl + files/)
 ```

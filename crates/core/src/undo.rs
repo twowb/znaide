@@ -183,15 +183,22 @@ pub fn rollback_by_index(index: usize) -> anyhow::Result<Snapshot> {
 mod tests {
     use super::*;
 
-    /// 把数据目录指向唯一临时目录(进程级 env;测试共享但互不冲突)
-    fn isolate() {
+    /// 把数据目录指向唯一临时目录,并串行化共享 env/manifest 的测试。
+    /// guard 必须存活到测试函数结束(let _g = isolate();)。
+    /// 注意顺序:先拿锁再 set_var——若反过来,等待锁的测试会在持锁者
+    /// 运行中途改写 env,把持锁者的写入引到别的目录(曾有 flaky)。
+    fn isolate() -> std::sync::MutexGuard<'static, ()> {
+        let g = crate::test_util::DATA_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()); // panic 测试不连锁毒化
         let dir = std::env::temp_dir().join(format!("znaide_undo_ut_{}", std::process::id()));
         std::env::set_var("ZNAIDE_DATA_DIR", &dir);
+        g
     }
 
     #[test]
     fn backup_and_rollback_roundtrip() {
-        isolate();
+        let _g = isolate();
         let dir = std::env::temp_dir().join(format!("znaide_undo_fs_{}", std::process::id()));
         let f = dir.join("a.txt");
         std::fs::create_dir_all(&dir).unwrap();
@@ -205,7 +212,7 @@ mod tests {
 
     #[test]
     fn list_is_newest_first() {
-        isolate();
+        let _g = isolate();
         let snaps = list();
         for w in snaps.windows(2) {
             assert!(w[0].ts_ms >= w[1].ts_ms);
@@ -214,7 +221,7 @@ mod tests {
 
     #[test]
     fn missing_file_no_backup() {
-        isolate();
+        let _g = isolate();
         let none = backup(Path::new("/nonexistent/xyz-abc.txt"), "write").unwrap();
         assert!(none.is_none());
     }
@@ -222,7 +229,7 @@ mod tests {
     /// 每条新快照的 manifest 记录都带生成器标识(格式演进/排查用)
     #[test]
     fn manifest_records_generator_tag() {
-        isolate();
+        let _g = isolate();
         let dir = std::env::temp_dir().join(format!("znaide_undo_gen_{}", std::process::id()));
         let f = dir.join("g.txt");
         std::fs::create_dir_all(&dir).unwrap();
@@ -243,12 +250,18 @@ mod tests {
     /// 老格式清单(无 gen 字段)照常读取,gen 为 None——向后兼容
     #[test]
     fn legacy_manifest_without_gen_still_reads() {
-        isolate();
+        // 独立数据目录:老格式行(ts=1)会破坏 list_is_newest_first 的
+        // 降序断言,不能写进共享清单(先锁后设 env,临界区内 var 私有)
+        let g = crate::test_util::DATA_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("znaide_undo_legacy_{}", std::process::id()));
+        std::env::set_var("ZNAIDE_DATA_DIR", &dir);
         let path = manifest_path();
         if let Some(p) = path.parent() {
             std::fs::create_dir_all(p).unwrap();
         }
-        // 追加老格式行(不覆盖/删除共享清单,避免影响并行测试)
+        // 追加老格式行
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
             .create(true)
@@ -268,6 +281,8 @@ mod tests {
             .expect("老格式行应能读取");
         assert_eq!(old.orig, "/a");
         assert_eq!(old.gen, None);
+        std::fs::remove_dir_all(&dir).ok();
+        drop(g);
     }
 
     /// 外部来源标注:本版本 gen / 无 gen(老快照)不算;异源 gen 才算

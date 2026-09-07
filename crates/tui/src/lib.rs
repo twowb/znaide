@@ -4,6 +4,7 @@ pub mod ansi;
 pub mod app;
 pub mod md;
 pub mod config_ui;
+pub mod sessions_ui;
 
 use znaide_core::config::Resolved;
 use znaide_core::permissions::Mode;

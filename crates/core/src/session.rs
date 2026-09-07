@@ -1215,11 +1215,13 @@ fn memory_hint() -> String {
     }
 }
 
-/// 一条历史会话(带无头标识)
+/// 一条历史会话(带无头标识与用户备注)
 pub struct HistoryEntry {
     pub path: PathBuf,
     /// 命令行无头模式(-p)产生的会话(文件首行 meta 标记)
     pub headless: bool,
+    /// 用户备注(会话旁 <id>.meta.json 的 note;无备注为 None)
+    pub note: Option<String>,
 }
 
 /// 解析历史文件首行的会话元数据(仅 headless 标志;旧文件无 meta 视为交互会话)
@@ -1247,6 +1249,66 @@ fn entry_headless(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// 会话备注 sidecar 路径:<id>.jsonl → 同目录 <id>.meta.json。
+/// sidecar 是独立小文件(原子写),jsonl 保持纯消息流;jsonl 首行 meta 只放
+/// headless/schema 这类随文件一生不变的内容(改备注不重写大文件,/clear
+/// 截断 jsonl 也不丢备注)。
+fn note_sidecar_path(jsonl: &Path) -> PathBuf {
+    let stem = jsonl.file_stem().unwrap_or_default();
+    jsonl.with_file_name(format!("{}.meta.json", stem.to_string_lossy()))
+}
+
+/// 读会话备注:无 sidecar / 坏 JSON / 空文本一律 None(不报错)。
+pub fn read_note(jsonl: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(note_sidecar_path(jsonl)).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let note = v.get("note")?.as_str()?.trim();
+    if note.is_empty() {
+        None
+    } else {
+        Some(note.to_string())
+    }
+}
+
+/// 写会话备注(空文本 = 删除 sidecar)。原子:同目录临时文件 + rename,
+/// 避免写一半崩溃留下坏 JSON。
+pub fn write_note(jsonl: &Path, note: &str) -> std::io::Result<()> {
+    let path = note_sidecar_path(jsonl);
+    let note = note.trim();
+    if note.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        };
+    }
+    let body = serde_json::json!({ "note": note }).to_string();
+    let tmp = path.with_extension("tmp"); // <id>.meta.tmp,不会被会话列表扫到
+    std::fs::write(&tmp, body)?;
+    match std::fs::rename(&tmp, &path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// 删除会话文件及其备注 sidecar(/resume del、空壳清理共用;幂等)。
+pub fn remove_session(jsonl: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(jsonl) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    match std::fs::remove_file(note_sidecar_path(jsonl)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    Ok(())
+}
+
 /// 列出 ~/.znaide/sessions 下所有历史会话(带无头标识,供 /resume)。
 /// 空文件(0 字节,旧版本遗留的空壳)没有恢复价值,直接跳过。
 pub fn list_history_sessions_detailed() -> Vec<HistoryEntry> {
@@ -1258,9 +1320,11 @@ pub fn list_history_sessions_detailed() -> Vec<HistoryEntry> {
             if p.extension().map(|x| x == "jsonl").unwrap_or(false)
                 && e.metadata().map(|m| m.len() > 0).unwrap_or(false)
             {
+                let note = read_note(&p);
                 out.push(HistoryEntry {
                     headless: entry_headless(&p),
                     path: p,
+                    note,
                 });
             }
         }
@@ -1300,7 +1364,7 @@ pub fn prune_empty_sessions() -> usize {
         let p = e.path();
         if p.extension().map(|x| x == "jsonl").unwrap_or(false)
             && e.metadata().map(|m| m.len() == 0).unwrap_or(false)
-            && std::fs::remove_file(&p).is_ok()
+            && remove_session(&p).is_ok()
         {
             removed += 1;
         }
@@ -1400,6 +1464,97 @@ mod tests {
         assert!(!super::entry_headless(&dir.join("not_exist.jsonl")), "文件缺失不应 panic");
         std::fs::remove_file(&h).ok();
         std::fs::remove_file(&i).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---------- 会话备注(sidecar <id>.meta.json) ----------
+
+    /// 写读 roundtrip、覆盖更新、空文本清除(删除 sidecar)
+    #[test]
+    fn note_write_read_overwrite_clear() {
+        let dir = std::env::temp_dir().join(format!("znaide_note_ut_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sess = dir.join("s1.jsonl");
+        std::fs::write(&sess, "{\"meta\":{\"headless\":false}}\n").unwrap();
+
+        // 初始无备注
+        assert_eq!(super::read_note(&sess), None, "无 sidecar → None");
+        // 写入 → 读回;首尾空白应裁剪
+        super::write_note(&sess, "  给 README 做英文版  ").unwrap();
+        assert_eq!(super::read_note(&sess).as_deref(), Some("给 README 做英文版"));
+        // sidecar 落在 <id>.meta.json,不改动 jsonl 本体
+        assert!(dir.join("s1.meta.json").exists());
+        assert!(!dir.join("s1.meta.json.tmp").exists(), "临时文件应已改名");
+        assert_eq!(
+            std::fs::read_to_string(&sess).unwrap(),
+            "{\"meta\":{\"headless\":false}}\n",
+            "jsonl 内容不得被备注写入触碰"
+        );
+        // 覆盖更新
+        super::write_note(&sess, "改成英文 README 的会话").unwrap();
+        assert_eq!(super::read_note(&sess).as_deref(), Some("改成英文 README 的会话"));
+        // 空文本 = 清除
+        super::write_note(&sess, "   ").unwrap();
+        assert_eq!(super::read_note(&sess), None, "空备注应清除");
+        assert!(!dir.join("s1.meta.json").exists(), "sidecar 应被删除");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 坏 JSON / 缺字段 → None,不 panic
+    #[test]
+    fn note_bad_sidecar_gives_none() {
+        let dir = std::env::temp_dir().join(format!("znaide_note_bad_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sess = dir.join("s2.jsonl");
+        std::fs::write(&sess, "x").unwrap();
+        // 坏 JSON
+        std::fs::write(dir.join("s2.meta.json"), "{not json").unwrap();
+        assert_eq!(super::read_note(&sess), None, "坏 JSON → None");
+        // JSON 但无 note 字段
+        std::fs::write(dir.join("s2.meta.json"), "{\"other\":1}").unwrap();
+        assert_eq!(super::read_note(&sess), None);
+        // note 是空串
+        std::fs::write(dir.join("s2.meta.json"), "{\"note\":\"\"}").unwrap();
+        assert_eq!(super::read_note(&sess), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 删除会话(jsonl)时 sidecar 一并删;缺失文件幂等
+    #[test]
+    fn remove_session_deletes_jsonl_and_sidecar() {
+        let dir = std::env::temp_dir().join(format!("znaide_note_del_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sess = dir.join("s3.jsonl");
+        std::fs::write(&sess, "x").unwrap();
+        super::write_note(&sess, "要删的备注").unwrap();
+        assert!(dir.join("s3.meta.json").exists());
+        super::remove_session(&sess).unwrap();
+        assert!(!sess.exists(), "jsonl 应被删");
+        assert!(!dir.join("s3.meta.json").exists(), "sidecar 应一并删");
+        // 幂等:再删不报错
+        super::remove_session(&sess).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 空壳清理(0 字节 jsonl)应把孤儿 sidecar 一起清掉
+    #[test]
+    fn prune_empty_sessions_removes_sidecar_too() {
+        // 依赖 ZNAIDE_DATA_DIR:与 undo 测试共用同一把锁串行(先锁后设 env)
+        let _g = crate::test_util::DATA_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("znaide_sess_prune_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sessions")).unwrap();
+        std::env::set_var("ZNAIDE_DATA_DIR", &dir);
+        let sess = dir.join("sessions").join("ghost.jsonl");
+        std::fs::write(&sess, "").unwrap();
+        super::write_note(&sess, "孤儿备注").unwrap();
+        assert_eq!(super::prune_empty_sessions(), 1, "应清掉 1 个空壳");
+        assert!(!sess.exists());
+        assert!(
+            !dir.join("sessions").join("ghost.meta.json").exists(),
+            "孤儿 sidecar 应随空壳一起删"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

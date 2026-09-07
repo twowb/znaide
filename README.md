@@ -110,7 +110,7 @@ make build-all          # 六平台一次构建(缺工具链自动跳过;android
 | `/skills` | 列出已安装技能(含扫描告警) |
 | `/config` | 打开配置面板(随时改 provider/模型/端点/Key,立即生效) |
 | `/undo` `/undo <序号>` | 列出快照 / 回滚到指定版本 |
-| `/resume` `/resume <序号\|片段>` | 列出 / 恢复历史会话(列表标 `[无头]` = 命令行 `-p` 产生的会话,并显示总数) |
+| `/resume` `/resume <序号\|片段>` | **无参**:打开全屏**会话管理窗口**(「历史会话/长期记忆」页签:↑↓ 选择、空格多选、`d` 批量删除、`n` 改备注、`/` 过滤、Enter 恢复/查看,当前会话禁删);**带参**:直接恢复该历史会话(`[无头]` = 命令行 `-p` 产生) |
 | `/clear` | 清空会话上下文与历史文件(需确认,不可恢复) |
 | `/compact` | 压缩上下文:旧对话收敛为一段中文摘要,上下文回到低位(历史档案完整保留)。压缩过程不可中断:状态栏「压缩中…」+ 收纳推进条动画,消息区忙行提示约需数秒~数十秒,完成/失败均有结果提示 |
 | `/update` | 检查并更新到 GitHub 最新版本(启动时也会自动检查一次,发现新版会提示;也可用命令 `znaide --update`)。更新走 GitHub,网络不通时设置 `HTTPS_PROXY` 环境变量;Linux/macOS 替换后下次启动生效,Windows 退出程序后自动完成替换 |
@@ -251,7 +251,7 @@ API Key 也可以完全不进配置文件,用环境变量提供:`DASHSCOPE_API_K
 ├─ config.json      配置(provider / model / base_url / api_key)
 ├─ mcp.json         MCP server 配置(可选)
 ├─ skills/          技能(skills/<名字>/SKILL.md,可带 scripts/)
-├─ sessions/        会话历史 *.jsonl
+├─ sessions/        会话历史 *.jsonl(可有同名 *.meta.json 备注)
 ├─ memories/        长期记忆(*.md + MEMORY.md 索引)
 └─ undo/            写文件前快照(manifest.jsonl + files/)
 ```

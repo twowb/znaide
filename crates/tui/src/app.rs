@@ -13,10 +13,13 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use crate::config_ui::{SetupWizard, WizardAction};
+use crate::sessions_ui::{SessionsUi, UiAction};
 use znaide_core::config::Resolved;
 use znaide_core::llm::OpenAiClient;
 use znaide_core::permissions::Mode;
-use znaide_core::session::{list_history_sessions_detailed, Session, SessionEvent};
+use znaide_core::session::{
+    list_history_sessions_detailed, remove_session, Session, SessionEvent,
+};
 
 /// 配置向导异步结果回传
 enum WizardReply {
@@ -453,6 +456,8 @@ pub async fn run(
     let mut session_id = String::new();
     // 配置向导(None = 对话模式)
     let mut config_wizard: Option<SetupWizard> = None;
+    // 会话管理窗口(/resume 无参打开;None = 对话模式)
+    let mut sessions_ui: Option<SessionsUi> = None;
     // 配置向导异步回传通道
     let (wiz_tx, mut wiz_rx) = mpsc::unbounded_channel::<WizardReply>();
     // 是否已有可用配置(未配置成功时禁止使用)
@@ -542,6 +547,19 @@ pub async fn run(
                         height: avail_bottom.saturating_sub(avail_top).max(1),
                     };
                     wizard.render(f, inner);
+                    return;
+                }
+                // 会话管理窗口:同样覆盖消息+输入+状态区
+                if let Some(su) = &sessions_ui {
+                    let avail_top = chunks[1].y;
+                    let avail_bottom = chunks[3].y;
+                    let inner = Rect {
+                        x: chunks[1].x,
+                        y: avail_top,
+                        width: chunks[1].width,
+                        height: avail_bottom.saturating_sub(avail_top).max(1),
+                    };
+                    su.render(f, inner);
                     return;
                 }
 
@@ -904,6 +922,23 @@ pub async fn run(
                 }
                 continue;
             }
+            // 会话管理窗口模式:按键交给窗口,动作由宿主执行
+            if let Some(mut su) = sessions_ui.take() {
+                match su.on_key(k) {
+                    UiAction::Exit => {
+                        // 关闭窗口回到对话
+                        items.push(MsgItem::Notice("已关闭会话管理(随时 /resume 再开)。".into()));
+                    }
+                    UiAction::Resume(path) => {
+                        let _ = cmd_tx.send(AgentCmd::LoadHistory(path));
+                        items.push(MsgItem::Notice("正在恢复历史会话…".into()));
+                    }
+                    UiAction::None => {
+                        sessions_ui = Some(su);
+                    }
+                }
+                continue;
+            }
             // 光标移动:Home/End 让给滚动了,这里只管 ←/→/Delete
             match k.code {
                 KeyCode::Left => {
@@ -948,7 +983,14 @@ pub async fn run(
                         input.clear();
                         input_cursor = 0;
                     } else if raw.starts_with('/') {
-                        match handle_command(&raw, &cmd_tx, &update_tx, &mut items, &cwd, &mut confirm) {
+                        match handle_command(
+                            &raw,
+                            &cmd_tx,
+                            &update_tx,
+                            &mut items,
+                            &cwd,
+                            &mut confirm,
+                        ) {
                             Some(SlashOutcome::Task(prompt)) => {
                                 if !configured_ok {
                                     items.push(MsgItem::Notice(
@@ -984,6 +1026,10 @@ pub async fn run(
                             Some(SlashOutcome::Quit) => {
                                 // /quit /exit:退出主循环(Ctrl+C 等效);退出后打印会话统计
                                 quit_requested = true;
+                            }
+                            Some(SlashOutcome::OpenSessions) => {
+                                // /resume 无参:打开全屏会话管理窗口
+                                sessions_ui = Some(SessionsUi::open(&session_id));
                             }
                             None => {}
                         }
@@ -1275,6 +1321,8 @@ enum SlashOutcome {
     Compact,
     /// 退出程序(/quit /exit;退出时打印本次会话统计)
     Quit,
+    /// 打开全屏会话管理窗口(/resume 无参)
+    OpenSessions,
 }
 
 /// 处理 slash 命令。返回 Some(结果) 表示应作为任务/技能发给 agent;None 表示内部处理。
@@ -1353,49 +1401,39 @@ fn handle_command(
             items.push(MsgItem::CommandOutput(out));
         }
         "/resume" => {
-            // 带无头标识的完整列表(供展示);paths 供序号/片段匹配
+            // 无参:打开全屏会话管理窗口(会话 / 记忆两个页签,多选批量删除、
+            // 备注编辑、过滤、恢复;Esc 返回)
+            if parts.len() == 1 {
+                return Some(SlashOutcome::OpenSessions);
+            }
+            // 带参数:恢复 / 删除(兼容旧行为,脚本友好)
             let history = list_history_sessions_detailed();
             if history.is_empty() {
                 items.push(MsgItem::CommandOutput("暂无历史会话(~/.znaide/sessions/ 为空)".into()));
                 return None;
             }
             let paths: Vec<PathBuf> = history.iter().map(|h| h.path.clone()).collect();
-            if parts.len() >= 2 {
+            if parts[1] == "del" {
                 // /resume del <序号|片段> 删除历史
-                if parts[1] == "del" {
-                    if parts.len() < 3 {
-                        items.push(MsgItem::CommandOutput("用法:/resume del <序号|文件名片段>".into()));
-                        return None;
-                    }
-                    let target = parts[2];
-                    let matched = match_session(&paths, target);
-                    match matched {
-                        Some(path) => {
-                            match std::fs::remove_file(&path) {
-                                Ok(()) => {
-                                    items.push(MsgItem::Notice(format!(
-                                        "🗑 已删除历史会话: {}",
-                                        path.display()
-                                    )));
-                                }
-                                Err(e) => items.push(MsgItem::CommandOutput(format!(
-                                    "删除失败: {e}"
-                                ))),
-                            }
-                        }
-                        None => {
-                            items.push(MsgItem::CommandOutput(format!("未找到匹配「{target}」的历史会话")));
-                        }
-                    }
+                if parts.len() < 3 {
+                    items.push(MsgItem::CommandOutput("用法:/resume del <序号|文件名片段>".into()));
                     return None;
                 }
-                // 尝试:传入序号或文件路径 → 恢复
-                let target = parts[1];
+                let target = parts[2];
                 let matched = match_session(&paths, target);
                 match matched {
                     Some(path) => {
-                        let _ = cmd_tx.send(AgentCmd::LoadHistory(path));
-                        items.push(MsgItem::Notice("正在恢复历史会话…".into()));
+                        match remove_session(&path) {
+                            Ok(()) => {
+                                items.push(MsgItem::Notice(format!(
+                                    "🗑 已删除历史会话: {}",
+                                    path.display()
+                                )));
+                            }
+                            Err(e) => items.push(MsgItem::CommandOutput(format!(
+                                "删除失败: {e}"
+                            ))),
+                        }
                     }
                     None => {
                         items.push(MsgItem::CommandOutput(format!("未找到匹配「{target}」的历史会话")));
@@ -1403,29 +1441,19 @@ fn handle_command(
                 }
                 return None;
             }
-            let shown = history.len().min(10);
-            let mut out = format!(
-                "历史会话(共 {} 个,最新在前;[无头] = 命令行 -p 产生的会话):\n",
-                history.len()
-            );
-            for (i, h) in history.iter().take(shown).enumerate() {
-                let size = std::fs::metadata(&h.path)
-                    .map(|m| m.len() / 1024)
-                    .unwrap_or(0);
-                let stem = h
-                    .path
-                    .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                let flag = if h.headless { " [无头]" } else { "" };
-                out.push_str(&format!("  {}. {}{} ({} KB)\n", i + 1, stem, flag, size));
+            // 尝试:传入序号或文件路径 → 恢复
+            let target = parts[1];
+            let matched = match_session(&paths, target);
+            match matched {
+                Some(path) => {
+                    let _ = cmd_tx.send(AgentCmd::LoadHistory(path));
+                    items.push(MsgItem::Notice("正在恢复历史会话…".into()));
+                }
+                None => {
+                    items.push(MsgItem::CommandOutput(format!("未找到匹配「{target}」的历史会话")));
+                }
             }
-            if history.len() > shown {
-                out.push_str(&format!("…(共 {} 个,显示最新 {shown} 个)\n", history.len()));
-            }
-            out.push_str("\n用法:\n  /resume <序号|片段>       恢复\n  /resume del <序号|片段>  删除");
-            items.push(MsgItem::CommandOutput(out));
+            return None;
         }
         "/compact" => {
             items.push(MsgItem::Notice("▶ 请求压缩上下文…".into()));
@@ -1572,7 +1600,7 @@ const HELP_TEXT: &str = "可用命令:
   /skills                  列出已安装技能
   /config                  打开配置面板(随时修改 provider/模型/端点/key,立即生效)
   /undo                    列出 undo 快照; /undo <序号> 回滚
-  /resume                  列出历史会话; /resume <序号|片段> 恢复; /resume del <序号|片段> 删除
+  /resume                  打开会话管理窗口(会话/记忆页签,多选批量删、备注、恢复); /resume <序号|片段> 恢复; /resume del <序号|片段> 删除
   /clear                   清空当前会话上下文与历史文件(需确认)
   /compact                 压缩上下文:旧对话收敛为摘要,腾出空间继续对话
   /update                  检查并更新到 GitHub 最新版本
@@ -2062,7 +2090,7 @@ const SLASH_BUILTINS: &[(&str, &str)] = &[
     ("/skills", "已安装技能列表"),
     ("/config", "打开配置向导"),
     ("/undo", "undo 快照/回滚(/undo <序号>)"),
-    ("/resume", "恢复/删除历史会话"),
+    ("/resume", "历史会话管理窗口(批量删/备注/恢复); /resume <片段> 直接恢复"),
     ("/clear", "清空会话(确认后不可恢复)"),
     ("/compact", "压缩上下文:旧对话 → 摘要,释放空间"),
     ("/update", "检查并更新到 GitHub 最新版本"),
@@ -3515,7 +3543,9 @@ mod slash_tests {
         let mut items: Vec<MsgItem> = vec![MsgItem::User("旧消息".into())];
         let mut confirm: Option<ConfirmBox> = None;
         let cwd = std::env::temp_dir();
-        let r = handle_command("/clear", &cmd_tx, &update_tx, &mut items, &cwd, &mut confirm);
+        let r = handle_command(
+            "/clear", &cmd_tx, &update_tx, &mut items, &cwd, &mut confirm,
+        );
         assert!(r.is_none());
         // 展示未被直接清空,而是挂起一个确认
         assert!(!items.is_empty());
