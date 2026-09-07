@@ -107,7 +107,7 @@ Input/output box border colors follow the permission mode (ask=green / acceptEdi
 | `/resume` `/resume <n\|fragment>` | **No arg**: opens the full-screen **session manager** ("sessions / memory" tabs: `↑↓` pick, `space` multi-select, `d` batch delete, `n` edit note, `/` filter, Enter resume/view; the current session can't be deleted). **With arg**: resume that session directly (`[headless]` = created by `-p`) |
 | `/clear` | Clear session context + history file (confirmed; unrecoverable) |
 | `/compact` | Compress context: older turns collapsed into a summary, context freed (full history kept for `--resume`) |
-| `/update` | Check & update to the latest release (`znaide --update` also works; startup auto-checks once). **Two sources with automatic fallback**: GitHub first; when unreachable (or download fails) it switches to the **Gitee mirror** (synced repo & releases, no proxy needed in China); `HTTPS_PROXY` still helps the GitHub source. Linux/macOS replace on next start, Windows swaps after exit |
+| `/update` | Check & update to the latest release (`znaide --update` also works; startup auto-checks once). **Two sources with automatic fallback**: **Gitee mirror** first (synced repo & releases, no proxy needed in China); when unreachable (or download fails) it switches to GitHub; `HTTPS_PROXY` still helps the GitHub source. Linux/macOS replace on next start, Windows swaps after exit |
 | `/persona` | Global persona: list / switch (`/persona <name>`), `/persona none` off. Persisted to config, affects all following conversation; safety rules stay intact |
 | `/quit` `/exit` | Quit (prints session stats; `Ctrl+C` too) |
 | `/skill-name [args]` | Trigger an installed skill manually (see Skills) |
