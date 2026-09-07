@@ -475,17 +475,21 @@ pub async fn run(
     let app_start = std::time::Instant::now();
 
     // 启动自动更新检查(默认开):界面起来 2s 后静默探测一次,发现新版才提示;
-    // 网络失败静默不打扰,随时可 /update 手动检查
+    // 网络失败静默不打扰,随时可 /update 手动检查。探测按 GitHub → Gitee 顺序,
+    // 任一源连通即用(GitHub 不通时国内用户也能发现 Gitee 的新版)。
     {
         let update_tx = update_tx.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             let Ok(client) = znaide_core::update::http_client() else { return };
-            let Ok(latest) = znaide_core::update::check_latest(&client).await else { return };
+            let Ok((src, latest)) = znaide_core::update::probe_latest(&client).await else {
+                return;
+            };
             let cur = znaide_core::update::current_version();
             if znaide_core::update::version_gt(&latest, &cur) {
                 let _ = update_tx.send(format!(
-                    "发现新版本 v{latest}(当前 v{cur})。输入 /update 立即更新,或忽略继续使用。"
+                    "发现新版本 v{latest}(来源 {})\n当前 v{cur}:输入 /update 立即更新,或忽略继续使用。",
+                    src.label()
                 ));
             }
         });
@@ -1474,11 +1478,11 @@ fn handle_command(
                 let cur = znaide_core::update::current_version();
                 let msg = match znaide_core::update::perform_update().await {
                     UpdateResult::UpToDate => format!("已是最新版本 v{cur}。"),
-                    UpdateResult::Updated { version, deferred: false } => {
-                        format!("✔ 已更新到 v{version}:下次启动生效(本次继续用旧版本)。")
+                    UpdateResult::Updated { version, source, deferred: false } => {
+                        format!("✔ 已更新到 v{version}(来源 {source}):下次启动生效(本次继续用旧版本)。")
                     }
-                    UpdateResult::Updated { version, deferred: true } => format!(
-                        "✔ 新版本 v{version} 已就位:退出程序后自动完成替换,下次启动生效。"
+                    UpdateResult::Updated { version, source, deferred: true } => format!(
+                        "✔ 新版本 v{version}(来源 {source})已就位:退出程序后自动完成替换,下次启动生效。"
                     ),
                     UpdateResult::CheckFailed(e) => format!("⚠ 检查更新失败: {e}"),
                     UpdateResult::DownloadFailed(e) => format!("⚠ 更新失败: {e}"),
