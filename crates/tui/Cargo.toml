@@ -1,0 +1,17 @@
+[package]
+name = "znaide-tui"
+description = "znaide 交互界面:ratatui 渲染,消费 core 会话引擎"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+znaide-core = { path = "../core" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+futures-util = { workspace = true }
+tokio-util = { workspace = true }
+dirs = { workspace = true }

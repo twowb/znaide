@@ -1,0 +1,18 @@
+[package]
+name = "znaide-core"
+description = "znaide 大脑:纯引擎,零终端依赖(agent 循环 / LLM / 工具 / 权限 / 记忆 / 会话)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+dirs = { workspace = true }
+regex = { workspace = true }
+futures-util = { workspace = true }
+async-stream = { workspace = true }
+tokio-util = { workspace = true }

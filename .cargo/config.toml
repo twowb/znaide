@@ -1,0 +1,31 @@
+# znaide 跨平台构建配置
+# linker / ar 路径与全局 ~/.cargo/config 配合;此处仅放平台特有标志
+
+# Linux x86_64:musl 全静态
+# 注:Ubuntu 的 musl 1.2.2 不支持 rustc 默认的 static-PIE(运行段错误),
+# 用 relocation-model=static 生成传统静态二进制
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-linux-musl-gcc"
+rustflags = ["-C", "relocation-model=static"]
+
+# Linux aarch64:musl 全静态(需 aarch64-linux-musl-gcc)
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-linux-musl-gcc"
+rustflags = ["-C", "relocation-model=static"]
+
+# Windows:GNU 工具链 + CRT 静态链接(不依赖 msvcrt 之外的 DLL)
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# macOS:用 zig 交叉编译(无需 osxcross/SDK,zig 内置 Mach-O 链接与 darwin 存根)
+# linker 指向 wrapper(zig-cc-*-darwin,位于 ~/.cargo/bin):
+#   wrapper 以 `zig cc -target <triple>-macos-none` 调用,并丢弃 cc crate 附加的 clang 风格 --target
+# ring 等 C 依赖的编译同样经 CC_aarch64_apple_darwin / CC_x86_64_apple_darwin 指向该 wrapper
+[target.x86_64-apple-darwin]
+linker = "zig-cc-x86_64-darwin"
+rustflags = ["-C", "link-arg=-L", "-C", "link-arg=/home/zngeek/.cargo/darwin-stubs"]
+
+[target.aarch64-apple-darwin]
+linker = "zig-cc-aarch64-darwin"
+rustflags = ["-C", "link-arg=-L", "-C", "link-arg=/home/zngeek/.cargo/darwin-stubs"]

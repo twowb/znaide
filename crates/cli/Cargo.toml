@@ -1,0 +1,18 @@
+[package]
+name = "znaide-cli"
+description = "znaide 入口:交互 TUI / -p 无头 / 子命令"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "znaide"
+path = "src/main.rs"
+
+[dependencies]
+znaide-core = { path = "../core" }
+znaide-tui = { path = "../tui" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
