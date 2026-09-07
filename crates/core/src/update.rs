@@ -1,10 +1,14 @@
-//! 自动更新:从 GitHub Releases 探测/下载/安装新版本。
+//! 自动更新:多源(GitHub → Gitee)探测/下载/安装新版本。
 //!
-//! - 版本探测走 `releases/latest` 的 302 重定向(Location 里带 tag),避开
-//!   GitHub API 的匿名限流;资产用直链按平台命名规范拼
-//!   (`znaide-<平台>-v<版本>`),与发布脚本的命名强耦合。
-//! - 下载尊重 `HTTPS_PROXY` / `ALL_PROXY` 等代理环境变量(GitHub 直连
-//!   常不通,由用户侧代理转发)。
+//! - **GitHub 源**(默认):版本探测走 `releases/latest` 的 302 重定向
+//!   (Location 里带 tag),避开 GitHub API 的匿名限流;资产用直链按平台
+//!   命名规范拼(`znaide-<平台>-v<版本>`,与发布脚本的命名强耦合)。
+//! - **Gitee 源**(兜底):无 302 捷径,走 API v5 `releases/latest`
+//!   (公开仓库匿名可读),资产下载 URL 与 GitHub 同构
+//!   (`/{repo}/releases/download/v{版本}/{资产名}`)。
+//! - 顺序:GitHub 失败(网络/解析)自动切 Gitee;下载失败同样切下一个源;
+//!   全部失败按源给出各自提示(GitHub 提示 HTTPS_PROXY)。
+//! - 下载尊重 `HTTPS_PROXY` / `ALL_PROXY` 等代理环境变量。
 //! - 自替换:Unix 上运行中的进程可以原子 rename 覆盖自身,下次启动生效;
 //!   Windows 运行中的 exe 被系统锁定,改为落一个"退出后自动替换"的
 //!   批处理,由 cmd 脱离进程执行(轮询等到 exe 解锁再换)。
@@ -12,8 +16,110 @@
 
 use std::path::{Path, PathBuf};
 
-/// 发布仓库
+/// GitHub 发布仓库
 pub const REPO: &str = "twowb/znaide";
+/// Gitee 发布仓库(与 GitHub 同步的镜像)
+pub const GITEE_REPO: &str = "brother-ershui/znaide";
+
+/// 更新源(顺序即回退顺序)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateSource {
+    GitHub,
+    Gitee,
+}
+
+/// 更新源顺序:GitHub 优先,Gitee 兜底
+pub const UPDATE_SOURCES: &[UpdateSource] = &[UpdateSource::GitHub, UpdateSource::Gitee];
+
+impl UpdateSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            UpdateSource::GitHub => "GitHub",
+            UpdateSource::Gitee => "Gitee",
+        }
+    }
+
+    fn repo(self) -> &'static str {
+        match self {
+            UpdateSource::GitHub => REPO,
+            UpdateSource::Gitee => GITEE_REPO,
+        }
+    }
+
+    fn download_host(self) -> &'static str {
+        match self {
+            UpdateSource::GitHub => "github.com",
+            UpdateSource::Gitee => "gitee.com",
+        }
+    }
+
+    /// 该源失败时的额外提示
+    fn hint(self) -> &'static str {
+        match self {
+            UpdateSource::GitHub => "GitHub 网络不通时可设置 HTTPS_PROXY",
+            UpdateSource::Gitee => "请检查 Gitee 仓库是否公开可访问",
+        }
+    }
+
+    /// 探测该源的最新发布版本(不带 v 前缀,如 "1.1.0")
+    pub async fn check_latest(self, client: &reqwest::Client) -> anyhow::Result<String> {
+        match self {
+            UpdateSource::GitHub => {
+                let url = format!("https://github.com/{}/releases/latest", self.repo());
+                let resp = client.head(&url).send().await?;
+                if !resp.status().is_success() {
+                    anyhow::bail!("HTTP {}", resp.status());
+                }
+                let path = resp.url().path().to_string();
+                // 形如 /twowb/znaide/releases/tag/v1.2.3(旧格式 /releases/v1.2.3)
+                let tag = path
+                    .rsplit('/')
+                    .find(|seg| !seg.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("无法解析重定向地址: {path}"))?;
+                parse_version_from_tag(tag)
+            }
+            UpdateSource::Gitee => {
+                // API v5 releases/latest:公开仓库匿名可读,一次拿最新 tag
+                let url = format!(
+                    "https://gitee.com/api/v5/repos/{}/releases/latest",
+                    self.repo()
+                );
+                let resp = client.get(&url).send().await?;
+                if !resp.status().is_success() {
+                    anyhow::bail!("HTTP {} ({url})", resp.status());
+                }
+                let text = resp.text().await?;
+                let v: serde_json::Value = serde_json::from_str(&text)
+                    .map_err(|e| anyhow::anyhow!("Gitee 返回解析失败: {e}"))?;
+                let tag = v
+                    .get("tag_name")
+                    .and_then(|t| t.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("Gitee 响应缺少 tag_name"))?;
+                parse_version_from_tag(tag)
+            }
+        }
+    }
+
+    /// 该源指定版本的资产直链(两端 URL 形态一致)
+    fn download_url(self, version: &str) -> anyhow::Result<String> {
+        let fname = release_asset_name(version)
+            .ok_or_else(|| anyhow::anyhow!("当前平台没有发布产物,无法自动更新"))?;
+        Ok(format!(
+            "https://{}/{}/releases/download/v{version}/{fname}",
+            self.download_host(),
+            self.repo()
+        ))
+    }
+}
+
+/// 从 tag 段(v1.2.3 / 1.2.3)解析出版本号
+fn parse_version_from_tag(tag: &str) -> anyhow::Result<String> {
+    let ver = tag.trim_start_matches('v');
+    if ver.is_empty() || !ver.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        anyhow::bail!("无法解析版本号: {tag}");
+    }
+    Ok(ver.to_string())
+}
 
 /// 当前程序版本
 pub fn current_version() -> String {
@@ -98,37 +204,28 @@ pub fn http_client() -> anyhow::Result<reqwest::Client> {
     Ok(b.build()?)
 }
 
-/// 探测最新发布版本(不带 v 前缀的数字段,如 "1.1.0")。
-/// 网络失败/解析不出都返回 Err,调用方决定是否提示。
-pub async fn check_latest(client: &reqwest::Client) -> anyhow::Result<String> {
-    let url = format!("https://github.com/{REPO}/releases/latest");
-    let resp = client.head(&url).send().await?;
-    if !resp.status().is_success() {
-        anyhow::bail!("探测最新版本失败: HTTP {}", resp.status());
+/// 依次探测各源,返回**第一个连通源**的最新版本。
+/// 全部失败才 Err(TUI 启动静默检查与展示层用)。
+pub async fn probe_latest(
+    client: &reqwest::Client,
+) -> anyhow::Result<(UpdateSource, String)> {
+    let mut errs: Vec<String> = Vec::new();
+    for &src in UPDATE_SOURCES {
+        match src.check_latest(client).await {
+            Ok(v) => return Ok((src, v)),
+            Err(e) => errs.push(format!("{}: {e:#}", src.label())),
+        }
     }
-    let path = resp.url().path().to_string();
-    // 形如 /twowb/znaide/releases/tag/v1.2.3(旧格式 /releases/v1.2.3)
-    let tag = path
-        .rsplit('/')
-        .find(|seg| !seg.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("无法解析重定向地址: {path}"))?;
-    let ver = tag.trim_start_matches('v');
-    if ver.is_empty() || !ver.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-        anyhow::bail!("无法解析版本号: {tag}");
-    }
-    Ok(ver.to_string())
+    anyhow::bail!("所有更新源均不可达({})", errs.join("; "))
 }
 
-/// 下载指定版本的二进制到可执行文件同目录的临时文件,返回其路径
-pub async fn download_update(
+/// 从指定源下载指定版本的二进制到可执行文件同目录的临时文件,返回其路径
+pub async fn download_from(
     client: &reqwest::Client,
+    src: UpdateSource,
     version: &str,
 ) -> anyhow::Result<PathBuf> {
-    let fname = release_asset_name(version)
-        .ok_or_else(|| anyhow::anyhow!("当前平台没有发布产物,无法自动更新"))?;
-    let url = format!(
-        "https://github.com/{REPO}/releases/download/v{version}/{fname}"
-    );
+    let url = src.download_url(version)?;
     let resp = client.get(&url).send().await?;
     if !resp.status().is_success() {
         anyhow::bail!("下载失败: HTTP {} ({url})", resp.status());
@@ -224,8 +321,12 @@ pub fn install_update(downloaded: &Path) -> anyhow::Result<InstallOutcome> {
 pub enum UpdateResult {
     /// 已是最新
     UpToDate,
-    /// 更新完成;deferred=true 表示替换要等进程退出后由批处理完成
-    Updated { version: String, deferred: bool },
+    /// 更新完成;source = 下载来源;deferred=true 表示替换要等进程退出后由批处理完成
+    Updated {
+        version: String,
+        source: &'static str,
+        deferred: bool,
+    },
     /// 检查失败(网络/代理/解析)
     CheckFailed(String),
     /// 下载失败
@@ -234,7 +335,10 @@ pub enum UpdateResult {
     VerifyFailed(String),
 }
 
-/// 完整执行一次更新:探测 → 比较 → 下载 → 自检 → 安装。
+/// 完整执行一次更新:按源顺序[GitHub → Gitee]探测 → 比较 → 下载 → 自检 → 安装。
+/// - 首个能连通(探测成功)的源决定"最新版本":已是最新即结束;
+///   有新版就从该源下载,下载失败自动尝试后续源(同版本资产)。
+/// - 全部源探测失败 → CheckFailed,按源列出原因(GitHub 失败附 HTTPS_PROXY 提示)。
 /// 不发网络请求的前提错误(代理构造失败)也并入 CheckFailed。
 pub async fn perform_update() -> UpdateResult {
     let cur = current_version();
@@ -242,30 +346,61 @@ pub async fn perform_update() -> UpdateResult {
         Ok(c) => c,
         Err(e) => return UpdateResult::CheckFailed(format!("客户端构造失败: {e:#}")),
     };
-    let latest = match check_latest(&client).await {
-        Ok(v) => v,
-        Err(e) => {
-            return UpdateResult::CheckFailed(format!(
-                "{e:#}\n提示:更新走 GitHub,网络不通时请设置 HTTPS_PROXY 环境变量"
-            ))
+
+    // 各源探测失败记录(全败时汇总给用户)
+    let mut check_errs: Vec<String> = Vec::new();
+    for &src in UPDATE_SOURCES {
+        let latest = match src.check_latest(&client).await {
+            Ok(v) => v,
+            Err(e) => {
+                check_errs.push(format!("{}: {e:#}", src.label()));
+                continue;
+            }
+        };
+        // 首个连通源:以它判定是否已最新
+        if !version_gt(&latest, &cur) {
+            return UpdateResult::UpToDate;
         }
-    };
-    if !version_gt(&latest, &cur) {
-        return UpdateResult::UpToDate;
+        // 有新版:优先本源下载;失败依次尝试后续源(同版本资产名一致)
+        let mut dl_errs: Vec<String> = Vec::new();
+        for &s2 in UPDATE_SOURCES.iter().skip_while(|s| **s != src) {
+            match download_from(&client, s2, &latest).await {
+                Ok(tmp) => {
+                    if let Err(e) = verify_download(&tmp, &latest) {
+                        let _ = std::fs::remove_file(&tmp);
+                        return UpdateResult::VerifyFailed(format!("{e:#}"));
+                    }
+                    let source_label = s2.label();
+                    return match install_update(&tmp) {
+                        Ok(InstallOutcome::Replaced) => UpdateResult::Updated {
+                            version: latest,
+                            source: source_label,
+                            deferred: false,
+                        },
+                        Ok(InstallOutcome::Deferred) => UpdateResult::Updated {
+                            version: latest,
+                            source: source_label,
+                            deferred: true,
+                        },
+                        Err(e) => UpdateResult::DownloadFailed(format!("安装失败: {e:#}")),
+                    };
+                }
+                Err(e) => dl_errs.push(format!("{}: {e:#}", s2.label())),
+            }
+        }
+        return UpdateResult::DownloadFailed(format!(
+            "探测到新版 v{latest} 但下载失败:\n{}",
+            dl_errs.join("\n")
+        ));
     }
-    let tmp = match download_update(&client, &latest).await {
-        Ok(p) => p,
-        Err(e) => return UpdateResult::DownloadFailed(format!("{e:#}")),
-    };
-    if let Err(e) = verify_download(&tmp, &latest) {
-        let _ = std::fs::remove_file(&tmp);
-        return UpdateResult::VerifyFailed(format!("{e:#}"));
-    }
-    match install_update(&tmp) {
-        Ok(InstallOutcome::Replaced) => UpdateResult::Updated { version: latest, deferred: false },
-        Ok(InstallOutcome::Deferred) => UpdateResult::Updated { version: latest, deferred: true },
-        Err(e) => UpdateResult::DownloadFailed(format!("安装失败: {e:#}")),
-    }
+
+    // 全部源探测失败
+    let github_hint = check_errs
+        .iter()
+        .any(|e| e.starts_with("GitHub:"))
+        .then(|| "\n提示:更新源含 GitHub,网络不通时可设置 HTTPS_PROXY 环境变量")
+        .unwrap_or("");
+    UpdateResult::CheckFailed(format!("检查更新失败:\n{}{github_hint}", check_errs.join("\n")))
 }
 
 /// 自检下载产物:运行 `--version`,输出应包含目标版本
@@ -315,5 +450,38 @@ mod tests {
         // .exe 必须在版本号之后,不在平台段里
         assert!(name.ends_with(".exe") == cfg!(target_os = "windows"));
         assert!(!name.contains(".exe-v"), "扩展名位置错误: {name}");
+    }
+
+    #[test]
+    fn update_sources_github_first_then_gitee() {
+        // 顺序即回退顺序:GitHub 优先,Gitee 兜底
+        assert_eq!(UPDATE_SOURCES.len(), 2);
+        assert_eq!(UPDATE_SOURCES[0], UpdateSource::GitHub);
+        assert_eq!(UPDATE_SOURCES[1], UpdateSource::Gitee);
+        assert_eq!(UpdateSource::GitHub.label(), "GitHub");
+        assert_eq!(UpdateSource::Gitee.label(), "Gitee");
+    }
+
+    #[test]
+    fn parse_version_handles_v_prefix_and_garbage() {
+        assert_eq!(parse_version_from_tag("v1.2.3").unwrap(), "1.2.3");
+        assert_eq!(parse_version_from_tag("1.2.3").unwrap(), "1.2.3");
+        assert!(parse_version_from_tag("release").is_err());
+        assert!(parse_version_from_tag("v").is_err());
+        assert!(parse_version_from_tag("").is_err());
+    }
+
+    #[test]
+    fn download_url_matches_both_hosts() {
+        // GitHub 与 Gitee 资产 URL 同构(实测 Gitee browser_download_url 即此形态),
+        // 平台段与 .exe 位置决定成败(线上踩过 404 的坑)
+        let gh = UpdateSource::GitHub.download_url("1.0.2").unwrap();
+        assert!(gh.starts_with("https://github.com/twowb/znaide/releases/download/v1.0.2/"));
+        let gi = UpdateSource::Gitee.download_url("1.0.2").unwrap();
+        assert!(gi.starts_with("https://gitee.com/brother-ershui/znaide/releases/download/v1.0.2/"));
+        // 资产名片段一致(两端发布同名资产)
+        let fname = release_asset_name("1.0.2").unwrap();
+        assert!(gh.ends_with(&format!("/{fname}")));
+        assert!(gi.ends_with(&format!("/{fname}")));
     }
 }

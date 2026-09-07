@@ -58,11 +58,11 @@ async fn run_update() -> anyhow::Result<()> {
     println!("当前版本: v{cur}");
     match znaide_core::update::perform_update().await {
         UpdateResult::UpToDate => println!("已是最新版本 v{cur}。"),
-        UpdateResult::Updated { version, deferred: false } => {
-            println!("✔ 已更新到 v{version}。下次启动即生效(本次会话继续用旧版本)。");
+        UpdateResult::Updated { version, source, deferred: false } => {
+            println!("✔ 已更新到 v{version}(来源 {source})。下次启动即生效(本次会话继续用旧版本)。");
         }
-        UpdateResult::Updated { version, deferred: true } => {
-            println!("✔ 新版本 v{version} 已就位:退出本程序后会自动完成替换,下次启动即生效。");
+        UpdateResult::Updated { version, source, deferred: true } => {
+            println!("✔ 新版本 v{version}(来源 {source})已就位:退出本程序后会自动完成替换,下次启动即生效。");
         }
         UpdateResult::CheckFailed(e) => eprintln!("⚠ 检查更新失败: {e}"),
         UpdateResult::DownloadFailed(e) => eprintln!("⚠ 更新失败: {e}"),
