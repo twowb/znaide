@@ -1,12 +1,12 @@
-//! 自动更新:多源(GitHub → Gitee)探测/下载/安装新版本。
+//! 自动更新:多源(Gitee → GitHub)探测/下载/安装新版本。
 //!
-//! - **GitHub 源**(默认):版本探测走 `releases/latest` 的 302 重定向
-//!   (Location 里带 tag),避开 GitHub API 的匿名限流;资产用直链按平台
-//!   命名规范拼(`znaide-<平台>-v<版本>`,与发布脚本的命名强耦合)。
-//! - **Gitee 源**(兜底):无 302 捷径,走 API v5 `releases/latest`
+//! - **Gitee 源**(默认优先):国内直连快、无需代理,走 API v5 `releases/latest`
 //!   (公开仓库匿名可读),资产下载 URL 与 GitHub 同构
 //!   (`/{repo}/releases/download/v{版本}/{资产名}`)。
-//! - 顺序:GitHub 失败(网络/解析)自动切 Gitee;下载失败同样切下一个源;
+//! - **GitHub 源**(兜底):版本探测走 `releases/latest` 的 302 重定向
+//!   (Location 里带 tag),避开 GitHub API 的匿名限流;资产用直链按平台
+//!   命名规范拼(`znaide-<平台>-v<版本>`,与发布脚本的命名强耦合)。
+//! - 顺序:Gitee 失败(网络/解析)自动切 GitHub;下载失败同样切下一个源;
 //!   全部失败按源给出各自提示(GitHub 提示 HTTPS_PROXY)。
 //! - 下载尊重 `HTTPS_PROXY` / `ALL_PROXY` 等代理环境变量。
 //! - 自替换:Unix 上运行中的进程可以原子 rename 覆盖自身,下次启动生效;
@@ -28,8 +28,8 @@ pub enum UpdateSource {
     Gitee,
 }
 
-/// 更新源顺序:GitHub 优先,Gitee 兜底
-pub const UPDATE_SOURCES: &[UpdateSource] = &[UpdateSource::GitHub, UpdateSource::Gitee];
+/// 更新源顺序:Gitee 优先(国内直连快),GitHub 兜底
+pub const UPDATE_SOURCES: &[UpdateSource] = &[UpdateSource::Gitee, UpdateSource::GitHub];
 
 impl UpdateSource {
     pub fn label(self) -> &'static str {
@@ -335,9 +335,9 @@ pub enum UpdateResult {
     VerifyFailed(String),
 }
 
-/// 完整执行一次更新:按源顺序[GitHub → Gitee]探测 → 比较 → 下载 → 自检 → 安装。
+/// 完整执行一次更新:按源顺序[Gitee → GitHub]探测 → 比较 → 下载 → 自检 → 安装。
 /// - 首个能连通(探测成功)的源决定"最新版本":已是最新即结束;
-///   有新版就从该源下载,下载失败自动尝试后续源(同版本资产)。
+///   有新版就从该源下载,下载失败自动尝试其它源(同版本资产)。
 /// - 全部源探测失败 → CheckFailed,按源列出原因(GitHub 失败附 HTTPS_PROXY 提示)。
 /// 不发网络请求的前提错误(代理构造失败)也并入 CheckFailed。
 pub async fn perform_update() -> UpdateResult {
@@ -361,9 +361,12 @@ pub async fn perform_update() -> UpdateResult {
         if !version_gt(&latest, &cur) {
             return UpdateResult::UpToDate;
         }
-        // 有新版:优先本源下载;失败依次尝试后续源(同版本资产名一致)
+        // 有新版:优先本源下载;失败再按源表顺序试其它源(同版本资产名一致)
         let mut dl_errs: Vec<String> = Vec::new();
-        for &s2 in UPDATE_SOURCES.iter().skip_while(|s| **s != src) {
+        let mut dl_order = Vec::with_capacity(UPDATE_SOURCES.len());
+        dl_order.push(src);
+        dl_order.extend(UPDATE_SOURCES.iter().copied().filter(|&s| s != src));
+        for s2 in dl_order {
             match download_from(&client, s2, &latest).await {
                 Ok(tmp) => {
                     if let Err(e) = verify_download(&tmp, &latest) {
@@ -453,11 +456,11 @@ mod tests {
     }
 
     #[test]
-    fn update_sources_github_first_then_gitee() {
-        // 顺序即回退顺序:GitHub 优先,Gitee 兜底
+    fn update_sources_gitee_first_then_github() {
+        // 顺序即回退顺序:Gitee 优先(国内直连快),GitHub 兜底
         assert_eq!(UPDATE_SOURCES.len(), 2);
-        assert_eq!(UPDATE_SOURCES[0], UpdateSource::GitHub);
-        assert_eq!(UPDATE_SOURCES[1], UpdateSource::Gitee);
+        assert_eq!(UPDATE_SOURCES[0], UpdateSource::Gitee);
+        assert_eq!(UPDATE_SOURCES[1], UpdateSource::GitHub);
         assert_eq!(UpdateSource::GitHub.label(), "GitHub");
         assert_eq!(UpdateSource::Gitee.label(), "Gitee");
     }

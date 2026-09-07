@@ -475,8 +475,8 @@ pub async fn run(
     let app_start = std::time::Instant::now();
 
     // 启动自动更新检查(默认开):界面起来 2s 后静默探测一次,发现新版才提示;
-    // 网络失败静默不打扰,随时可 /update 手动检查。探测按 GitHub → Gitee 顺序,
-    // 任一源连通即用(GitHub 不通时国内用户也能发现 Gitee 的新版)。
+    // 网络失败静默不打扰,随时可 /update 手动检查。探测按 Gitee → GitHub 顺序,
+    // 任一源连通即用(Gitee 优先,国内直连无需代理)。
     {
         let update_tx = update_tx.clone();
         tokio::spawn(async move {
@@ -1470,7 +1470,7 @@ fn handle_command(
         "/update" => {
             // 后台执行(下载可能要一阵),进度/结果经 update 通道回 UI
             items.push(MsgItem::Notice(
-                "正在检查更新…(走 GitHub,网络不通请设置 HTTPS_PROXY 后重试)".into(),
+                "正在检查更新…(Gitee 优先,不通自动切 GitHub)".into(),
             ));
             let tx = update_tx.clone();
             tokio::spawn(async move {
