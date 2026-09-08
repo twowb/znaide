@@ -2,7 +2,7 @@
 
 **A "do-anything" AI assistant that lives in your terminal.**
 
-Tell it what to do in plain language and it gets it done — edit files, run commands, browse the web, organize folders, write documents. Coding is just one use case. Written from scratch in Rust (agent-loop architecture inspired by qwen-code): **one static binary, zero Node/zero runtime dependencies, Chinese-first UI, works with local models and cloud APIs alike**.
+Tell it what to do in plain language and it gets it done — edit files, run commands, browse the web, organize folders, write documents. Coding is just one use case. Written from scratch in Rust with a self-built agent loop: **one static binary, zero Node/zero runtime dependencies, Chinese-first UI, works with local models and cloud APIs alike**.
 
 > **Source & binaries**: This tool is open source under **AGPL-3.0** (repo: https://github.com/twowb/znaide). Free for personal use, learning, and open-source derivatives; **commercial or closed-source integration requires a commercial license** — see `COMMERCIAL.md`. Don't want to build? Grab a binary from [GitHub Releases](https://github.com/twowb/znaide/releases): pick `znaide-<platform>-v<version>` for Linux/macOS/Windows/Android-Termux; `--version` shows the build.
 

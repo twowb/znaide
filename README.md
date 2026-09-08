@@ -4,7 +4,7 @@
 
 **跑在终端里的"无所不能"通用 AI 助手。**
 
-用自然语言下达指令,znaide 自主完成:改文件、跑命令、查资料、整理数据、写文档……编程只是应用场景之一。它参考 qwen-code 的 agent 架构思想,用 Rust 从零实现:**单个静态二进制、零 Node 依赖、中文交互、本地模型与云 API 通吃**。
+用自然语言下达指令,znaide 自主完成:改文件、跑命令、查资料、整理数据、写文档……编程只是应用场景之一。它用 Rust 从零实现、自带 agent 循环:**单个静态二进制、零 Node 依赖、中文交互、本地模型与云 API 通吃**。
 
 > **源码与获取**:本工具**以 AGPL-3.0 开源**(仓库:[github.com/twowb/znaide](https://github.com/twowb/znaide)),自用/学习/开源衍生免费;**商用或闭源集成需商业授权**,见 `COMMERCIAL.md`。不想编译就直接下二进制:[GitHub Releases](https://github.com/twowb/znaide/releases) 按平台取 `znaide-<平台>-v<版本>`(Linux/macOS/Windows/Android-Termux),`--version` 可查看版本。
 
