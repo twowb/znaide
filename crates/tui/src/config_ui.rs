@@ -1,4 +1,4 @@
-//! 配置向导状态机(服务商 → 模型 → Key → 轮数上限 → 验证)。
+//! 配置向导状态机(服务商 → 模型 → Key → 上下文窗口 → 轮数上限 → 验证)。
 //! 与 app.rs 解耦:on_key 返回 WizardAction,宿主执行异步动作(查询模型/验证),
 //! 再把结果经 inject_models / inject_verify 回填。
 use crossterm::event::{KeyCode, KeyEvent};
@@ -21,6 +21,8 @@ pub enum Step {
     ModelSelect,
     /// 输入 API Key
     ApiKey,
+    /// 上下文窗口 token 数(状态栏 ctx 占用条的分母;留空 = 按模型名自动识别)
+    ContextWindow,
     /// 轮数上限(单条消息最多几轮模型往返;0 = 不限)
     MaxTurns,
     /// 正在验证(等待宿主回调)
@@ -65,8 +67,14 @@ pub struct SetupWizard {
     /// 单条消息轮数上限(None = 用默认;Some(0) = 不限)。由宿主在打开面板时
     /// 用 `prefill()` 从现有配置预填,保存时随其他字段一起落盘。
     pub max_turns: Option<usize>,
+    /// 上下文窗口 token 数(None = 按模型名查内置表)。同样由 `prefill()` 带出、
+    /// 保存时写进当前 provider 条目;模型不在内置表里时就靠这里填准(否则 ctx 条
+    /// 只报绝对量、不给百分比)。
+    pub context_window: Option<usize>,
     /// 当前 typing 输入的是 max_turns(与模型名/key/端点共用输入通道,靠它区分)
     pub typing_max_turns: bool,
+    /// 当前 typing 输入的是 context_window
+    pub typing_context_window: bool,
     /// Key 来自环境变量(api_key_env):面板里显示为空但实际可用
     pub key_from_env: bool,
     /// 打开面板时快照的合并后 provider 表:切服务商时按名字取"它自己"的
@@ -92,7 +100,9 @@ impl SetupWizard {
             notice: String::new(),
             progress: String::new(),
             max_turns: None,
+            context_window: None,
             typing_max_turns: false,
+            typing_context_window: false,
             key_from_env: false,
             provider_defs: std::collections::HashMap::new(),
         }
@@ -132,6 +142,8 @@ impl SetupWizard {
                 .unwrap_or(false);
         self.model_cursor = 0;
         self.models.clear();
+        // 窗口也是"这家自己的":切换时不能沿用上一家的(40k 的 ollama 与 1M 的云端来回切会算错)
+        self.context_window = def.as_ref().and_then(|d| d.context_window);
     }
 
     /// 用现有配置预填(重开 `/config` 时把已经配好的值显示出来)。
@@ -179,6 +191,8 @@ impl SetupWizard {
             && entry_plain.is_none()
             && def.as_ref().map(|d| d.api_key_env.is_some()).unwrap_or(false);
         self.max_turns = cfg.max_turns;
+        // 窗口:当前 provider 条目里的固定值(没写 = None,界面显示"按模型名自动")
+        self.context_window = def.as_ref().and_then(|d| d.context_window);
     }
 
     /// 是否已有配置可展示(首次运行全空 → 不显示摘要行)
@@ -195,10 +209,20 @@ impl SetupWizard {
         }
     }
 
+    /// 上下文窗口的展示文案:自动 = 按模型名查内置表(查不到就只说绝对量)
+    pub fn context_window_label(&self) -> String {
+        match self.context_window {
+            None => "自动(按模型名匹配内置表;认不出就只报绝对量)".to_string(),
+            Some(n) if n >= 1_000_000 => format!("{n}(约 {}M)", n / 1_000_000),
+            Some(n) if n >= 1_000 => format!("{n}(约 {}k)", n / 1_000),
+            Some(n) => format!("{n}"),
+        }
+    }
+
     pub fn is_idle_step(&self) -> bool {
         matches!(
             self.step,
-            Step::Provider | Step::ModelSelect | Step::ApiKey | Step::MaxTurns
+            Step::Provider | Step::ModelSelect | Step::ApiKey | Step::ContextWindow | Step::MaxTurns
         )
     }
 
@@ -213,7 +237,8 @@ impl SetupWizard {
             } else {
                 Some(self.api_key.clone())
             },
-            context_window: None,
+            // 面板里填的固定窗口(空 = 交给内置表/未知);验证不需要它,但保存要
+            context_window: self.context_window,
         }
     }
 
@@ -299,6 +324,7 @@ impl SetupWizard {
                 KeyCode::Esc => {
                     self.typing = false;
                     self.typing_max_turns = false;
+                    self.typing_context_window = false;
                     self.input_buf.clear();
                 }
                 KeyCode::Backspace => {
@@ -392,20 +418,54 @@ impl SetupWizard {
                     WizardAction::None
                 }
                 KeyCode::Char('s') | KeyCode::Char('S') => {
-                    // 验证(跳过轮数上限那步,直接用当前值)
+                    // 验证(跳过窗口/轮数上限那两步,直接用当前值)
                     self.step = Step::Verifying;
                     self.progress = format!("正在验证 {} / {} …", self.provider, self.model);
                     WizardAction::Verify(self.draft())
                 }
                 KeyCode::Enter => {
-                    // 下一步:轮数上限
-                    self.step = Step::MaxTurns;
+                    // 下一步:上下文窗口
+                    self.step = Step::ContextWindow;
                     WizardAction::None
                 }
                 KeyCode::Char('e') | KeyCode::Char('E') => {
                     // 编辑 key(覆盖)
                     self.typing = true;
                     self.input_buf = std::mem::take(&mut self.api_key);
+                    WizardAction::None
+                }
+                _ => WizardAction::None,
+            },
+            Step::ContextWindow => match key.code {
+                // 直接敲数字就进输入(照着屏幕上显示的改最直观)
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    self.typing = true;
+                    self.typing_context_window = true;
+                    self.input_buf.clear();
+                    self.input_buf.push(c);
+                    self.notice = "输入当前模型的上下文窗口 token 数(留空 = 按模型名自动识别):".into();
+                    WizardAction::None
+                }
+                KeyCode::Char('t') | KeyCode::Char('T') | KeyCode::Char('e') | KeyCode::Char('E') => {
+                    self.typing = true;
+                    self.typing_context_window = true;
+                    self.input_buf = self.context_window.map(|v| v.to_string()).unwrap_or_default();
+                    self.notice = "输入当前模型的上下文窗口 token 数(留空 = 按模型名自动识别):".into();
+                    WizardAction::None
+                }
+                KeyCode::Enter => {
+                    // 下一步:轮数上限
+                    self.step = Step::MaxTurns;
+                    WizardAction::None
+                }
+                KeyCode::Char('s') | KeyCode::Char('S') => {
+                    // 跳过轮数上限那步,直接用当前值验证
+                    self.step = Step::Verifying;
+                    self.progress = format!("正在验证 {} / {} …", self.provider, self.model);
+                    WizardAction::Verify(self.draft())
+                }
+                KeyCode::Esc => {
+                    self.step = Step::ApiKey;
                     WizardAction::None
                 }
                 _ => WizardAction::None,
@@ -434,7 +494,7 @@ impl SetupWizard {
                     WizardAction::Verify(self.draft())
                 }
                 KeyCode::Esc => {
-                    self.step = Step::ApiKey;
+                    self.step = Step::ContextWindow;
                     WizardAction::None
                 }
                 _ => WizardAction::None,
@@ -451,6 +511,31 @@ impl SetupWizard {
 
     /// 处理输入框提交的内容(取决于当前阶段)
     fn confirm_typed(&mut self, v: &str) -> WizardAction {
+        // 上下文窗口:与模型名/key/端点共用输入通道,靠 typing_context_window 区分
+        if self.typing_context_window {
+            self.typing_context_window = false;
+            let t = v.trim();
+            if t.is_empty() {
+                self.context_window = None;
+                self.notice = "上下文窗口:自动(按模型名匹配内置表)。按 s 验证并完成".into();
+                return WizardAction::None;
+            }
+            return match t.parse::<usize>() {
+                Ok(n) if n > 0 => {
+                    self.context_window = Some(n);
+                    self.notice = format!("上下文窗口:{n} tokens。按 s 验证并完成");
+                    WizardAction::None
+                }
+                _ => {
+                    // 回填原输入,让用户直接改错处
+                    self.input_buf = t.to_string();
+                    self.typing = true;
+                    self.typing_context_window = true;
+                    self.notice = "窗口要填正整数 tokens(留空 = 自动识别),请重新输入:".into();
+                    WizardAction::None
+                }
+            };
+        }
         // 轮数上限:与模型名/key/端点共用输入通道,靠 typing_max_turns 区分
         if self.typing_max_turns {
             self.typing_max_turns = false;
@@ -531,13 +616,21 @@ impl SetupWizard {
 
         let mut lines: Vec<Line> = Vec::new();
         // 步骤条
-        let steps = ["1 服务商", "2 模型", "3 API Key", "4 轮数上限", "5 验证"];
+        let steps = [
+            "1 服务商",
+            "2 模型",
+            "3 API Key",
+            "4 上下文窗口",
+            "5 轮数上限",
+            "6 验证",
+        ];
         let current = match self.step {
             Step::Provider => 0,
             Step::Querying | Step::ModelSelect => 1,
             Step::ApiKey => 2,
-            Step::MaxTurns => 3,
-            Step::Verifying => 4,
+            Step::ContextWindow => 3,
+            Step::MaxTurns => 4,
+            Step::Verifying => 5,
         };
         let mut bar: Vec<Span> = Vec::new();
         for (i, s) in steps.iter().enumerate() {
@@ -573,9 +666,10 @@ impl SetupWizard {
                 ),
                 Span::styled(
                     format!(
-                        "  端点 {}  Key {}  轮数 {}",
+                        "  端点 {}  Key {}  窗口 {}  轮数 {}",
                         self.base_url,
                         key,
+                        self.context_window_label(),
                         self.max_turns_label()
                     ),
                     Style::default().fg(Color::DarkGray),
@@ -672,8 +766,37 @@ impl SetupWizard {
                     Span::styled("轮数上限: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(self.max_turns_label(), Style::default().fg(Color::White)),
                 ]));
+                lines.push(Line::from(vec![
+                    Span::styled("上下文窗口: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(self.context_window_label(), Style::default().fg(Color::White)),
+                ]));
                 lines.push(Line::from(Span::styled(
-                    "e 输入 key(本地服务可留空)| Enter 下一步(轮数上限)| s 直接验证并完成 | Esc 返回改模型",
+                    "e 输入 key(本地服务可留空)| Enter 下一步(上下文窗口)| s 直接验证并完成 | Esc 返回改模型",
+                    Style::default().fg(Color::Cyan),
+                )));
+            }
+            Step::ContextWindow => {
+                lines.push(Line::from(Span::styled(
+                    format!("服务商: {} | 模型: {}", self.provider, self.model),
+                    Style::default().fg(Color::Green),
+                )));
+                lines.push(Line::from(vec![
+                    Span::styled("上下文窗口: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        self.context_window_label(),
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                lines.push(Line::from(Span::styled(
+                    "状态栏 ctx 占用条的分母(模型能吃多少 token)。内置表认不出你的模型名时会显示“窗口未知”,只报绝对量",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "本地 ollama 请与运行时 num_ctx 一致;直接输入数字修改(留空 = 自动识别)",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "Enter 下一步(轮数上限)| s 直接验证并完成 | Esc 返回改 key",
                     Style::default().fg(Color::Cyan),
                 )));
             }
@@ -694,7 +817,7 @@ impl SetupWizard {
                     Style::default().fg(Color::DarkGray),
                 )));
                 lines.push(Line::from(Span::styled(
-                    "直接输入数字修改(0 = 不限,留空 = 默认)| Enter 或 s 验证并完成 | Esc 返回改 key",
+                    "直接输入数字修改(0 = 不限,留空 = 默认)| Enter 或 s 验证并完成 | Esc 返回改窗口",
                     Style::default().fg(Color::Cyan),
                 )));
             }
@@ -784,19 +907,21 @@ mod tests {
         );
     }
 
-    /// 轮数上限是独立一步(第 4 步):数字直接输入、0 = 不限、留空 = 默认、乱填报错重输
+    /// 轮数上限是独立一步(第 5 步):数字直接输入、0 = 不限、留空 = 默认、乱填报错重输
     #[test]
     fn max_turns_step_edits_and_verifies() {
         let mut w = SetupWizard::new();
         w.provider = "ollama".into();
         w.model = "qwen3:8b".into();
 
-        // API Key 那步按 Enter → 进入轮数上限那步
+        // API Key 那步按 Enter → 先到上下文窗口那步,再 Enter → 轮数上限那步
         w.step = Step::ApiKey;
         match w.on_key(key(KeyCode::Enter)) {
             WizardAction::None => {}
             _ => panic!("Enter 应进入下一步"),
         }
+        assert_eq!(w.step, Step::ContextWindow);
+        w.on_key(key(KeyCode::Enter));
         assert_eq!(w.step, Step::MaxTurns);
         assert_eq!(w.max_turns_label(), format!("默认({} 轮)", znaide_core::session::DEFAULT_MAX_TURNS));
 
@@ -975,6 +1100,7 @@ mod tests {
                 base_url: Some("https://api.deepseek.com/v1".into()),
                 model: Some("deepseek-flash".into()),
                 api_key: Some("sk-deepseek".into()),
+                context_window: Some(1_048_576),
                 ..Default::default()
             },
         );
@@ -984,6 +1110,7 @@ mod tests {
                 base_url: Some("https://dashscope.aliyuncs.com/compatible-mode/v1".into()),
                 model: Some("qwen-plus".into()),
                 api_key: Some("sk-aliyun".into()),
+                context_window: Some(40_960),
                 ..Default::default()
             },
         );
@@ -1000,6 +1127,7 @@ mod tests {
         assert_eq!(w.provider, "dashscope");
         assert_eq!(w.model, "qwen-plus");
         assert_eq!(w.api_key, "sk-aliyun");
+        assert_eq!(w.context_window, Some(40_960), "窗口也是这家自己的");
 
         // 切回 deepseek:模型与 Key 都该换成 deepseek 自己的
         let ds = w
@@ -1016,6 +1144,7 @@ mod tests {
             w.base_url, "https://api.deepseek.com/v1",
             "端点要跟着服务商走"
         );
+        assert_eq!(w.context_window, Some(1_048_576), "窗口不能沿用上一家的 40k");
         assert!(!w.key_from_env, "明文 Key 不该被标成来自环境变量");
         assert!(w.models.is_empty(), "换家后旧模型列表要清掉");
 
@@ -1030,6 +1159,7 @@ mod tests {
         w.on_key(key(KeyCode::Enter));
         assert_eq!(w.model, "qwen-plus");
         assert_eq!(w.api_key, "sk-aliyun");
+        assert_eq!(w.context_window, Some(40_960));
     }
 
     /// 服务商给出的模型列表里没有"当前模型"时,保留它并置顶选中(避免回车被悄悄换掉)
@@ -1195,5 +1325,74 @@ mod tests {
         w.inject_verify(false, "401 Unauthorized".into());
         assert_eq!(w.step, Step::ApiKey);
         assert!(w.notice.contains("401"));
+    }
+
+    /// 上下文窗口是独立一步(第 4 步):填正整数 = 固定值,留空 = 自动识别(内置表/未知)
+    #[test]
+    fn context_window_step_edits_and_verifies() {
+        let mut w = SetupWizard::new();
+        w.provider = "deepseek".into();
+        w.model = "deepseek-flash".into();
+        w.step = Step::ContextWindow;
+        assert_eq!(w.context_window, None);
+        assert!(w.context_window_label().contains("自动"));
+
+        // 直接敲数字就进输入(不用先按编辑键),继续敲完 → 1048576
+        w.on_key(key(KeyCode::Char('1')));
+        assert!(w.typing && w.typing_context_window);
+        assert_eq!(w.input_buf, "1");
+        for c in "048576".chars() {
+            w.on_key(key(KeyCode::Char(c)));
+        }
+        w.on_key(key(KeyCode::Enter));
+        assert!(!w.typing && !w.typing_context_window);
+        assert_eq!(w.step, Step::ContextWindow, "提交后留在本步");
+        assert_eq!(w.context_window, Some(1_048_576));
+        assert!(w.context_window_label().contains('M'));
+
+        // t 预填当前值,改成小窗口(40k 的本地模型典型值)
+        w.on_key(key(KeyCode::Char('t')));
+        assert_eq!(w.input_buf, "1048576");
+        w.input_buf.clear();
+        for c in "40960".chars() {
+            w.on_key(key(KeyCode::Char(c)));
+        }
+        w.on_key(key(KeyCode::Enter));
+        assert_eq!(w.context_window, Some(40_960));
+        assert!(w.context_window_label().contains("40k"));
+
+        // 留空 = 回到"自动"(按模型名查内置表)
+        w.on_key(key(KeyCode::Char('t')));
+        w.input_buf.clear();
+        w.on_key(key(KeyCode::Enter));
+        assert_eq!(w.context_window, None);
+
+        // 非法输入(0 / 非数字):不写入,留输入态并回填原串
+        for bad in ["0", "abc"] {
+            w.on_key(key(KeyCode::Char('t')));
+            w.input_buf.clear();
+            for c in bad.chars() {
+                w.on_key(key(KeyCode::Char(c)));
+            }
+            w.on_key(key(KeyCode::Enter));
+            assert!(w.typing && w.typing_context_window, "{bad} 应留在输入态");
+            assert_eq!(w.input_buf, bad);
+            assert_eq!(w.context_window, None, "{bad} 不是有效窗口,不该写入");
+            w.on_key(key(KeyCode::Esc));
+            assert!(!w.typing && !w.typing_context_window, "Esc 要清掉窗口输入标记");
+        }
+
+        // 本步 Enter → 轮数上限;draft 带上窗口(保存路径要用它)
+        w.context_window = Some(131_072);
+        w.on_key(key(KeyCode::Enter));
+        assert_eq!(w.step, Step::MaxTurns);
+        assert_eq!(w.draft().context_window, Some(131_072));
+
+        // Esc 链:验证 → 轮数上限 → 上下文窗口
+        w.step = Step::Verifying;
+        w.on_key(key(KeyCode::Esc));
+        assert_eq!(w.step, Step::MaxTurns);
+        w.on_key(key(KeyCode::Esc));
+        assert_eq!(w.step, Step::ContextWindow);
     }
 }

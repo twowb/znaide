@@ -75,11 +75,13 @@ pub struct Resolved {
 /// 模型窗口内置表(没配 context_window 时按名字匹配)。
 /// 数据 2026-09 从各家官方页 + Litellm 扒的,迭代很快,过时了就改;
 /// 本地模型窗口看 ollama 的 num_ctx,对不上就在 config.json 写死。
-fn model_context_window(model: &str) -> usize {
+/// **查不到一律返回 None(未知)**:以前这里回 32k,会把百万级模型算成"快满了",
+/// 占用条虚高还会劝人做没必要的 /compact。
+fn model_context_window(model: &str) -> Option<usize> {
     let m = model.to_lowercase();
     let has = |keys: &[&str]| keys.iter().any(|k| m.contains(k));
     // ---- 闭源/云端 ----
-    if has(&["claude"]) {
+    let win: usize = if has(&["claude"]) {
         200_000 // opus/sonnet/haiku 4.x-5.x
     } else if has(&["gpt-5"]) {
         400_000 // gpt-5 / gpt-5-mini / gpt-5-nano
@@ -91,9 +93,11 @@ fn model_context_window(model: &str) -> usize {
         128_000
     } else if has(&["gemini"]) || has(&["qwen-plus"]) {
         1_000_000 // gemini-2.5 系(官方站限区未能复核);qwen-plus(百炼 Qwen3 系)
+    } else if has(&["qwen3-max", "qwen3.8-max"]) {
+        1_000_000 // 百炼 Qwen3 代 max 档:与表内同代的 qwen-plus 对齐(确切值请写进条目覆盖)
     } else if has(&["qwen-max"]) {
         32_768 // 阿里百炼 qwen-max 官方页
-    } else if has(&["deepseek-v4"]) {
+    } else if has(&["deepseek-v4", "deepseek-flash", "deepseek-pro"]) {
         1_048_576 // DeepSeek v4(flash/pro)官方页 1M
     } else if has(&["deepseek-chat", "deepseek-reasoner"]) {
         131_072
@@ -120,8 +124,10 @@ fn model_context_window(model: &str) -> usize {
     } else if has(&["llama3"]) {
         8_192
     } else {
-        32_768
-    }
+        // 认不出来就认"不知道",不拿默认值假装知道
+        return None;
+    };
+    Some(win)
 }
 
 fn env_first(names: &[&str]) -> Option<String> {
@@ -283,10 +289,11 @@ impl Config {
 }
 
 impl Resolved {
-    /// 实际窗口:配置值 > 内置表 > 32k
-    pub fn effective_context_window(&self) -> usize {
+    /// 实际窗口:配置值 > 内置表;**都查不到 = None(未知)**,调用方据此只报绝对量、
+    /// 不编百分比(见 tui 的 ctx 占用条)。
+    pub fn effective_context_window(&self) -> Option<usize> {
         match self.context_window {
-            Some(n) if n > 0 => n,
+            Some(n) if n > 0 => Some(n),
             _ => model_context_window(&self.model),
         }
     }
@@ -325,12 +332,14 @@ impl Config {
     /// 把当前选择写进 config.json:值写进**对应 provider 条目**(表里没有就补一份),
     /// 不再写顶层三件套——顶层只作手动临时覆盖,面板保存不该把预设永久遮蔽掉。
     /// model/base_url 传 None 表示"保持该条目原值";api_key 传空串表示清除明文。
+    /// context_window 传 None 表示"该条目不固定窗口"(按模型名查内置表,查不到 = 未知)。
     pub fn save(
         &mut self,
         provider: &str,
         model: Option<&str>,
         base_url: Option<&str>,
         api_key: Option<&str>,
+        context_window: Option<usize>,
     ) -> anyhow::Result<()> {
         self.ensure_build_tag();
         self.provider = Some(provider.to_string());
@@ -346,6 +355,8 @@ impl Config {
                 // 空串视为清除明文(api_key_env 保留,环境变量那条路仍可用)
                 entry.api_key = Some(k.to_string()).filter(|s| !s.is_empty());
             }
+            // 0/None 都算"不固定"(0 不是有效窗口,当没填)
+            entry.context_window = context_window.filter(|n| *n > 0);
         }
         // 顶层三件套清空:留着会遮蔽预设,让"切 provider"失效
         self.model = None;
@@ -533,18 +544,43 @@ mod tests {
             ..Default::default()
         };
         let r = cfg.resolve(None, None, None, None).unwrap();
-        assert_eq!(r.effective_context_window(), 65536);
+        assert_eq!(r.effective_context_window(), Some(65536));
         // 未配置 → 按模型名匹配(2026-09 检索值)
         cfg.context_window = None;
         let r = cfg.resolve(None, None, None, None).unwrap();
-        assert_eq!(r.effective_context_window(), 40960); // ollama qwen3:8b
+        assert_eq!(r.effective_context_window(), Some(40960)); // ollama qwen3:8b
         // 云端/闭源家族
-        assert_eq!(model_context_window("qwen-plus"), 1_000_000);
-        assert_eq!(model_context_window("claude-sonnet-4-5"), 200_000);
-        assert_eq!(model_context_window("gpt-5"), 400_000);
-        assert_eq!(model_context_window("deepseek-v4-pro"), 1_048_576);
-        // 未知模型兜底 32k
-        assert_eq!(model_context_window("my-custom-model"), 32_768);
+        assert_eq!(model_context_window("qwen-plus"), Some(1_000_000));
+        assert_eq!(model_context_window("claude-sonnet-4-5"), Some(200_000));
+        assert_eq!(model_context_window("gpt-5"), Some(400_000));
+        assert_eq!(model_context_window("deepseek-v4-pro"), Some(1_048_576));
+        // v4 代短名(真实 API id 不带 v4 时的别名)
+        assert_eq!(model_context_window("deepseek-flash"), Some(1_048_576));
+        // 云端 Qwen3 代 max:不能被 ollama 的 qwen3 兜底(40k)吞掉
+        assert_eq!(model_context_window("qwen3.8-max"), Some(1_000_000));
+        assert_eq!(model_context_window("qwen3-max"), Some(1_000_000));
+        assert_eq!(model_context_window("qwen3:8b"), Some(40_960));
+    }
+
+    /// B:认不出来的模型返回 None(未知),不再假装 32k——否则百万级模型会被算成快满了
+    #[test]
+    fn unknown_model_window_is_none_not_guess() {
+        assert_eq!(model_context_window("my-custom-model"), None);
+        assert_eq!(model_context_window("deepseek-flash-v9-unknown"), Some(1_048_576)); // 命中别名
+        let cfg = Config {
+            model: Some("my-custom-model".into()),
+            ..Default::default()
+        };
+        let r = cfg.resolve(None, None, None, None).unwrap();
+        assert_eq!(r.effective_context_window(), None, "查不到 = 未知,交给调用方只说绝对量");
+        // 面板/配置里写死就照写死(0 无效,当没填)
+        let cfg2 = Config {
+            model: Some("my-custom-model".into()),
+            context_window: Some(262_144),
+            ..Default::default()
+        };
+        let r2 = cfg2.resolve(None, None, None, None).unwrap();
+        assert_eq!(r2.effective_context_window(), Some(262_144));
     }
 
     #[test]
@@ -576,15 +612,27 @@ mod tests {
 
         // 面板保存:先设值再 save → 文件里能读回
         cfg.max_turns = Some(500);
-        cfg.save("ollama", Some("qwen3:8b"), Some("http://127.0.0.1:11434/v1"), None)
-            .unwrap();
+        cfg.save(
+            "ollama",
+            Some("qwen3:8b"),
+            Some("http://127.0.0.1:11434/v1"),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(Config::load().unwrap().max_turns, Some(500));
 
         // 清空 → 写回 None(回到默认)
         let mut cfg = Config::load().unwrap();
         cfg.max_turns = None;
-        cfg.save("ollama", Some("qwen3:8b"), Some("http://127.0.0.1:11434/v1"), None)
-            .unwrap();
+        cfg.save(
+            "ollama",
+            Some("qwen3:8b"),
+            Some("http://127.0.0.1:11434/v1"),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(Config::load().unwrap().max_turns, None);
 
         // 老配置没有该键照常读
@@ -675,14 +723,14 @@ mod tests {
             ..Default::default()
         };
         let r = cfg.resolve(None, None, None, Some("ollama".into())).unwrap();
-        assert_eq!(r.effective_context_window(), 40_960);
+        assert_eq!(r.effective_context_window(), Some(40_960));
         // 没配 provider 窗口时,退回顶层,再退回模型表
         let cfg2 = Config {
             context_window: Some(65_536),
             ..Default::default()
         };
         let r2 = cfg2.resolve(None, None, None, Some("ollama".into())).unwrap();
-        assert_eq!(r2.effective_context_window(), 65_536);
+        assert_eq!(r2.effective_context_window(), Some(65_536));
     }
 
     /// D1:面板保存写进 provider 条目,不再把顶层三件套写死(否则切 provider 失效)
@@ -702,6 +750,7 @@ mod tests {
             Some("deepseek-chat"),
             Some("https://api.deepseek.com/v1"),
             Some("sk-1"),
+            Some(131_072),
         )
         .unwrap();
 
@@ -712,6 +761,7 @@ mod tests {
         assert_eq!(d.model.as_deref(), Some("deepseek-chat"));
         assert_eq!(d.base_url.as_deref(), Some("https://api.deepseek.com/v1"));
         assert_eq!(d.api_key.as_deref(), Some("sk-1"));
+        assert_eq!(d.context_window, Some(131_072), "窗口也写进条目(多服务商各配各的)");
 
         // 落盘后再读,值仍在条目里 → 切 provider 时不会被顶层遮蔽
         let back = Config::load().unwrap();
@@ -719,6 +769,26 @@ mod tests {
         assert_eq!(
             back.all_providers().get("deepseek").and_then(|d| d.model.clone()),
             Some("deepseek-chat".to_string())
+        );
+        assert_eq!(
+            back.all_providers().get("deepseek").and_then(|d| d.context_window),
+            Some(131_072)
+        );
+
+        // 面板留空 = 该条目不固定窗口(清掉旧值,回到按模型名查表)
+        let mut cfg = back;
+        cfg.save(
+            "deepseek",
+            Some("deepseek-chat"),
+            Some("https://api.deepseek.com/v1"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(cfg.providers.get("deepseek").and_then(|d| d.context_window), None);
+        assert_eq!(
+            Config::load().unwrap().providers.get("deepseek").and_then(|d| d.context_window),
+            None
         );
 
         std::env::remove_var("ZNAIDE_DATA_DIR");

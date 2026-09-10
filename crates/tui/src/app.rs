@@ -970,6 +970,7 @@ pub async fn run(
                             Some(&r.model),
                             Some(&r.base_url),
                             key_arg,
+                            wizard.context_window,
                         );
                         // 状态栏立即跟上新的轮数上限
                         round_limit = cfg.effective_max_turns();
@@ -1205,6 +1206,7 @@ pub async fn run(
                                     Some(&draft.model),
                                     Some(&draft.base_url),
                                     key_arg,
+                                    w.context_window,
                                 );
                                 // 状态栏立即跟上新的轮数上限
                                 round_limit = cfg.effective_max_turns();
@@ -1288,19 +1290,21 @@ pub async fn run(
         // 向导/确认框/工作中时不触发(相关层已拦截按键,这里兜底清空状态)。
         let completable = !busy && permission.is_none() && confirm.is_none() && config_wizard.is_none();
         refresh_completion(&input, input_cursor, cwd, completable, &mut completion);
-        // 上下文占用警示:空闲时 >=90% 提示一次(可 /compact 或开新会话);回落后重新武装
+        // 上下文占用警示:空闲时 >=90% 提示一次(可 /compact 或开新会话);回落后重新武装。
+        // 窗口未知时不提示——宁可不说,也不拿猜出来的窗口劝人做没必要的压缩。
         if !busy {
-            let win = current_resolved.effective_context_window();
-            if win > 0 && token_stats.last_prompt > 0 {
-                let pct = (token_stats.last_prompt as u128) * 100 / (win as u128);
-                if pct >= 90 && !ctx_warn_shown {
-                    items.push(MsgItem::Notice(format!(
-                        "⚠ 上下文已用约 {pct}%,再聊可能丢最早的记录。\
-                         可以 /compact 压缩,或 /quit 开新会话(--resume 能找回完整历史)。"
-                    )));
-                    ctx_warn_shown = true;
-                } else if pct < 90 {
-                    ctx_warn_shown = false;
+            if let Some(win) = current_resolved.effective_context_window().filter(|w| *w > 0) {
+                if token_stats.last_prompt > 0 {
+                    let pct = (token_stats.last_prompt as u128) * 100 / (win as u128);
+                    if pct >= 90 && !ctx_warn_shown {
+                        items.push(MsgItem::Notice(format!(
+                            "⚠ 上下文已用约 {pct}%,再聊可能丢最早的记录。\
+                             可以 /compact 压缩,或 /quit 开新会话(--resume 能找回完整历史)。"
+                        )));
+                        ctx_warn_shown = true;
+                    } else if pct < 90 {
+                        ctx_warn_shown = false;
+                    }
                 }
             }
         }
@@ -2025,8 +2029,21 @@ fn fmt_tokens(n: u64) -> String {
 }
 
 /// 上下文占用徽标:10 格占用条 + 百分比,窗口已知就常驻显示;
-/// >=90% 红、>=70% 黄、其余灰;还没有真实 usage 时从 0% 起步。
-fn ctx_usage_badge(used: u64, window: usize) -> Option<(String, Color)> {
+/// 占用 90% 及以上变红、70% 及以上变黄、其余灰;还没有真实 usage 时从 0% 起步。
+/// 窗口未知(模型不在内置表里、配置里也没写死)时不编百分比:只报真实绝对量
+/// `ctx ~21.4k`,也不参与变红与压缩提示——猜错的窗口比没有窗口更误事。
+fn ctx_usage_badge(used: u64, window: Option<usize>) -> Option<(String, Color)> {
+    let window = match window {
+        Some(w) => w,
+        None => {
+            let txt = if used == 0 {
+                "ctx ? 窗口未知".to_string()
+            } else {
+                format!("ctx ~{} 窗口未知", fmt_tokens(used))
+            };
+            return Some((txt, Color::DarkGray));
+        }
+    };
     if window == 0 {
         return None;
     }
@@ -4038,27 +4055,39 @@ mod ctx_usage_tests {
     /// 上下文占用徽标:只要窗口已知就常驻显示;阈值变色;无占用时 0% 起步
     #[test]
     fn badge_usage_and_colors() {
-        // 窗口未知才不显示;占用为 0 时也应显示 0%(会话打开即常驻)
-        assert!(ctx_usage_badge(100, 0).is_none());
-        let (t, c) = ctx_usage_badge(0, 40_960).unwrap();
+        // 窗口为 0(配置里写了无效值)才不显示
+        assert!(ctx_usage_badge(100, Some(0)).is_none());
+        let (t, c) = ctx_usage_badge(0, Some(40_960)).unwrap();
         assert!(t.contains("0%"));
         assert!(t.matches('░').count() == 10);
         assert_eq!(c, Color::DarkGray);
         // 约 25% → 5 格窗口 10 格内应填 2-3 格(round:25% → 2.5 → 3)
-        let (t, c) = ctx_usage_badge(10_240, 40_960).unwrap();
+        let (t, c) = ctx_usage_badge(10_240, Some(40_960)).unwrap();
         assert!(t.starts_with("ctx "));
         assert!(t.contains("25%"));
         assert!(t.matches('█').count() >= 2 && t.matches('█').count() <= 3);
         assert_eq!(c, Color::DarkGray);
         // 70%+ → 黄
-        let (_, c) = ctx_usage_badge(28_672, 40_960).unwrap(); // 70%
+        let (_, c) = ctx_usage_badge(28_672, Some(40_960)).unwrap(); // 70%
         assert_eq!(c, Color::Yellow);
         // 90%+ → 红
-        let (t, c) = ctx_usage_badge(37_000, 40_960).unwrap();
+        let (t, c) = ctx_usage_badge(37_000, Some(40_960)).unwrap();
         assert_eq!(c, Color::Red);
         assert!(t.contains('█'));
         // 超窗保护:百分比封顶显示但不越界 panic
-        let (t, _) = ctx_usage_badge(1_000_000, 40_960).unwrap();
+        let (t, _) = ctx_usage_badge(1_000_000, Some(40_960)).unwrap();
         assert!(t.ends_with("100%"));
+    }
+
+    /// B:窗口未知时只报真实绝对量,不编百分比、不变红(猜错的窗口比没窗口更误事)
+    #[test]
+    fn badge_unknown_window_reports_absolute_only() {
+        let (t, c) = ctx_usage_badge(21_400, None).unwrap();
+        assert!(t.contains("21.4k"), "未知窗口也要给出真实绝对量: {t}");
+        assert!(!t.contains('%'), "不该编百分比: {t}");
+        assert_eq!(c, Color::DarkGray, "未知窗口不参与红/黄升级");
+        // 还没有真实 usage 时如实说"窗口未知"
+        let (t0, _) = ctx_usage_badge(0, None).unwrap();
+        assert!(t0.contains('?'));
     }
 }
