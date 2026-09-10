@@ -61,17 +61,14 @@ async fn run_update() -> anyhow::Result<()> {
     use znaide_core::update::UpdateResult;
     let cur = znaide_core::update::current_version();
     println!("当前版本: v{cur}");
-    match znaide_core::update::perform_update().await {
-        UpdateResult::UpToDate => println!("已是最新版本 v{cur}。"),
-        UpdateResult::Updated { version, source, deferred: false } => {
-            println!("✔ 已更新到 v{version}(来源 {source})。下次启动即生效(本次会话继续用旧版本)。");
+    let r = znaide_core::update::perform_update().await;
+    let msg = r.describe(&cur);
+    // 失败进 stderr(脚本里能分辨),成功/无更新走 stdout
+    match r {
+        UpdateResult::CheckFailed(_) | UpdateResult::DownloadFailed(_) | UpdateResult::VerifyFailed(_) => {
+            eprintln!("{msg}");
         }
-        UpdateResult::Updated { version, source, deferred: true } => {
-            println!("✔ 新版本 v{version}(来源 {source})已就位:退出本程序后会自动完成替换,下次启动即生效。");
-        }
-        UpdateResult::CheckFailed(e) => eprintln!("⚠ 检查更新失败: {e}"),
-        UpdateResult::DownloadFailed(e) => eprintln!("⚠ 更新失败: {e}"),
-        UpdateResult::VerifyFailed(e) => eprintln!("⚠ {e}"),
+        _ => println!("{msg}"),
     }
     Ok(())
 }
@@ -126,16 +123,7 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("⚠ --resume 仅交互模式可用;已忽略(-p 无头模式)。");
             }
             // 什么配置来源都没有时才引导
-            let has_config = znaide_core::config::config_exists()
-                || cli.model.is_some()
-                || cli.base_url.is_some()
-                || cli.api_key.is_some()
-                || cli.provider.is_some()
-                || std::env::var("ZNAIDE_MODEL").is_ok()
-                || std::env::var("OPENAI_MODEL").is_ok()
-                || std::env::var("ZNAIDE_BASE_URL").is_ok()
-                || std::env::var("OPENAI_BASE_URL").is_ok();
-            if !has_config {
+            if !config_provided(&cli) {
                 print_first_run_headless_hint();
                 return Ok(());
             }
@@ -143,8 +131,8 @@ async fn main() -> anyhow::Result<()> {
             run_headless(&resolved, mode, &cwd, prompt, &persona, cli.max_turns).await?;
         }
         None => {
-            // 首次运行(无配置)自动进配置引导
-            let first_run = !znaide_core::config::config_exists();
+            // 首次运行(无任何配置来源)自动进配置引导
+            let first_run = !config_provided(&cli);
             let resolved = resolved.unwrap_or_else(|e| {
                 eprintln!("⚠ 配置解析: {e}");
                 // 先给个默认值撑住引导界面,真正连接前会被覆盖
@@ -175,7 +163,16 @@ async fn main() -> anyhow::Result<()> {
                 },
                 None => None,
             };
-            let stats = run_interactive(&resolved, mode, &cwd, first_run, resume, persona.clone()).await?;
+            let stats = run_interactive(
+                &resolved,
+                mode,
+                &cwd,
+                first_run,
+                resume,
+                persona.clone(),
+                cli.max_turns,
+            )
+            .await?;
             print_session_stats(&stats);
         }
     }
@@ -292,12 +289,7 @@ async fn run_headless(
         None
     };
 
-    let mode_cn = match mode {
-        Mode::Ask => "询问",
-        Mode::AcceptEdits => "编辑放行",
-        Mode::BypassPermissions => "全自动",
-        Mode::Yolo => "超级(YOLO)",
-    };
+    let mode_cn = mode.label();
     eprintln!("▶ 正在执行(模型: {},权限: {mode_cn})…", resolved.model);
     let mut session = Session::new(
         llm,
@@ -342,10 +334,23 @@ async fn run_interactive(
     first_run: bool,
     resume: Option<PathBuf>,
     persona: String,
+    max_turns: Option<usize>,
 ) -> anyhow::Result<znaide_tui::ExitStats> {
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         anyhow::bail!("交互模式需要终端。请在终端中运行 znaide,或用 -p \"指令\" 使用无头模式。");
     }
-    let stats = znaide_tui::run(resolved, mode, cwd, first_run, resume, persona).await?;
+    let stats = znaide_tui::run(resolved, mode, cwd, first_run, resume, persona, max_turns).await?;
     Ok(stats)
+}
+
+/// 是否已经有可用的配置来源(配置文件 / 命令行覆盖 / 环境变量)。
+/// 两个模式共用同一判定:只看配置文件会让"`--provider X --model Y` 齐了却还弹配置引导"
+/// 这种不一致发生;环境变量那份清单也不再手写,直接问 core(resolve 认哪些就问哪些)。
+fn config_provided(cli: &Cli) -> bool {
+    znaide_core::config::config_exists()
+        || cli.model.is_some()
+        || cli.base_url.is_some()
+        || cli.api_key.is_some()
+        || cli.provider.is_some()
+        || znaide_core::config::env_configured()
 }

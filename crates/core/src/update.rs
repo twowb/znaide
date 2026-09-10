@@ -53,14 +53,6 @@ impl UpdateSource {
         }
     }
 
-    /// 该源失败时的额外提示
-    fn hint(self) -> &'static str {
-        match self {
-            UpdateSource::GitHub => "GitHub 网络不通时可设置 HTTPS_PROXY",
-            UpdateSource::Gitee => "请检查 Gitee 仓库是否公开可访问",
-        }
-    }
-
     /// 探测该源的最新发布版本(不带 v 前缀,如 "1.1.0")
     pub async fn check_latest(self, client: &reqwest::Client) -> anyhow::Result<String> {
         match self {
@@ -131,31 +123,23 @@ pub fn current_version() -> String {
 /// windows-x64 / macos-x64 / macos-arm64 / android-arm64,Windows 的
 /// .exe 在版本号**之后**(znaide-windows-x64-v1.0.1.exe)。
 pub fn release_asset_name(version: &str) -> Option<String> {
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    {
-        return Some(format!("znaide-linux-x64-v{version}"));
+    // 用 cfg! 而不是 #[cfg] 块:后者在当前 target 上会让前面的块提前 return,
+    // 末尾的 None 被判"不可达"报警告(但它在未覆盖的架构上其实是要走的分支)。
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        Some(format!("znaide-linux-x64-v{version}"))
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        Some(format!("znaide-linux-arm64-v{version}"))
+    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        Some(format!("znaide-windows-x64-v{version}.exe"))
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        Some(format!("znaide-macos-x64-v{version}"))
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        Some(format!("znaide-macos-arm64-v{version}"))
+    } else if cfg!(all(target_os = "android", target_arch = "aarch64")) {
+        Some(format!("znaide-android-arm64-v{version}"))
+    } else {
+        None
     }
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    {
-        return Some(format!("znaide-linux-arm64-v{version}"));
-    }
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    {
-        return Some(format!("znaide-windows-x64-v{version}.exe"));
-    }
-    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    {
-        return Some(format!("znaide-macos-x64-v{version}"));
-    }
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    {
-        return Some(format!("znaide-macos-arm64-v{version}"));
-    }
-    #[cfg(all(target_os = "android", target_arch = "aarch64"))]
-    {
-        return Some(format!("znaide-android-arm64-v{version}"));
-    }
-    None
 }
 
 /// 语义化版本 vX.Y.Z 比较:a > b?
@@ -333,6 +317,31 @@ pub enum UpdateResult {
     DownloadFailed(String),
     /// 下载产物自检不过
     VerifyFailed(String),
+}
+
+impl UpdateResult {
+    /// 给用户看的一句话(CLI 打印 / TUI 提示共用一份,别再各写一遍 match)。
+    /// `current` = 当前版本(已是最新时回显)。
+    pub fn describe(&self, current: &str) -> String {
+        match self {
+            UpdateResult::UpToDate => format!("已是最新版本 v{current}。"),
+            UpdateResult::Updated {
+                version,
+                source,
+                deferred: false,
+            } => format!("✔ 已更新到 v{version}(来源 {source}):下次启动生效(本次继续用旧版本)。"),
+            UpdateResult::Updated {
+                version,
+                source,
+                deferred: true,
+            } => format!(
+                "✔ 新版本 v{version}(来源 {source})已就位:退出程序后自动完成替换,下次启动生效。"
+            ),
+            UpdateResult::CheckFailed(e) => format!("⚠ 检查更新失败: {e}"),
+            UpdateResult::DownloadFailed(e) => format!("⚠ 更新失败: {e}"),
+            UpdateResult::VerifyFailed(e) => format!("⚠ {e}"),
+        }
+    }
 }
 
 /// 完整执行一次更新:按源顺序[Gitee → GitHub]探测 → 比较 → 下载 → 自检 → 安装。

@@ -467,18 +467,9 @@ fn migrate_commands_from(commands_dir: &Path, skills_dir: &Path) -> usize {
     migrated
 }
 
-/// 从旧命令文本里读 description(与 parse_frontmatter 同风格)
+/// 从旧命令文本里读 description(走 parse_frontmatter,别再手抄一份同样的解析)
 fn extract_description(text: &str) -> String {
-    if let Some(rest) = text.strip_prefix("---") {
-        if let Some(end) = rest.find("\n---") {
-            for line in rest[..end].lines() {
-                if let Some(v) = line.trim().strip_prefix("description:") {
-                    return v.trim().trim_matches('"').trim_matches('\'').to_string();
-                }
-            }
-        }
-    }
-    String::new()
+    parse_frontmatter(text).0.description
 }
 
 /// 按名精确查找(含手动触发与模型调用两种入口)

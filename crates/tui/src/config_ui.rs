@@ -29,6 +29,10 @@ pub enum Step {
     Verifying,
 }
 
+/// 模型列表一次最多画多少行;超出的部分靠滚动窗口查看
+/// (固定 take(N) 会让游标移出屏幕,回车选中看不见的模型)
+const MODEL_WINDOW: usize = 25;
+
 /// 宿主需要执行的异步动作
 pub enum WizardAction {
     None,
@@ -36,8 +40,6 @@ pub enum WizardAction {
     FetchModels { base_url: String, api_key: Option<String> },
     /// 验证连接(base_url/model/api_key,由宿主调用 client.validate)
     Verify(Resolved),
-    /// 保存配置(验证通过后)
-    Save(Resolved),
     /// 退出向导
     Exit,
 }
@@ -219,11 +221,17 @@ impl SetupWizard {
         }
     }
 
-    pub fn is_idle_step(&self) -> bool {
-        matches!(
-            self.step,
-            Step::Provider | Step::ModelSelect | Step::ApiKey | Step::ContextWindow | Step::MaxTurns
-        )
+    /// 模型列表的滚动窗口:返回(起点下标, 画几行),保证 `model_cursor` 总在窗口内
+    pub fn model_window(&self) -> (usize, usize) {
+        let n = self.models.len();
+        if n <= MODEL_WINDOW {
+            return (0, n);
+        }
+        let first = self
+            .model_cursor
+            .saturating_sub(MODEL_WINDOW / 2)
+            .min(n - MODEL_WINDOW);
+        (first, MODEL_WINDOW)
     }
 
     /// 当前形成的 Resolved(未验证)
@@ -720,7 +728,10 @@ impl SetupWizard {
                         "选择模型(↑↓ + Enter),或 m 手动输入:",
                         Style::default().fg(Color::Yellow),
                     )));
-                    for (i, m) in self.models.iter().enumerate().take(25) {
+                    // 只画一个滚动窗口:光标可能落在 25 行之外,以前固定 take(25) 会让
+                    // ▶ 移出屏幕、回车选中看不见的那一项
+                    let (first, _) = self.model_window();
+                    for (i, m) in self.models.iter().enumerate().skip(first).take(MODEL_WINDOW) {
                         let sel = i == self.model_cursor;
                         let marker = if sel { "▶ " } else { "  " };
                         let st = if sel {
@@ -733,9 +744,14 @@ impl SetupWizard {
                             Span::styled(m.clone(), st),
                         ]));
                     }
-                    if self.models.len() > 25 {
+                    if self.models.len() > MODEL_WINDOW {
                         lines.push(Line::from(Span::styled(
-                            format!("…(共 {} 个,可输入筛选)", self.models.len()),
+                            format!(
+                                "…(共 {} 个,正在显示 {}-{};↑↓ 继续翻)",
+                                self.models.len(),
+                                first + 1,
+                                (first + MODEL_WINDOW).min(self.models.len())
+                            ),
                             Style::default().fg(Color::DarkGray),
                         )));
                     }
@@ -867,22 +883,6 @@ fn provider_list() -> Vec<(String, String, String)> {
     // 追加"自定义服务商"选项
     out.push(("custom".into(), "(手动输入端点)".into(), String::new()));
     out
-}
-
-/// 按服务商名查找预置 key 环境变量的值(存在且已设置则读)
-fn env_key_for(provider: &str) -> String {
-    let cfg = Config::load().unwrap_or_default();
-    let all = cfg.all_providers();
-    if let Some(def) = all.get(provider) {
-        if let Some(env) = &def.api_key_env {
-            if let Ok(v) = std::env::var(env) {
-                if !v.is_empty() {
-                    return v;
-                }
-            }
-        }
-    }
-    String::new()
 }
 
 #[cfg(test)]

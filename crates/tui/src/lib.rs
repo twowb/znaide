@@ -15,7 +15,8 @@ pub use app::ExitStats;
 /// 启动交互模式。resolved:模型连接配置;mode:权限模式;cwd:agent 工作目录;
 /// first_run:首次运行(无配置文件),启动后自动进入配置引导;
 /// resume:启动时直接恢复的历史会话文件(--resume <会话ID|片段>);
-/// persona:启动时注入的全局人格(空 = 不注入)。
+/// persona:启动时注入的全局人格(空 = 不注入);
+/// max_turns:命令行 `--max-turns` 覆盖(优先级高于 config;None = 用 config/默认)。
 /// 正常退出(/quit、/exit、Ctrl+C)返回本次会话统计供 CLI 打印。
 pub async fn run(
     resolved: &Resolved,
@@ -24,6 +25,7 @@ pub async fn run(
     first_run: bool,
     resume: Option<PathBuf>,
     persona: String,
+    max_turns: Option<usize>,
 ) -> anyhow::Result<ExitStats> {
-    app::run(resolved, mode, cwd, first_run, resume, persona).await
+    app::run(resolved, mode, cwd, first_run, resume, persona, max_turns).await
 }

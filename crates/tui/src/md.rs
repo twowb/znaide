@@ -21,8 +21,10 @@ struct Row {
     text: String,
 }
 
-fn wc(c: char) -> u16 {
-    // 近似 Unicode 宽度:CJK/全角/emoji 按 2 列
+/// 近似显示宽度:CJK/全角/常见 emoji 按 2 列,控制字符 0 列。
+/// ansi.rs 也用它,所以是 `pub(crate)`——以前那边抄了一份一模一样的,注释里还写着
+/// "两边要一起改",已经是个漂移隐患。
+pub(crate) fn wc(c: char) -> u16 {
     if c.is_control() {
         return 0;
     }

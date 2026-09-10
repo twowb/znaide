@@ -151,7 +151,10 @@ fn extract_frontmatter(content: &str) -> (String, String) {
     (name, desc)
 }
 
-/// 解析 frontmatter 的 name / description / type(缺省补齐)
+/// 解析 frontmatter 的 name / description / type(缺省补齐)。
+/// 注意:这里**故意**没和 skills::parse_frontmatter 合并——两者语义不同:
+/// 记忆文件的值不做去引号、name 缺省补 "(未命名)",还多认一个 `type:` 字段;
+/// 硬合并会改掉记忆的既有解析结果。真要统一时得先确认这两种读法的取舍。
 fn extract_meta(content: &str) -> (String, String, String) {
     let mut name = String::new();
     let mut desc = String::new();
@@ -276,12 +279,7 @@ fn slugify(name: &str) -> String {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let cut: String = s.chars().take(max).collect();
-        format!("{cut}…")
-    }
+    crate::util::truncate_chars(s, max, "…")
 }
 
 #[cfg(test)]

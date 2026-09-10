@@ -27,7 +27,8 @@ pub struct Config {
     /// 当前 provider(见 providers 表)
     pub provider: Option<String>,
     pub providers: std::collections::HashMap<String, ProviderDef>,
-    /// 上下文窗口(token)。不设则查内置表,兜底 32k;
+    /// 上下文窗口(token),按 provider 各配各的;不设则按模型名查内置表,
+    /// **查不到就是"未知"**(不再兜底 32k,见 `effective_context_window`)。
     /// ollama 要和运行时的 num_ctx 对上,否则占用条不准。
     pub context_window: Option<usize>,
     /// 单条消息最多允许的模型往返轮数(一轮可含多次工具调用)。不设 = 200;
@@ -87,7 +88,7 @@ fn model_context_window(model: &str) -> Option<usize> {
         400_000 // gpt-5 / gpt-5-mini / gpt-5-nano
     } else if has(&["gpt-4.1"]) {
         1_048_576
-    } else if has(&["o4-mini", "o4-mini", "o3", "o1"]) {
+    } else if has(&["o4-mini", "o3", "o1"]) {
         200_000
     } else if has(&["gpt-4o"]) {
         128_000
@@ -449,6 +450,24 @@ impl Config {
 /// 是否已存在配置文件
 pub fn config_exists() -> bool {
     config_path().exists()
+}
+
+/// resolve() 会读取的环境变量里,有没有哪个已经设了非空值。
+/// 宿主判断"用户是不是已经提供了配置"时用它,别再各自手写清单——手写那份漏了
+/// `ZNAIDE_PROVIDER`(单给一个 provider 名就能靠内置预设跑起来,却会被判成"没配置")。
+pub fn env_configured() -> bool {
+    let names = [
+        "ZNAIDE_PROVIDER",
+        "ZNAIDE_MODEL",
+        "OPENAI_MODEL",
+        "ZNAIDE_BASE_URL",
+        "OPENAI_BASE_URL",
+        "ZNAIDE_API_KEY",
+        "OPENAI_API_KEY",
+    ];
+    names
+        .iter()
+        .any(|n| std::env::var(n).map(|v| !v.trim().is_empty()).unwrap_or(false))
 }
 
 /// 建数据目录(memories/skills/sessions),不生成任何配置文件;
