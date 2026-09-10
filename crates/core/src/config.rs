@@ -30,6 +30,9 @@ pub struct Config {
     /// 上下文窗口(token)。不设则查内置表,兜底 32k;
     /// ollama 要和运行时的 num_ctx 对上,否则占用条不准。
     pub context_window: Option<usize>,
+    /// 单条消息最多允许的模型往返轮数(一轮可含多次工具调用)。不设 = 200;
+    /// 0 = 不限(只靠"重复调用同一工具"刹车)。命令行 `--max-turns` 优先于这里。
+    pub max_turns: Option<usize>,
     /// 全局人格(见 persona 模块);空 = 不注入。切换会写回这里持久生效。
     pub persona: Option<String>,
     /// 配置格式版本(内部键):保存时缺失自动补齐,供将来迁移判断。
@@ -37,8 +40,10 @@ pub struct Config {
     pub build_tag: Option<String>,
 }
 
-/// 当前配置格式版本(写入 config.json 的 build_tag;将来结构变化时据此迁移)
-const CONFIG_TAG: &str = "a16416a02578";
+/// 当前配置格式版本(写入 config.json 的 build_tag)。
+/// v2:顶层 model/base_url/api_key/context_window 不再由面板写入,改为搬进对应
+/// provider 条目(顶层只作手动临时覆盖),因此换一次标记触发一次性自愈迁移。
+const CONFIG_TAG: &str = "c6ee35b45916";
 
 /// provider 预设:端点 + 默认模型 + key(环境变量名或明文)
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -51,6 +56,9 @@ pub struct ProviderDef {
     pub api_key_env: Option<String>,
     /// 明文 key(优先于 api_key_env)
     pub api_key: Option<String>,
+    /// 该服务商对应模型的上下文窗口(可选)。多 provider 各配各的,
+    /// 避免在 40k 的 ollama 与 1M 的云端模型之间切换时占用条算错。
+    pub context_window: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -174,8 +182,31 @@ impl Config {
     /// 合并后的 provider 表(内置 + 用户覆盖/新增)
     pub fn all_providers(&self) -> std::collections::HashMap<String, ProviderDef> {
         let mut m = builtin_providers();
+        // 字段级合并:内置条目为底,用户条目只覆盖它写了值的字段。
+        // (整条替换会让 `{"base_url": ...}` 顺手丢掉内置的 model/api_key_env)
         for (k, v) in &self.providers {
-            m.insert(k.clone(), v.clone());
+            match m.get_mut(k) {
+                Some(base) => {
+                    if v.base_url.is_some() {
+                        base.base_url = v.base_url.clone();
+                    }
+                    if v.model.is_some() {
+                        base.model = v.model.clone();
+                    }
+                    if v.api_key.is_some() {
+                        base.api_key = v.api_key.clone();
+                    }
+                    if v.api_key_env.is_some() {
+                        base.api_key_env = v.api_key_env.clone();
+                    }
+                    if v.context_window.is_some() {
+                        base.context_window = v.context_window;
+                    }
+                }
+                None => {
+                    m.insert(k.clone(), v.clone());
+                }
+            }
         }
         m
     }
@@ -231,25 +262,21 @@ impl Config {
                 )
             })?;
 
-        // key:CLI > env > provider 明文 > provider 环境变量名 > config 顶层
+        // key:CLI > env > 顶层 config(手动覆盖)> provider 明文 > provider 环境变量名。
+        // 三个字段口径统一为"顶层覆盖预设",避免切 provider 时出现"新 key + 老端点"的错配。
         let api_key = cli_api_key
             .or_else(|| env_first(&["ZNAIDE_API_KEY", "OPENAI_API_KEY"]))
-            .or_else(|| {
-                pdef.api_key
-                    .clone()
-                    .filter(|k| !k.is_empty())
-                    .or_else(|| {
-                        pdef.api_key_env.as_ref().and_then(|env| env_first(&[env]))
-                    })
-            })
-            .or_else(|| self.api_key.clone().filter(|k| !k.is_empty()));
+            .or_else(|| self.api_key.clone().filter(|k| !k.is_empty()))
+            .or_else(|| pdef.api_key.clone().filter(|k| !k.is_empty()))
+            .or_else(|| pdef.api_key_env.as_ref().and_then(|env| env_first(&[env])));
 
         Ok(Resolved {
             model,
             base_url,
             api_key,
             provider_name,
-            context_window: self.context_window,
+            // 窗口按 provider 走(各服务商各配各的);顶层那个是历史遗留兜底
+            context_window: pdef.context_window.or(self.context_window),
         })
     }
 
@@ -266,6 +293,11 @@ impl Resolved {
 }
 
 impl Config {
+    /// 单条消息的轮数上限:配置值 > 默认 200;0 表示不限(不替换成默认值)
+    pub fn effective_max_turns(&self) -> usize {
+        self.max_turns.unwrap_or(crate::session::DEFAULT_MAX_TURNS)
+    }
+
     /// provider 清单(名字/base_url/模型),给 UI 列表用
     pub fn list_providers(&self) -> Vec<(String, String, String)> {
         let providers = self.all_providers();
@@ -290,7 +322,9 @@ impl Config {
         }
     }
 
-    /// 把当前选择写进 config.json。表里没有的 provider 会补一份,方便以后手改。
+    /// 把当前选择写进 config.json:值写进**对应 provider 条目**(表里没有就补一份),
+    /// 不再写顶层三件套——顶层只作手动临时覆盖,面板保存不该把预设永久遮蔽掉。
+    /// model/base_url 传 None 表示"保持该条目原值";api_key 传空串表示清除明文。
     pub fn save(
         &mut self,
         provider: &str,
@@ -300,31 +334,24 @@ impl Config {
     ) -> anyhow::Result<()> {
         self.ensure_build_tag();
         self.provider = Some(provider.to_string());
-        self.model = model.map(|s| s.to_string());
-        self.base_url = base_url.map(|s| s.to_string());
-        // api_key 为空字符串视为清除
-        self.api_key = api_key
-            .map(|s| s.to_string())
-            .filter(|s| !s.is_empty());
-        // 确保 provider 在表里(便于用户以后在文件里继续改)
-        if !self.providers.contains_key(provider) {
-            self.providers.insert(
-                provider.to_string(),
-                ProviderDef {
-                    base_url: base_url.map(|s| s.to_string()),
-                    model: model.map(|s| s.to_string()),
-                    api_key: api_key.map(|s| s.to_string()),
-                    api_key_env: None,
-                },
-            );
+        {
+            let entry = self.providers.entry(provider.to_string()).or_default();
+            if let Some(m) = model {
+                entry.model = Some(m.to_string());
+            }
+            if let Some(b) = base_url {
+                entry.base_url = Some(b.to_string());
+            }
+            if let Some(k) = api_key {
+                // 空串视为清除明文(api_key_env 保留,环境变量那条路仍可用)
+                entry.api_key = Some(k.to_string()).filter(|s| !s.is_empty());
+            }
         }
-        let path = config_path();
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let text = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, text + "\n")?;
-        Ok(())
+        // 顶层三件套清空:留着会遮蔽预设,让"切 provider"失效
+        self.model = None;
+        self.base_url = None;
+        self.api_key = None;
+        self.persist()
     }
 
     /// 新增/覆盖一个 provider 预设并落盘
@@ -361,14 +388,50 @@ impl Config {
         matches!(&self.build_tag, Some(t) if t != CONFIG_TAG)
     }
 
-    /// 执行迁移:把 build_tag 置回当前版本并落盘;返回是否发生过迁移
+    /// 执行迁移:把 build_tag 置回当前版本,并把历史遗留的"顶层三件套 + 顶层窗口"
+    /// 搬进当前 provider 条目(它们只是手动临时覆盖,长期留着会遮蔽预设、让切 provider 失效)。
+    /// 返回是否发生过迁移。
     pub fn migrate(&mut self) -> anyhow::Result<bool> {
         if !self.needs_migrate() {
             return Ok(false);
         }
         self.build_tag = Some(CONFIG_TAG.to_string());
+        self.absorb_top_level_into_provider();
         self.persist()?;
         Ok(true)
+    }
+
+    /// 把顶层 model/base_url/api_key/context_window 搬进当前 provider 条目并清空顶层。
+    /// 口径统一后顶层三件套一律"手动覆盖"(优先于预设),所以"搬进条目 + 清空顶层"
+    /// 之后 `resolve()` 的结果必然与搬之前一致(见 migrate_absorbs_top_level_overrides)。
+    fn absorb_top_level_into_provider(&mut self) {
+        if self.model.is_none()
+            && self.base_url.is_none()
+            && self.api_key.is_none()
+            && self.context_window.is_none()
+        {
+            return;
+        }
+        let name = self
+            .provider
+            .clone()
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| "ollama".to_string());
+        let entry = self.providers.entry(name).or_default();
+        if let Some(m) = self.model.take() {
+            entry.model = Some(m);
+        }
+        if let Some(b) = self.base_url.take() {
+            entry.base_url = Some(b);
+        }
+        if let Some(cw) = self.context_window.take() {
+            entry.context_window = Some(cw);
+        }
+        // 口径统一后顶层三件套一律"手动覆盖"(优先于预设),所以顶层 key 一定有生效,
+        // 直接搬进条目即可——搬完生效值不变。
+        if let Some(k) = self.api_key.take() {
+            entry.api_key = Some(k);
+        }
     }
 }
 
@@ -409,6 +472,7 @@ mod tests {
             api_key: None,
             provider: None,
             context_window: None,
+            max_turns: None,
             persona: None,
             build_tag: None,
             providers: Default::default(),
@@ -450,6 +514,7 @@ mod tests {
             api_key: None,
             provider: Some("ollama".into()),
             context_window: None,
+            max_turns: None,
             persona: None,
             build_tag: None,
             providers,
@@ -482,23 +547,251 @@ mod tests {
         assert_eq!(model_context_window("my-custom-model"), 32_768);
     }
 
+    #[test]
+    fn effective_max_turns_defaults_and_overrides() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.effective_max_turns(), crate::session::DEFAULT_MAX_TURNS);
+        cfg.max_turns = Some(500);
+        assert_eq!(cfg.effective_max_turns(), 500);
+        // 0 是"不限"的有效值,不能被替换成默认
+        cfg.max_turns = Some(0);
+        assert_eq!(cfg.effective_max_turns(), 0);
+    }
+
+    /// 轮数上限随 save() 落盘并读回——配置面板保存走的就是 `cfg.max_turns = …; save(…)`
+    /// 这条路;顺带覆盖"老配置没有该键 → None"。
+    #[test]
+    fn max_turns_roundtrip_through_save() {
+        let _g = crate::test_util::DATA_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("znaide_cfg_mt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("ZNAIDE_DATA_DIR", &dir);
+
+        // 全新(无 config.json):未设置
+        let mut cfg = Config::load().unwrap_or_default();
+        assert_eq!(cfg.max_turns, None);
+
+        // 面板保存:先设值再 save → 文件里能读回
+        cfg.max_turns = Some(500);
+        cfg.save("ollama", Some("qwen3:8b"), Some("http://127.0.0.1:11434/v1"), None)
+            .unwrap();
+        assert_eq!(Config::load().unwrap().max_turns, Some(500));
+
+        // 清空 → 写回 None(回到默认)
+        let mut cfg = Config::load().unwrap();
+        cfg.max_turns = None;
+        cfg.save("ollama", Some("qwen3:8b"), Some("http://127.0.0.1:11434/v1"), None)
+            .unwrap();
+        assert_eq!(Config::load().unwrap().max_turns, None);
+
+        // 老配置没有该键照常读
+        let legacy: Config = serde_json::from_str(r#"{"model":"m"}"#).unwrap();
+        assert_eq!(legacy.max_turns, None);
+
+        std::env::remove_var("ZNAIDE_DATA_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// build_tag(配置格式版本):老配置无此键读为 None;写盘前由 save 系补上
     #[test]
     fn build_tag_roundtrip_and_legacy_default() {
         let old: Config = serde_json::from_str(r#"{"model":"m"}"#).unwrap();
         assert_eq!(old.build_tag, None, "老配置(无 build_tag)应读为 None");
+        // 用常量拼,别再写死字面量(换版本时会一起失效)
         let with_tag: Config =
-            serde_json::from_str(r#"{"build_tag":"a16416a02578"}"#).unwrap();
+            serde_json::from_str(&format!(r#"{{"build_tag":"{CONFIG_TAG}"}}"#)).unwrap();
         assert_eq!(with_tag.build_tag.as_deref(), Some(CONFIG_TAG));
     }
 
-    /// 迁移判定:当前版本/无标记不触发;异源标记触发(启动时自动置回)
+    /// 迁移判定:当前版本/无标记不触发;旧版与异源标记都触发(启动时自动置回)
     #[test]
     fn migrate_detects_foreign_build_tag() {
-        let cur: Config = serde_json::from_str(r#"{"build_tag":"a16416a02578"}"#).unwrap();
+        let cur: Config =
+            serde_json::from_str(&format!(r#"{{"build_tag":"{CONFIG_TAG}"}}"#)).unwrap();
         assert!(!cur.needs_migrate(), "当前版本标记不需迁移");
         assert!(!Config::default().needs_migrate(), "无标记(初次)不需迁移");
+        let v1: Config = serde_json::from_str(r#"{"build_tag":"a16416a02578"}"#).unwrap();
+        assert!(v1.needs_migrate(), "上一版标记应触发一次性迁移");
         let foreign: Config = serde_json::from_str(r#"{"build_tag":"deadbeef00"}"#).unwrap();
         assert!(foreign.needs_migrate(), "异源标记应触发迁移");
+    }
+
+    /// D4:用户条目按字段覆盖内置预设,不能顺手丢掉它没写的字段
+    #[test]
+    fn user_preset_merges_field_wise() {
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "deepseek".into(),
+            ProviderDef {
+                base_url: Some("https://mirror.example.com/v1".into()),
+                ..Default::default()
+            },
+        );
+        let cfg = Config {
+            providers,
+            ..Default::default()
+        };
+        let all = cfg.all_providers();
+        let d = all.get("deepseek").expect("内置 deepseek 应在");
+        assert_eq!(d.base_url.as_deref(), Some("https://mirror.example.com/v1"), "用户写的覆盖");
+        assert!(d.model.is_some(), "没写的 model 应保留内置值");
+        assert!(d.api_key_env.is_some(), "没写的 api_key_env 应保留内置值");
+        // 用户自定义的新 provider 照常加入
+        let mut providers2 = std::collections::HashMap::new();
+        providers2.insert(
+            "myprov".into(),
+            ProviderDef {
+                base_url: Some("https://mine/v1".into()),
+                model: Some("m".into()),
+                ..Default::default()
+            },
+        );
+        let cfg2 = Config {
+            providers: providers2,
+            ..Default::default()
+        };
+        assert!(cfg2.all_providers().contains_key("myprov"));
+    }
+
+    /// D3:上下文窗口按 provider 走,顶层那个只作兜底
+    #[test]
+    fn context_window_prefers_provider_entry() {
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "ollama".into(),
+            ProviderDef {
+                base_url: Some("http://127.0.0.1:11434/v1".into()),
+                model: Some("qwen3:8b".into()),
+                context_window: Some(40_960),
+                ..Default::default()
+            },
+        );
+        let cfg = Config {
+            providers,
+            context_window: Some(9_999_999), // 历史遗留的全局值:不该盖过 provider 自己的
+            ..Default::default()
+        };
+        let r = cfg.resolve(None, None, None, Some("ollama".into())).unwrap();
+        assert_eq!(r.effective_context_window(), 40_960);
+        // 没配 provider 窗口时,退回顶层,再退回模型表
+        let cfg2 = Config {
+            context_window: Some(65_536),
+            ..Default::default()
+        };
+        let r2 = cfg2.resolve(None, None, None, Some("ollama".into())).unwrap();
+        assert_eq!(r2.effective_context_window(), 65_536);
+    }
+
+    /// D1:面板保存写进 provider 条目,不再把顶层三件套写死(否则切 provider 失效)
+    #[test]
+    fn save_writes_into_provider_entry_not_top_level() {
+        let _g = crate::test_util::DATA_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("znaide_cfg_save_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("ZNAIDE_DATA_DIR", &dir);
+
+        let mut cfg = Config::default();
+        cfg.save(
+            "deepseek",
+            Some("deepseek-chat"),
+            Some("https://api.deepseek.com/v1"),
+            Some("sk-1"),
+        )
+        .unwrap();
+
+        assert_eq!(cfg.model, None, "顶层 model 不该被写");
+        assert_eq!(cfg.base_url, None, "顶层 base_url 不该被写");
+        assert_eq!(cfg.api_key, None, "顶层 api_key 不该被写");
+        let d = cfg.providers.get("deepseek").expect("条目应写入");
+        assert_eq!(d.model.as_deref(), Some("deepseek-chat"));
+        assert_eq!(d.base_url.as_deref(), Some("https://api.deepseek.com/v1"));
+        assert_eq!(d.api_key.as_deref(), Some("sk-1"));
+
+        // 落盘后再读,值仍在条目里 → 切 provider 时不会被顶层遮蔽
+        let back = Config::load().unwrap();
+        assert!(back.model.is_none() && back.base_url.is_none());
+        assert_eq!(
+            back.all_providers().get("deepseek").and_then(|d| d.model.clone()),
+            Some("deepseek-chat".to_string())
+        );
+
+        std::env::remove_var("ZNAIDE_DATA_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D5:自愈迁移把顶层三件套搬进当前 provider,且**迁移前后生效配置一致**
+    #[test]
+    fn migrate_absorbs_top_level_overrides() {
+        const VAR: &str = "ZNAIDE_TEST_ABSORB_KEY";
+        std::env::remove_var(VAR); // 分支 A:环境变量不存在
+        let raw = format!(
+            r#"{{
+            "model": "deepseek-flash",
+            "base_url": "https://api.deepseek.com/v1",
+            "api_key": "sk-top",
+            "provider": "deepseek",
+            "context_window": 65536,
+            "providers": {{
+                "deepseek": {{"model": "deepseek-v4-flash", "api_key_env": "{VAR}"}},
+                "ollama": {{"base_url": "http://127.0.0.1:11434/v1", "model": "qwen3:8b"}}
+            }}
+        }}"#
+        );
+        let before: Config = serde_json::from_str(&raw).unwrap();
+        let eff_before = before.resolve(None, None, None, None).unwrap();
+
+        let mut after: Config = serde_json::from_str(&raw).unwrap();
+        after.build_tag = Some(CONFIG_TAG.to_string());
+        after.absorb_top_level_into_provider();
+
+        assert!(after.model.is_none() && after.base_url.is_none() && after.api_key.is_none());
+        assert!(after.context_window.is_none(), "顶层窗口也该搬走");
+        let d = after.providers.get("deepseek").unwrap();
+        assert_eq!(d.model.as_deref(), Some("deepseek-flash"), "顶层值生效过 → 覆盖条目");
+        assert_eq!(d.base_url.as_deref(), Some("https://api.deepseek.com/v1"));
+        assert_eq!(d.context_window, Some(65_536));
+        assert_eq!(
+            d.api_key.as_deref(),
+            Some("sk-top"),
+            "条目取不到 key 时,顶层明文要搬进来(否则用户丢 key)"
+        );
+
+        // 迁移前后生效参数必须一模一样
+        let eff_after = after.resolve(None, None, None, None).unwrap();
+        assert_eq!(eff_before.model, eff_after.model);
+        assert_eq!(eff_before.base_url, eff_after.base_url);
+        assert_eq!(eff_before.api_key, eff_after.api_key);
+        assert_eq!(
+            eff_before.effective_context_window(),
+            eff_after.effective_context_window()
+        );
+        // 另一个 provider 不受影响,切过去仍好使(这正是本次修复的目的)
+        let other = after.resolve(None, None, None, Some("ollama".into())).unwrap();
+        assert_eq!(other.model, "qwen3:8b");
+        assert_eq!(other.base_url, "http://127.0.0.1:11434/v1");
+
+        // 分支 B:顶层与条目都有 key 时,顶层优先(口径已统一为"顶层 = 手动覆盖"),
+        // 迁移把顶层值搬进条目 → 生效 key 前后一致
+        let raw_b = r#"{
+            "api_key": "sk-top",
+            "provider": "ollama",
+            "providers": { "ollama": {"model": "qwen3:8b", "api_key": "sk-old"} }
+        }"#;
+        let mut b: Config = serde_json::from_str(raw_b).unwrap();
+        let eff_b = b.resolve(None, None, None, None).unwrap();
+        assert_eq!(eff_b.api_key.as_deref(), Some("sk-top"), "顶层覆盖预设(三个字段口径一致)");
+        b.absorb_top_level_into_provider();
+        assert_eq!(b.providers.get("ollama").unwrap().api_key.as_deref(), Some("sk-top"));
+        assert_eq!(
+            b.resolve(None, None, None, None).unwrap().api_key.as_deref(),
+            Some("sk-top"),
+            "搬完生效 key 不变"
+        );
     }
 }

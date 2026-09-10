@@ -57,10 +57,11 @@ On first launch (no `~/.znaide/config.json` yet), interactive mode opens the wiz
 
 1. **Pick a provider**: built-in ollama / dashscope / deepseek / openrouter / zai, or custom (type any endpoint)
 2. **Pick a model**: the app fetches the provider's **real model list** from `/models`; `↑↓` to choose; press `m` to type one manually
-3. **Enter API key**: press `e` to type it (local servers like ollama can leave it empty)
-4. **Verify & unlock**: press `s` to send a real test request — **the config is only saved once the request succeeds**; on failure it tells you what to fix
+3. **Enter API key**: press `e` to type it (local servers like ollama can leave it empty), then `Enter` for the next step
+4. **Round-trip limit**: max model round trips per message — **just type a number** (`0` = unlimited, empty = default 200), `Enter` to finish
+5. **Verify & unlock**: send a real test request — **the config is only saved once the request succeeds**; on failure it tells you what to fix
 
-Reopen anytime with `/config` to switch provider/model/key; changes take effect immediately (no session restart).
+Reopening with `/config` **brings out the current configuration** (summary line on top); changes take effect immediately (no session restart).
 
 ## Usage
 
@@ -92,7 +93,7 @@ A banner shows at startup; `/quit` or `/exit` exits (or `Ctrl+C`), printing this
 
 **Dynamic timing on cards**: `⏳ run_shell_command · 12s · budget 4min` ticking per second; total time shown when done. Pass `idle_ms` as your **estimated completion time** (better to overshoot; unset = no budget): if the command overruns its estimate (plus a grace of ~20%, capped at 60s) it is terminated with a full report; commands silent for 90s are considered hung; cards turn yellow → red near the limits, and show "over budget, grace left Xs" while in the grace period.
 
-**Status bar** (left → right): `permission (询问/编辑放行/全自动/超级) [| persona (when set)] | model | state (ready/working…/compacting…, with flow/compact animations) [| tokens: in · out · Σ (≈ live while streaming)] [| ctx ▓▓▓▓▓░░░░░ 34% usage bar (vs model window; 70% yellow / 90% red hinting /compact)] · session <id>`.
+**Status bar** (left → right): `permission (询问/编辑放行/全自动/超级) [| persona (when set)] | model | state (ready/working…/compacting…, with flow/compact animations) · round <used>/<limit> (`∞` when unlimited, see `max_turns`) [| tokens: in · out · Σ (≈ live while streaming)] [| ctx ▓▓▓▓▓░░░░░ 34% usage bar (vs model window; 70% yellow / 90% red hinting /compact)] · session <id>`.
 
 Input/output box border colors follow the permission mode (ask=green / acceptEdits=cyan / bypass=magenta / yolo=red). Session ID matches its history file (`~/.znaide/sessions/<id>.jsonl`) and works with `/resume`.
 
@@ -102,7 +103,7 @@ Input/output box border colors follow the permission mode (ask=green / acceptEdi
 |---|---|
 | `/help` | Show help |
 | `/skills` | List installed skills (with scan warnings) |
-| `/config` | Open config panel (provider/model/endpoint/key, applies instantly) |
+| `/config` | Open config panel (reopening brings out the current provider/model/endpoint/key/max turns, with a summary line on top; applies instantly) |
 | `/undo` `/undo <n>` | List snapshots / roll back to one |
 | `/resume` `/resume <n\|fragment>` | **No arg**: opens the full-screen **session manager** ("sessions / memory" tabs: `↑↓` pick, `space` multi-select, `d` batch delete, `n` edit note, `/` filter, Enter resume/view; the current session can't be deleted). **With arg**: resume that session directly (`[headless]` = created by `-p`) |
 | `/clear` | Clear session context + history file (confirmed; unrecoverable) |
@@ -162,6 +163,9 @@ znaide -p "archive zips in ~/Downloads by date" --permission bypassPermissions
 # override model/provider without touching config
 znaide -p "hi" --provider deepseek
 znaide -p "hi" --model qwen3:8b --base-url http://localhost:11434/v1
+
+# let a big task run longer (default cap: 200 model round trips per message; 0 = unlimited)
+znaide -p "go through every TODO in the repo" --permission bypassPermissions --max-turns 0
 ```
 
 ## Configuration
@@ -171,11 +175,9 @@ znaide -p "hi" --model qwen3:8b --base-url http://localhost:11434/v1
 ```json
 {
   "provider": "ollama",
-  "model": "qwen3:8b",
-  "base_url": "http://localhost:11434/v1",
-  "api_key": "",
+  "max_turns": 200,
   "providers": {
-    "ollama": { "base_url": "http://localhost:11434/v1", "model": "qwen3:8b" },
+    "ollama": { "base_url": "http://localhost:11434/v1", "model": "qwen3:8b", "context_window": 40960 },
     "dashscope": {
       "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
       "model": "qwen-plus",
@@ -190,10 +192,11 @@ znaide -p "hi" --model qwen3:8b --base-url http://localhost:11434/v1
 }
 ```
 
-- `provider`: active preset (must exist in `providers` or be a built-in)
-- Top-level `model` / `base_url` / `api_key` override the preset
-- `api_key_env`: read the key from that environment variable (recommended, keeps secrets out of the file); a plain `api_key` also works
-- `context_window` (optional): the model's context window in tokens, used by the ctx usage bar. When unset, an internal table matches the model name (2026-09 data: qwen3→40k, qwen-plus→1M, deepseek-v4→1M, gpt-5→400k, claude→200k…), falling back to 32k; for ollama keep it in sync with `num_ctx`
+- `provider`: the active preset — switching it switches **the whole set** (endpoint / model / key); configure each service you switch between under `providers`
+- `providers`: **field-wise overrides over the built-in presets** (the built-in entry is the base; write only the fields you want to change); each entry supports `base_url` / `model` / `api_key` / `api_key_env` (recommended) / `context_window`
+- top-level `model` / `base_url` / `api_key` (optional): a **manual temporary override**, higher priority than the preset; **the setup panel never writes these**. Existing top-level values in an old config are **migrated into the active provider entry and cleared on startup** (one-off self-healing), after which switching `provider` really takes effect
+- `context_window` (optional): best set **per provider entry**; the top-level one is a legacy fallback. When unset, an internal table matches the model name (2026-09 data: qwen3→40k, qwen-plus→1M, deepseek-v4→1M, gpt-5→400k, claude→200k…), falling back to 32k; for ollama keep it in sync with `num_ctx`
+- `max_turns` (optional): max model round trips **per message** (one round may carry several tool calls); default 200, **0 = unlimited**. When the budget runs out it no longer stops silently — interactive mode asks "continue?" and headless mode reports the round count and how to raise it; a repeated identical call is warned at 3 and aborted as "going in circles" at 6
 
 Keys can live purely in environment variables: `DASHSCOPE_API_KEY`, `DEEPSEEK_API_KEY`, `ZAI_API_KEY`, `OPENROUTER_API_KEY`, etc.
 

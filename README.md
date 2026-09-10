@@ -59,10 +59,11 @@ make build-all          # 六平台一次构建(缺工具链自动跳过;android
 
 1. **选择服务商**:内置 ollama / dashscope / deepseek / openrouter / zai,或选 custom 手输端点
 2. **选择模型**:程序自动请求该服务商的 `/models` 接口拉取**真实可用模型**,↑↓ 选择;若查询失败或想自定义,按 `m` 直接输入
-3. **填 API Key**:按 `e` 输入(本地服务如 ollama 可留空)
-4. **验证并解锁**:按 `s` 真实发一条请求验证——**验证通过才保存配置并允许使用**;失败则提示修改
+3. **填 API Key**:按 `e` 输入(本地服务如 ollama 可留空),`Enter` 进入下一步
+4. **轮数上限**:单条消息最多允许几轮模型往返,**直接输入数字即可改**(`0` = 不限,留空 = 默认 200),`Enter` 完成
+5. **验证并解锁**:真实发一条请求验证——**验证通过才保存配置并允许使用**;失败则提示修改
 
-之后随时输入 `/config` 重新打开向导改服务商/模型/Key,保存即生效(不中断当前会话)。
+重开(`/config`)时面板会**带出当前配置**(顶部有"当前配置"摘要行),改服务商/模型/Key/轮数上限,保存即生效(不中断当前会话)。
 
 ## 使用
 
@@ -98,7 +99,7 @@ make build-all          # 六平台一次构建(缺工具链自动跳过;android
 
 执行中按 `Esc` 可随时中断:正在跑的工具立即停,同批还没来得及执行的动作会在历史里记成「未执行」,会话历史始终保持完整——中断后继续对话、或日后 `--resume` 恢复,都能无缝接着聊,不会出现恢复后无法对话的情况。
 
-**底部状态栏**从左到右显示:`权限模式(中文短名:询问 / 编辑放行 / 全自动 / 超级)[| 人格(有人格时显示,空 = 默认助手)] | 模型 | 状态(就绪/工作中…/压缩中…;执行=流动光条、压缩=收纳推进条动画)[| token 统计:in 输入 · out 输出 · Σ 会话总计(回复流式中 out/Σ 带 ≈ 实时估算)][| ctx ▓▓▓▓▓░░░░░ 34% 上下文占用条(占模型窗口比例,窗口已知即常驻、0% 也显示;70% 变黄 / 90% 变红并提示可 /compact;刚压缩后从 0% 重新计起)] · 会话 <id>`。
+**底部状态栏**从左到右显示:`权限模式(中文短名:询问 / 编辑放行 / 全自动 / 超级)[| 人格(有人格时显示,空 = 默认助手)] | 模型 | 状态(就绪/工作中…/压缩中…;执行=流动光条、压缩=收纳推进条动画) · 轮 本轮已用/上限(上限 0 显示 ∞,见 `max_turns`)[| token 统计:in 输入 · out 输出 · Σ 会话总计(回复流式中 out/Σ 带 ≈ 实时估算)][| ctx ▓▓▓▓▓░░░░░ 34% 上下文占用条(占模型窗口比例,窗口已知即常驻、0% 也显示;70% 变黄 / 90% 变红并提示可 /compact;刚压缩后从 0% 重新计起)] · 会话 <id>`。
 
 **输入框与输出框边框颜色 = 当前权限模式**:询问=绿 / 编辑放行=天蓝 / 全自动=紫 / 超级(YOLO)=红(工作中输入框禁用时变灰,输出框常显);`Shift+Tab` 切换后边框立即变色。会话 ID 启动即显示,与本会话历史文件同名(`~/.znaide/sessions/<id>.jsonl`),可配合 `/resume` 用 ID 片段精确定位恢复。
 
@@ -108,7 +109,7 @@ make build-all          # 六平台一次构建(缺工具链自动跳过;android
 |---|---|
 | `/help` | 显示帮助 |
 | `/skills` | 列出已安装技能(含扫描告警) |
-| `/config` | 打开配置面板(随时改 provider/模型/端点/Key,立即生效) |
+| `/config` | 打开配置面板(重开时带出当前服务商/模型/端点/Key/轮数上限,顶部显示"当前配置"摘要;改完立即生效) |
 | `/undo` `/undo <序号>` | 列出快照 / 回滚到指定版本 |
 | `/resume` `/resume <序号\|片段>` | **无参**:打开全屏**会话管理窗口**(「历史会话/长期记忆」页签:↑↓ 选择、空格多选、`d` 批量删除、`n` 改备注、`/` 过滤、Enter 恢复/查看,当前会话禁删);**带参**:直接恢复该历史会话(`[无头]` = 命令行 `-p` 产生) |
 | `/clear` | 清空会话上下文与历史文件(需确认,不可恢复) |
@@ -192,6 +193,9 @@ znaide -p "把 ~/Downloads 里的 zip 按日期归档" --permission bypassPermis
 # 临时指定模型/服务商(不改配置文件)
 znaide -p "你好" --provider deepseek
 znaide -p "你好" --model qwen3:8b --base-url http://localhost:11434/v1
+
+# 大任务跑更久(默认单条消息最多 200 轮模型往返;0 = 不限)
+znaide -p "把整个仓库的 TODO 过一遍" --permission bypassPermissions --max-turns 0
 ```
 
 ## 配置
@@ -201,13 +205,12 @@ znaide -p "你好" --model qwen3:8b --base-url http://localhost:11434/v1
 ```json
 {
   "provider": "ollama",
-  "model": "qwen3:8b",
-  "base_url": "http://localhost:11434/v1",
-  "api_key": "",
+  "max_turns": 200,
   "providers": {
     "ollama": {
       "base_url": "http://localhost:11434/v1",
-      "model": "qwen3:8b"
+      "model": "qwen3:8b",
+      "context_window": 40960
     },
     "dashscope": {
       "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -225,10 +228,11 @@ znaide -p "你好" --model qwen3:8b --base-url http://localhost:11434/v1
 
 字段说明:
 
-- `provider`:当前启用的服务商名(须在 `providers` 里,或使用内置预设)
-- `model` / `base_url` / `api_key`:可覆盖 provider 预设的顶层快捷字段
-- `providers`:服务商预设表。`api_key_env` 表示从该环境变量读取 Key(推荐,避免明文);也可以直接写 `api_key`
-- `context_window`(可选):当前模型的上下文窗口 token 数。不设置时按模型名匹配内置表(2026-09 检索:qwen3→40k、qwen-plus→1M、deepseek-v4→1M、gpt-5→400k、claude→200k 等),未命中默认 32k;本地模型(ollama)请与运行时的 `num_ctx` 保持一致,否则上下文占用条不准
+- `provider`:当前启用的服务商——**切它就换整套**(端点 / 模型 / Key);想在多个服务商之间来回切,就在 `providers` 里各配各的
+- `providers`:**按字段覆盖内置预设**(内置条目做底,只写你要改的字段,其它字段保留内置值);每个条目支持 `base_url` / `model` / `api_key` / `api_key_env`(推荐,从环境变量读 Key)/ `context_window`
+- 顶层 `model` / `base_url` / `api_key`(可选):**手动临时覆盖**,优先级高于预设;**面板保存不会写这里**。老配置里已有的顶层值会在启动时**自动搬进当前 provider 条目并清空顶层**(一次性自愈迁移),之后切换 `provider` 才真正生效
+- `context_window`(可选):该项**建议写在 provider 条目里**(各服务商各配各的);顶层那个是历史遗留兜底。不设置时按模型名匹配内置表(2026-09 检索:qwen3→40k、qwen-plus→1M、deepseek-v4→1M、gpt-5→400k、claude→200k 等),未命中默认 32k;本地模型(ollama)请与运行时的 `num_ctx` 保持一致,否则上下文占用条不准
+- `max_turns`(可选):**单条消息**最多允许的模型往返轮数(一轮可含多次工具调用),默认 200;**0 = 不限**。用完不再静默停——交互模式弹"继续执行"确认框,无头模式说明已达几轮与怎么调大;另有"同一调用重复 3 次提醒、6 次判原地打转中止"的刹车
 
 API Key 也可以完全不进配置文件,用环境变量提供:`DASHSCOPE_API_KEY`、`DEEPSEEK_API_KEY`、`ZAI_API_KEY`、`OPENROUTER_API_KEY` 等,向导会自动读取。
 

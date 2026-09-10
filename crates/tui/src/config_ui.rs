@@ -1,4 +1,4 @@
-//! 配置向导状态机(服务商 → 模型 → Key → 验证)。
+//! 配置向导状态机(服务商 → 模型 → Key → 轮数上限 → 验证)。
 //! 与 app.rs 解耦:on_key 返回 WizardAction,宿主执行异步动作(查询模型/验证),
 //! 再把结果经 inject_models / inject_verify 回填。
 use crossterm::event::{KeyCode, KeyEvent};
@@ -20,6 +20,8 @@ pub enum Step {
     ModelSelect,
     /// 输入 API Key
     ApiKey,
+    /// 轮数上限(单条消息最多几轮模型往返;0 = 不限)
+    MaxTurns,
     /// 正在验证(等待宿主回调)
     Verifying,
 }
@@ -59,6 +61,13 @@ pub struct SetupWizard {
     pub notice: String,
     /// 查询/验证中的进度文案
     pub progress: String,
+    /// 单条消息轮数上限(None = 用默认;Some(0) = 不限)。由宿主在打开面板时
+    /// 用 `prefill()` 从现有配置预填,保存时随其他字段一起落盘。
+    pub max_turns: Option<usize>,
+    /// 当前 typing 输入的是 max_turns(与模型名/key/端点共用输入通道,靠它区分)
+    pub typing_max_turns: bool,
+    /// Key 来自环境变量(api_key_env):面板里显示为空但实际可用
+    pub key_from_env: bool,
 }
 
 impl SetupWizard {
@@ -78,11 +87,78 @@ impl SetupWizard {
             input_buf: String::new(),
             notice: String::new(),
             progress: String::new(),
+            max_turns: None,
+            typing_max_turns: false,
+            key_from_env: false,
+        }
+    }
+
+    /// 用现有配置预填(重开 `/config` 时把已经配好的值显示出来)。
+    /// 不在 `new()` 里读盘,免得测试受本机 ~/.znaide/config.json 影响。
+    pub fn prefill(&mut self) {
+        if let Ok(cfg) = Config::load() {
+            self.apply_config(&cfg);
+        }
+    }
+
+    /// 预填的纯逻辑(便于测试):服务商/模型/端点/Key/轮数上限全部带出,
+    /// 游标落在当前服务商上,并在顶部显示"当前配置"摘要。
+    pub fn apply_config(&mut self, cfg: &Config) {
+        let r = cfg.resolve(None, None, None, None).ok();
+        // 服务商:config 的 provider,兜底解析出的名字
+        let provider = cfg
+            .provider
+            .clone()
+            .filter(|p| !p.is_empty())
+            .or_else(|| r.as_ref().map(|x| x.provider_name.clone()));
+        if let Some(p) = provider {
+            self.provider = p.clone();
+            // 游标落在当前服务商上,列表里一眼看到"现在用的是哪个"
+            if let Some(i) = self.providers.iter().position(|(n, _, _)| *n == p) {
+                self.cursor = i;
+            }
+        }
+        if let Some(x) = &r {
+            self.model = x.model.clone();
+            self.base_url = x.base_url.clone();
+        }
+        // Key:顶层手动覆盖 > 当前 provider 条目里的明文。走 api_key_env 的
+        // **不**预填成明文,否则验证通过保存时会把 key 落到文件里,违背用环境变量的初衷。
+        let def = cfg.all_providers().get(&self.provider).cloned();
+        self.api_key = cfg
+            .api_key
+            .clone()
+            .filter(|k| !k.is_empty())
+            .or_else(|| {
+                def.as_ref()
+                    .and_then(|d| d.api_key.clone())
+                    .filter(|k| !k.is_empty())
+            })
+            .unwrap_or_default();
+        self.key_from_env =
+            self.api_key.is_empty() && def.as_ref().map(|d| d.api_key_env.is_some()).unwrap_or(false);
+        self.max_turns = cfg.max_turns;
+    }
+
+    /// 是否已有配置可展示(首次运行全空 → 不显示摘要行)
+    pub fn has_configured(&self) -> bool {
+        !self.provider.is_empty() || !self.model.is_empty() || !self.api_key.is_empty()
+    }
+
+    /// 轮数上限的展示文案
+    pub fn max_turns_label(&self) -> String {
+        match self.max_turns {
+            None => format!("默认({} 轮)", znaide_core::session::DEFAULT_MAX_TURNS),
+            Some(0) => "不限".to_string(),
+            Some(n) => format!("{n} 轮"),
         }
     }
 
     pub fn is_idle_step(&self) -> bool {
-        matches!(self.step, Step::Provider | Step::ModelSelect | Step::ApiKey)
+        matches!(
+            self.step,
+            Step::Provider | Step::ModelSelect | Step::ApiKey | Step::MaxTurns
+        )
     }
 
     /// 当前形成的 Resolved(未验证)
@@ -118,11 +194,14 @@ impl SetupWizard {
                 self.models.clear();
                 self.notice = "该服务商没返回模型列表(可能不支持 /models),直接输入模型名:".into();
                 self.typing = true;
+                // 带出当前模型:不改就直接回车沿用
+                self.input_buf = self.model.clone();
             }
             Err(e) => {
                 self.models.clear();
                 self.notice = format!("模型列表查询失败: {e}\n直接输入模型名(回车继续):");
                 self.typing = true;
+                self.input_buf = self.model.clone();
             }
         }
     }
@@ -160,6 +239,7 @@ impl SetupWizard {
                 }
                 KeyCode::Esc => {
                     self.typing = false;
+                    self.typing_max_turns = false;
                     self.input_buf.clear();
                 }
                 KeyCode::Backspace => {
@@ -186,8 +266,14 @@ impl SetupWizard {
                 KeyCode::Enter | KeyCode::Char('e') => {
                     let (name, base, _default_model) =
                         self.providers[self.cursor.min(self.providers.len() - 1)].clone();
+                    // 重开面板时选中的就是当前服务商:保留已预填的 key,
+                    // 别把用户配好的 key 清掉(只有真的换了服务商才重新取)
+                    let switching = name != self.provider;
                     self.provider = name.clone();
-                    self.api_key = env_key_for(&name);
+                    if switching {
+                        self.api_key = env_key_for(&name);
+                        self.key_from_env = self.api_key.is_empty();
+                    }
                     if name == "custom" {
                         // 自定义服务商:先输入端点
                         self.typing = true;
@@ -247,23 +333,57 @@ impl SetupWizard {
                     WizardAction::None
                 }
                 KeyCode::Char('s') | KeyCode::Char('S') => {
-                    // 验证
+                    // 验证(跳过轮数上限那步,直接用当前值)
                     self.step = Step::Verifying;
                     self.progress = format!("正在验证 {} / {} …", self.provider, self.model);
                     WizardAction::Verify(self.draft())
                 }
-                KeyCode::Char('e') | KeyCode::Char('E') | KeyCode::Enter => {
-                    // 直接编辑 key(覆盖)
+                KeyCode::Enter => {
+                    // 下一步:轮数上限
+                    self.step = Step::MaxTurns;
+                    WizardAction::None
+                }
+                KeyCode::Char('e') | KeyCode::Char('E') => {
+                    // 编辑 key(覆盖)
                     self.typing = true;
                     self.input_buf = std::mem::take(&mut self.api_key);
                     WizardAction::None
                 }
                 _ => WizardAction::None,
             },
-            Step::Verifying => {
-                // 等待宿主;按 Esc 回 ApiKey
-                if matches!(key.code, KeyCode::Esc) {
+            Step::MaxTurns => match key.code {
+                // 直接敲数字就进输入(照着屏幕上显示的改最直观)
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    self.typing = true;
+                    self.typing_max_turns = true;
+                    self.input_buf.clear();
+                    self.input_buf.push(c);
+                    self.notice = "输入单条消息最多允许的模型往返轮数(0 = 不限,留空 = 默认):".into();
+                    WizardAction::None
+                }
+                KeyCode::Char('t') | KeyCode::Char('T') | KeyCode::Char('e') | KeyCode::Char('E') => {
+                    self.typing = true;
+                    self.typing_max_turns = true;
+                    self.input_buf = self.max_turns.map(|v| v.to_string()).unwrap_or_default();
+                    self.notice = "输入单条消息最多允许的模型往返轮数(0 = 不限,留空 = 默认):".into();
+                    WizardAction::None
+                }
+                KeyCode::Enter | KeyCode::Char('s') | KeyCode::Char('S') => {
+                    // 完成:验证(用当前轮数上限)
+                    self.step = Step::Verifying;
+                    self.progress = format!("正在验证 {} / {} …", self.provider, self.model);
+                    WizardAction::Verify(self.draft())
+                }
+                KeyCode::Esc => {
                     self.step = Step::ApiKey;
+                    WizardAction::None
+                }
+                _ => WizardAction::None,
+            },
+            Step::Verifying => {
+                // 等待宿主;按 Esc 回到上一步(轮数上限)
+                if matches!(key.code, KeyCode::Esc) {
+                    self.step = Step::MaxTurns;
                 }
                 WizardAction::None
             }
@@ -272,6 +392,39 @@ impl SetupWizard {
 
     /// 处理输入框提交的内容(取决于当前阶段)
     fn confirm_typed(&mut self, v: &str) -> WizardAction {
+        // 轮数上限:与模型名/key/端点共用输入通道,靠 typing_max_turns 区分
+        if self.typing_max_turns {
+            self.typing_max_turns = false;
+            let t = v.trim();
+            if t.is_empty() {
+                self.max_turns = None;
+                self.notice = format!(
+                    "轮数上限:随默认({} 轮)。按 s 验证并完成",
+                    znaide_core::session::DEFAULT_MAX_TURNS
+                );
+                return WizardAction::None;
+            }
+            return match t.parse::<usize>() {
+                Ok(0) => {
+                    self.max_turns = Some(0);
+                    self.notice = "轮数上限:不限(只靠重复调用刹车)。按 s 验证并完成".into();
+                    WizardAction::None
+                }
+                Ok(n) => {
+                    self.max_turns = Some(n);
+                    self.notice = format!("轮数上限:{n} 轮。按 s 验证并完成");
+                    WizardAction::None
+                }
+                Err(_) => {
+                    // 回填原输入,让用户直接改错处
+                    self.input_buf = t.to_string();
+                    self.typing = true;
+                    self.typing_max_turns = true;
+                    self.notice = "轮数上限要填整数(0 = 不限,留空 = 默认),请重新输入:".into();
+                    WizardAction::None
+                }
+            };
+        }
         match self.step {
             // 自定义服务商:提交的是端点,随后查询模型
             Step::Provider if self.provider == "custom" => {
@@ -317,11 +470,13 @@ impl SetupWizard {
 
         let mut lines: Vec<Line> = Vec::new();
         // 步骤条
-        let steps = ["1 服务商", "2 模型", "3 API Key", "4 验证"];
+        let steps = ["1 服务商", "2 模型", "3 API Key", "4 轮数上限", "5 验证"];
         let current = match self.step {
             Step::Provider => 0,
             Step::Querying | Step::ModelSelect => 1,
-            Step::ApiKey | Step::Verifying => 2,
+            Step::ApiKey => 2,
+            Step::MaxTurns => 3,
+            Step::Verifying => 4,
         };
         let mut bar: Vec<Span> = Vec::new();
         for (i, s) in steps.iter().enumerate() {
@@ -339,6 +494,34 @@ impl SetupWizard {
         }
         lines.push(Line::from(bar));
         lines.push(Line::from(""));
+
+        // 重开面板时先把"现在用的是什么"摆出来(首次运行全空则不显示)
+        if self.has_configured() {
+            let key = if !self.api_key.is_empty() {
+                "••••••••".to_string()
+            } else if self.key_from_env {
+                "来自环境变量".to_string()
+            } else {
+                "(未设置)".to_string()
+            };
+            lines.push(Line::from(vec![
+                Span::styled("当前配置: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{} / {}", self.provider, self.model),
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        "  端点 {}  Key {}  轮数 {}",
+                        self.base_url,
+                        key,
+                        self.max_turns_label()
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+            lines.push(Line::from(""));
+        }
 
         match self.step {
             Step::Provider => {
@@ -414,7 +597,11 @@ impl SetupWizard {
                     Style::default().fg(Color::Green),
                 )));
                 let key_disp = if self.api_key.is_empty() {
-                    "(未设置)".to_string()
+                    if self.key_from_env {
+                        "(来自环境变量,留空即保持)".to_string()
+                    } else {
+                        "(未设置)".to_string()
+                    }
                 } else {
                     "••••••••".to_string()
                 };
@@ -422,8 +609,33 @@ impl SetupWizard {
                     Span::styled("API Key: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(key_disp, Style::default().fg(Color::White)),
                 ]));
+                lines.push(Line::from(vec![
+                    Span::styled("轮数上限: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(self.max_turns_label(), Style::default().fg(Color::White)),
+                ]));
                 lines.push(Line::from(Span::styled(
-                    "e 输入 key(本地服务可留空)| s 验证并完成 | Esc 返回改模型",
+                    "e 输入 key(本地服务可留空)| Enter 下一步(轮数上限)| s 直接验证并完成 | Esc 返回改模型",
+                    Style::default().fg(Color::Cyan),
+                )));
+            }
+            Step::MaxTurns => {
+                lines.push(Line::from(Span::styled(
+                    format!("服务商: {} | 模型: {}", self.provider, self.model),
+                    Style::default().fg(Color::Green),
+                )));
+                lines.push(Line::from(vec![
+                    Span::styled("轮数上限: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        self.max_turns_label(),
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                lines.push(Line::from(Span::styled(
+                    "单条消息最多允许的模型往返轮数(一轮可含多次工具调用);用完会问你要不要再放一批",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "直接输入数字修改(0 = 不限,留空 = 默认)| Enter 或 s 验证并完成 | Esc 返回改 key",
                     Style::default().fg(Color::Cyan),
                 )));
             }
@@ -505,6 +717,154 @@ mod tests {
         let w = SetupWizard::new();
         assert_eq!(w.step, Step::Provider);
         assert!(!w.providers.is_empty());
+        // 默认不读盘:轮数上限为空(用默认)
+        assert_eq!(w.max_turns, None);
+        assert_eq!(
+            w.max_turns_label(),
+            format!("默认({} 轮)", znaide_core::session::DEFAULT_MAX_TURNS)
+        );
+    }
+
+    /// 轮数上限是独立一步(第 4 步):数字直接输入、0 = 不限、留空 = 默认、乱填报错重输
+    #[test]
+    fn max_turns_step_edits_and_verifies() {
+        let mut w = SetupWizard::new();
+        w.provider = "ollama".into();
+        w.model = "qwen3:8b".into();
+
+        // API Key 那步按 Enter → 进入轮数上限那步
+        w.step = Step::ApiKey;
+        match w.on_key(key(KeyCode::Enter)) {
+            WizardAction::None => {}
+            _ => panic!("Enter 应进入下一步"),
+        }
+        assert_eq!(w.step, Step::MaxTurns);
+        assert_eq!(w.max_turns_label(), format!("默认({} 轮)", znaide_core::session::DEFAULT_MAX_TURNS));
+
+        // 直接敲数字 5 就进输入(不用先按编辑键),继续敲 00 → 500
+        w.on_key(key(KeyCode::Char('5')));
+        assert!(w.typing && w.typing_max_turns);
+        assert_eq!(w.input_buf, "5");
+        for c in "00".chars() {
+            w.on_key(key(KeyCode::Char(c)));
+        }
+        w.on_key(key(KeyCode::Enter));
+        assert!(!w.typing && !w.typing_max_turns);
+        assert_eq!(w.step, Step::MaxTurns, "提交后留在本步");
+        assert_eq!(w.max_turns, Some(500));
+        assert_eq!(w.max_turns_label(), "500 轮");
+
+        // 再改成 0 = 不限,t 会预填当前值
+        w.on_key(key(KeyCode::Char('t')));
+        assert_eq!(w.input_buf, "500");
+        w.input_buf.clear();
+        w.on_key(key(KeyCode::Char('0')));
+        w.on_key(key(KeyCode::Enter));
+        assert_eq!(w.max_turns, Some(0));
+        assert_eq!(w.max_turns_label(), "不限");
+
+        // 留空 = 回默认
+        w.on_key(key(KeyCode::Char('t')));
+        w.input_buf.clear();
+        w.on_key(key(KeyCode::Enter));
+        assert_eq!(w.max_turns, None);
+
+        // 非法输入:留在 typing 并回填原串,不写入值
+        w.on_key(key(KeyCode::Char('t')));
+        w.input_buf.clear();
+        for c in "12x".chars() {
+            w.on_key(key(KeyCode::Char(c)));
+        }
+        w.on_key(key(KeyCode::Enter));
+        assert!(w.typing && w.typing_max_turns);
+        assert_eq!(w.input_buf, "12x");
+        assert_eq!(w.max_turns, None);
+
+        // Esc 退出输入:标记要清掉,免得下次输入被当成轮数
+        w.on_key(key(KeyCode::Esc));
+        assert!(!w.typing && !w.typing_max_turns);
+        assert_eq!(w.step, Step::MaxTurns, "Esc 只退输入,不退步骤");
+
+        // 本步按 Enter → 验证(带上当前轮数上限)
+        w.max_turns = Some(300);
+        match w.on_key(key(KeyCode::Enter)) {
+            WizardAction::Verify(r) => assert_eq!(r.model, "qwen3:8b"),
+            _ => panic!("Enter 应触发验证"),
+        }
+        assert_eq!(w.step, Step::Verifying);
+
+        // Esc 从验证回退到本步
+        w.on_key(key(KeyCode::Esc));
+        assert_eq!(w.step, Step::MaxTurns);
+    }
+
+    /// 重开面板:已配置的值(服务商/模型/端点/Key/轮数)要带出来,游标落在当前服务商
+    #[test]
+    fn prefill_shows_existing_config() {
+        let mut w = SetupWizard::new();
+        assert!(!w.has_configured(), "首次运行没有可展示的配置");
+        let cfg = Config {
+            provider: Some("deepseek".into()),
+            model: Some("deepseek-chat".into()),
+            base_url: Some("https://api.deepseek.com/v1".into()),
+            api_key: Some("sk-x".into()),
+            context_window: None,
+            max_turns: Some(500),
+            persona: None,
+            build_tag: None,
+            providers: Default::default(),
+        };
+        w.apply_config(&cfg);
+        assert_eq!(w.provider, "deepseek");
+        assert_eq!(w.model, "deepseek-chat");
+        assert_eq!(w.base_url, "https://api.deepseek.com/v1");
+        assert_eq!(w.api_key, "sk-x");
+        assert_eq!(w.max_turns, Some(500));
+        assert!(!w.key_from_env);
+        assert!(w.has_configured());
+        // 游标落在当前服务商上(列表里就能看出现在用的是哪个)
+        if let Some(i) = w.providers.iter().position(|(n, _, _)| n == "deepseek") {
+            assert_eq!(w.cursor, i);
+        }
+        // 直接 Enter 选同一个服务商:已配好的 key 不能被清掉
+        w.on_key(key(KeyCode::Enter));
+        assert_eq!(w.api_key, "sk-x", "重选同一个服务商不该清掉已配的 key");
+    }
+
+    /// 用 api_key_env 的配置:key 不预填成明文(否则保存会写回文件),但要标出来源
+    #[test]
+    fn prefill_keeps_env_key_out_of_panel() {
+        const VAR: &str = "ZNAIDE_TEST_CFG_KEY";
+        std::env::set_var(VAR, "sk-from-env");
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "testprov".into(),
+            znaide_core::config::ProviderDef {
+                base_url: Some("https://t/v1".into()),
+                model: Some("m1".into()),
+                api_key_env: Some(VAR.into()),
+                api_key: None,
+                context_window: None,
+            },
+        );
+        let cfg = Config {
+            provider: Some("testprov".into()),
+            model: Some("m1".into()),
+            base_url: Some("https://t/v1".into()),
+            api_key: None,
+            context_window: None,
+            max_turns: None,
+            persona: None,
+            build_tag: None,
+            providers,
+        };
+        let mut w = SetupWizard::new();
+        w.apply_config(&cfg);
+        assert!(w.api_key.is_empty(), "环境变量里的 key 不该被预填成明文");
+        assert!(w.key_from_env, "要标出 key 来自环境变量");
+        assert_eq!(w.model, "m1");
+        assert_eq!(w.max_turns, None);
+        std::env::remove_var(VAR);
     }
 
     #[test]
