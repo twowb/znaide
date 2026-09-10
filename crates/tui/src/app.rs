@@ -802,13 +802,19 @@ pub async fn run(
 
         // 粘贴事件:整段进入输入框(不经逐键路径,避免误触发发送)
         if let Some(UiEvent::Paste(text)) = &key_ev {
+            // 兼容 \r\n 与 \r;再剥离终端控制/转义残留(鼠标残片防线)
+            let norm = text.replace("\r\n", "\n").replace('\r', "\n");
+            let clean = sanitize_typed_text(&norm);
             if config_wizard.is_none() && permission.is_none() && confirm.is_none() {
-                // 兼容 \r\n 与 \r;再剥离终端控制/转义残留(鼠标残片防线)
-                let norm = text.replace("\r\n", "\n").replace('\r', "\n");
-                let clean = sanitize_typed_text(&norm);
                 input_cursor = insert_str_at(&mut input, input_cursor, &clean);
+            } else if permission.is_none() && confirm.is_none() {
+                // 配置向导的文本输入态(API Key / 端点 / 模型名 / 轮数)允许粘贴:
+                // 只填进输入缓冲,**不当作回车**(不提交、不推进步骤)。
+                // 权限确认与破坏性确认弹窗是 y/n 决策,粘贴仍忽略(防多行粘贴误触发)。
+                if let Some(w) = config_wizard.as_mut() {
+                    let _ = w.paste_text(&clean);
+                }
             }
-            // 配置向导/确认弹窗中的粘贴暂忽略
         }
 
         if let Some(UiEvent::Key(k)) = key_ev {
