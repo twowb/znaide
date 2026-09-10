@@ -39,6 +39,27 @@ impl Mode {
             ),
         }
     }
+
+    /// 界面短标签(全中文)。两个宿主共用一份,别再各写各的(以前 TUI 是"超级"、
+    /// CLI 是"超级(YOLO)",同一档两种叫法)。
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::Ask => "询问",
+            Mode::AcceptEdits => "编辑放行",
+            Mode::BypassPermissions => "全自动",
+            Mode::Yolo => "超级",
+        }
+    }
+
+    /// 一句话说明(切换提示 / 启动日志展示)
+    pub fn hint(self) -> &'static str {
+        match self {
+            Mode::Ask => "询问:写文件/执行命令前均需确认",
+            Mode::AcceptEdits => "编辑放行:文件修改自动放行,命令执行需确认",
+            Mode::BypassPermissions => "全自动:全部自动执行,高危命令仍要人工确认",
+            Mode::Yolo => "超级(YOLO):一切放行、无任何问询,高危判定也放行",
+        }
+    }
 }
 
 /// 一次权限判定结果
@@ -76,6 +97,14 @@ pub struct Permission {
     pub mode: Mode,
 }
 
+/// ask 模式下写文件被拒时的提示(无头模式不弹确认,直接拒)
+pub const NEED_ACCEPT_EDITS: &str =
+    "ask 模式下写文件要确认,无头模式直接拒绝。要自动改文件就加 --permission acceptEdits";
+
+/// 当前模式跑命令要确认、无头模式直接拒时的提示
+pub const NEED_BYPASS: &str =
+    "该模式下跑命令要确认,无头模式直接拒绝。要自动执行就加 --permission bypassPermissions";
+
 impl Permission {
     pub fn new(mode: Mode) -> Self {
         Self { mode }
@@ -84,10 +113,7 @@ impl Permission {
     /// 文件写入类操作(read_file / write_file / edit 等改写文件)
     pub fn check_file_write(&self) -> Decision {
         match self.mode {
-            Mode::Ask => Decision::Deny(
-                "ask 模式下写文件要确认,无头模式直接拒绝。要自动改文件就加 --permission acceptEdits"
-                    .into(),
-            ),
+            Mode::Ask => Decision::Deny(NEED_ACCEPT_EDITS.into()),
             _ => Decision::Allow,
         }
     }
@@ -95,10 +121,7 @@ impl Permission {
     /// 终端命令执行(只管档位;YOLO 一切放行)
     pub fn check_command(&self, _command: &str) -> Decision {
         match self.mode {
-            Mode::Ask | Mode::AcceptEdits => Decision::Deny(
-                "该模式下跑命令要确认,无头模式直接拒绝。要自动执行就加 --permission bypassPermissions"
-                    .into(),
-            ),
+            Mode::Ask | Mode::AcceptEdits => Decision::Deny(NEED_BYPASS.into()),
             Mode::BypassPermissions | Mode::Yolo => Decision::Allow,
         }
     }

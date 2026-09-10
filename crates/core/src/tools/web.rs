@@ -144,12 +144,7 @@ fn strip_block(html: &str, tag: &str) -> String {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let cut: String = s.chars().take(max).collect();
-        format!("{cut}\n…(已截断)")
-    }
+    crate::util::truncate_chars(s, max, "\n…(已截断)")
 }
 
 #[cfg(test)]

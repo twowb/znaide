@@ -259,8 +259,19 @@ fn disable_mouse_capture() -> std::io::Result<()> {
     crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture)
 }
 
+/// 生效的轮数上限:命令行 `--max-turns` 覆盖 > config 的 `max_turns`(0 = 不限)> 200。
+/// 启动与 `/config` 重配都走它,让"命令行优先"在交互模式里同样成立。
+fn effective_max_turns(cli_override: Option<usize>) -> usize {
+    cli_override.unwrap_or_else(|| {
+        znaide_core::config::Config::load()
+            .map(|c| c.effective_max_turns())
+            .unwrap_or(znaide_core::session::DEFAULT_MAX_TURNS)
+    })
+}
+
 /// 交互主循环。resume = `--resume` 指定的历史会话文件;
 /// persona = 启动时注入的全局人格(空 = 不注入)。
+/// max_turns = 命令行 `--max-turns` 覆盖(None = 用 config/默认)。
 /// 退出(/quit、/exit、Ctrl+C)时返回本次统计,由 CLI 打印。
 pub async fn run(
     resolved: &Resolved,
@@ -269,6 +280,7 @@ pub async fn run(
     first_run: bool,
     resume: Option<PathBuf>,
     persona: String,
+    max_turns: Option<usize>,
 ) -> anyhow::Result<ExitStats> {
     enable_raw_mode()?;
     let mut stdout = stdout();
@@ -337,10 +349,9 @@ pub async fn run(
             Ok(s) => s,
             Err(_) => return,
         };
-        // 轮数上限:config 的 max_turns(0 = 不限),缺省 DEFAULT_MAX_TURNS
-        if let Ok(cfg) = znaide_core::config::Config::load() {
-            session.set_max_turns(cfg.effective_max_turns());
-        }
+        // 轮数上限:--max-turns > config 的 max_turns(0 = 不限)> 默认。
+        // 以前这里只读 config,`znaide --max-turns N` 在交互模式下被静默忽略。
+        session.set_max_turns(effective_max_turns(max_turns));
         if !persona.is_empty() {
             let _ = ev_tx.send(SessionEvent::Notice(format!(
                 "人格:{persona}(全局生效,输入 /persona 可切换或关闭)"
@@ -370,11 +381,10 @@ pub async fn run(
                     }
                     Some(AgentCmd::Reconfigure(r)) => {
                         session.reconfigure(&r);
-                        // 轮数上限也跟着重读(/config 改了 max_turns 立即生效)。
+                        // 轮数上限也跟着重读(/config 改了 max_turns 立即生效;
+                        // 命令行给了 --max-turns 的话仍然它优先)。
                         // 状态栏的 round_limit 由宿主在保存配置处同步(这里在 agent 任务里,拿不到 UI 变量)
-                        if let Ok(cfg) = znaide_core::config::Config::load() {
-                            session.set_max_turns(cfg.effective_max_turns());
-                        }
+                        session.set_max_turns(effective_max_turns(max_turns));
                         session.notify(format!(
                             "✔ 配置已切换: {} / {}",
                             r.provider_name, r.model
@@ -465,11 +475,12 @@ pub async fn run(
     let mut sb_dragging = false;
     // 当前生效配置(表单回填与状态栏展示用)
     let mut current_resolved = resolved.clone();
+    // 生效上下文窗口:只随 current_resolved 变,别每帧重算
+    // (effective_context_window 内部要先 to_lowercase 再跑一长串 contains)
+    let mut ctx_window = current_resolved.effective_context_window();
     // 轮次:本轮已用轮数 / 上限(0 = 不限),状态栏展示用
     let mut round_used: usize = 0;
-    let mut round_limit: usize = znaide_core::config::Config::load()
-        .map(|c| c.effective_max_turns())
-        .unwrap_or(znaide_core::session::DEFAULT_MAX_TURNS);
+    let mut round_limit: usize = effective_max_turns(max_turns);
     // 当前会话 id(agent 经 SessionInfo 事件回传,状态栏展示用)
     let mut session_id = String::new();
     // 配置向导(None = 对话模式)
@@ -480,7 +491,6 @@ pub async fn run(
     let (wiz_tx, mut wiz_rx) = mpsc::unbounded_channel::<WizardReply>();
     // 是否已有可用配置(未配置成功时禁止使用)
     let mut configured_ok = znaide_core::config::config_exists();
-    let mut config_lock_notice_shown = false;
     if first_run {
         items.push(MsgItem::Notice(
             "🎉 首次运行:先完成一次配置。选 AI 服务商,向导自动查询可用模型。".into(),
@@ -677,6 +687,10 @@ pub async fn run(
                     format!(" · 会话 {}", session_id)
                 };
                 // token 统计:输入/输出/会话总计。
+                // **这是计费口径的累计**:每次模型调用都会把完整历史重发一遍,服务端按
+                // 每份 prompt 各计一次,所以 Σ 会随"轮数 × 上下文长度"涨,不等于上下文占用
+                // (占用看 ctx 条)。/clear、/resume 换会话时归零,/compact 不归零(同一会话,
+                // 已经花掉的账不该消失)。
                 // 进行中回复的真实 usage 尚未到账,输出/总计以 ≈ 附上实时估算;
                 // 该轮结束(Usage 事件)即切换为真实值。
                 let token_info = {
@@ -687,7 +701,7 @@ pub async fn run(
                     if sum_show > 0 {
                         let mark = if live { "≈" } else { "" };
                         format!(
-                            " · in {} · out {}{} · Σ {}{}",
+                            " · 累计 in {} · out {}{} · Σ {}{}",
                             fmt_tokens(token_stats.input),
                             mark,
                             fmt_tokens(out_show),
@@ -727,7 +741,7 @@ pub async fn run(
                 );
                 let status = format!(
                     " {}{} | {} | {}{}{}{}{}",
-                    mode_str(current_mode),
+                    current_mode.label(),
                     persona_seg,
                     current_resolved.model,
                     state_text,
@@ -742,7 +756,7 @@ pub async fn run(
                 )];
                 // 上下文占用条(真实 prompt / 模型窗口),高占用变色
                 if let Some((badge, badge_color)) =
-                    ctx_usage_badge(token_stats.last_prompt, current_resolved.effective_context_window())
+                    ctx_usage_badge(token_stats.last_prompt, ctx_window)
                 {
                     status_spans.push(Span::styled(
                         format!(" {badge}"),
@@ -931,9 +945,6 @@ pub async fn run(
                                 "⚠ 配置还没完成,对话仍不可用。用 /config 继续配置。".into()
                             },
                         ));
-                        if !configured_ok && !config_lock_notice_shown {
-                            config_lock_notice_shown = true;
-                        }
                     }
                     WizardAction::FetchModels { base_url, api_key } => {
                         // 保留向导(Querying 状态),后台查询模型
@@ -953,38 +964,6 @@ pub async fn run(
                             let r = znaide_core::llm::openai::probe_chat(&probe).await;
                             let _ = tx.send(WizardReply::Verify(r.map_err(|e| format!("{e:#}"))));
                         });
-                    }
-                    WizardAction::Save(r) => {
-                        // 验证通过:落盘 + 运行时应用 + 解锁
-                        let mut cfg = znaide_core::config::Config::load().unwrap_or_default();
-                        // 面板里填的轮数上限一起落盘(空 = 清除,回到默认 200)
-                        cfg.max_turns = wizard.max_turns;
-                        // Key 来自环境变量时不写明文(留空即保持环境变量那条路)
-                        let key_arg = if wizard.key_from_env {
-                            None
-                        } else {
-                            r.api_key.as_deref()
-                        };
-                        let save_result = cfg.save(
-                            &r.provider_name,
-                            Some(&r.model),
-                            Some(&r.base_url),
-                            key_arg,
-                            wizard.context_window,
-                        );
-                        // 状态栏立即跟上新的轮数上限
-                        round_limit = cfg.effective_max_turns();
-                        let _ = cmd_tx.send(AgentCmd::Reconfigure(r.clone()));
-                        current_resolved = r.clone();
-                        configured_ok = save_result.is_ok();
-                        items.push(MsgItem::Notice(match save_result {
-                            Ok(()) => format!(
-                                "✔ 配置完成并已生效: {} / {}。可以开始用了。",
-                                r.provider_name, r.model
-                            ),
-                            Err(e) => format!("⚠ 配置已生效但没存上: {e}(下次启动要重新配)"),
-                        }));
-                        config_wizard = None;
                     }
                 }
                 continue;
@@ -1208,10 +1187,12 @@ pub async fn run(
                                     key_arg,
                                     w.context_window,
                                 );
-                                // 状态栏立即跟上新的轮数上限
-                                round_limit = cfg.effective_max_turns();
+                                // 状态栏立即跟上新的轮数上限(命令行 --max-turns 仍优先)
+                                round_limit = effective_max_turns(max_turns);
                                 let _ = cmd_tx.send(AgentCmd::Reconfigure(draft.clone()));
                                 current_resolved = draft.clone();
+                                // 配置变了,窗口跟着刷新(状态栏 ctx 条用的就是它)
+                                ctx_window = current_resolved.effective_context_window();
                                 configured_ok = save_result.is_ok();
                                 w.inject_verify(true, format!(
                                     " {} / {} 已保存并生效。",
@@ -1293,7 +1274,7 @@ pub async fn run(
         // 上下文占用警示:空闲时 >=90% 提示一次(可 /compact 或开新会话);回落后重新武装。
         // 窗口未知时不提示——宁可不说,也不拿猜出来的窗口劝人做没必要的压缩。
         if !busy {
-            if let Some(win) = current_resolved.effective_context_window().filter(|w| *w > 0) {
+            if let Some(win) = ctx_window.filter(|w| *w > 0) {
                 if token_stats.last_prompt > 0 {
                     let pct = (token_stats.last_prompt as u128) * 100 / (win as u128);
                     if pct >= 90 && !ctx_warn_shown {
@@ -1572,20 +1553,8 @@ fn handle_command(
             ));
             let tx = update_tx.clone();
             tokio::spawn(async move {
-                use znaide_core::update::UpdateResult;
                 let cur = znaide_core::update::current_version();
-                let msg = match znaide_core::update::perform_update().await {
-                    UpdateResult::UpToDate => format!("已是最新版本 v{cur}。"),
-                    UpdateResult::Updated { version, source, deferred: false } => {
-                        format!("✔ 已更新到 v{version}(来源 {source}):下次启动生效(本次继续用旧版本)。")
-                    }
-                    UpdateResult::Updated { version, source, deferred: true } => format!(
-                        "✔ 新版本 v{version}(来源 {source})已就位:退出程序后自动完成替换,下次启动生效。"
-                    ),
-                    UpdateResult::CheckFailed(e) => format!("⚠ 检查更新失败: {e}"),
-                    UpdateResult::DownloadFailed(e) => format!("⚠ 更新失败: {e}"),
-                    UpdateResult::VerifyFailed(e) => format!("⚠ {e}"),
-                };
+                let msg = znaide_core::update::perform_update().await.describe(&cur);
                 let _ = tx.send(msg);
             });
         }
@@ -1784,7 +1753,7 @@ fn push_history_item(
                         name,
                         args: String::new(),
                         ok: Some(true),
-                        output: content,
+                        output: cap_tool_output(content),
                         started: None,
                         done_secs: None,
                         idle_ms: None,
@@ -1873,7 +1842,7 @@ fn handle_session_event(
                 .find(|i| matches!(i, MsgItem::Tool { name: n, .. } if *n == name))
             {
                 *slot = Some(ok);
-                *out = output;
+                *out = cap_tool_output(output);
                 // 实时输出区使命结束:清空,卡片高度回落
                 live.clear();
                 // 定格总用时:结束那一瞬的 elapsed,之后渲染不再跳动
@@ -1926,8 +1895,9 @@ fn handle_session_event(
             items.push(MsgItem::Notice(
                 "✔ 已清空会话上下文与历史文件,可重新开始。".into(),
             ));
-            // 上下文占用未知,清掉旧占用显示,等待下一次真实 usage
-            stats.last_prompt = 0;
+            // 历史文件都清了 = 换了个会话:占用与累计用量一起归零
+            // (ctx 旧占用是"未知",等下一次真实 usage;累计 in/out 不再残留上一个会话的数字)
+            *stats = TokenStats::default();
         }
         SessionEvent::CompactionStarted => {
             // 压缩是耗时操作:置忙(收纳推进条动画由忙行动画呈现),不再 push 静态提示
@@ -1955,7 +1925,8 @@ fn handle_session_event(
                     push_history_item(items, m, &mut tool_names, &mut pending);
                 }
             }
-            // 压缩后占用大幅下降;旧占用显示清零,待下一次真实 usage 再更新
+            // 压缩后占用大幅下降;旧占用显示清零,待下一次真实 usage 再更新。
+            // 注意:累计 in/out 不归零——压缩没换会话,已经花掉的账不该消失。
             stats.last_prompt = 0;
         }
         SessionEvent::SessionInfo { id, .. } => {
@@ -1965,6 +1936,9 @@ fn handle_session_event(
         SessionEvent::HistoryLoaded { count, messages } => {
             // /resume:当前显示的内容已不在上下文中,整体替换为恢复的历史会话
             items.clear();
+            // 换了会话:状态栏的 ctx 占用与累计 in/out 都是**上一个会话**的数字,
+            // 留着会让人以为恢复出来的历史占据/花费了这些(真实值等下一次 usage 到账)
+            *stats = TokenStats::default();
             items.push(MsgItem::Notice(format!(
                 "━━━ 已恢复历史会话({count} 条消息),内容如下 ━━━"
             )));
@@ -2094,6 +2068,26 @@ fn pulse_char(slow_frame: usize) -> char {
 const LIVE_ROWS: usize = 10;
 /// 实时输出累积上限(字节):超出丢头部只留尾(UI 只关心最新)
 const LIVE_CAP: usize = 128 * 1024;
+
+/// 工具卡片的成品输出留存上限:卡片只展示前 500 字符 / 4 行,存整份(命令可能吐
+/// 几 MB)只会白占内存到会话结束。保头 + 标记,够渲染就够。
+const TOOL_OUT_CAP: usize = 8 * 1024;
+
+/// 工具输出入库前的封顶(保头,超限处补一行说明)
+fn cap_tool_output(s: String) -> String {
+    if s.len() <= TOOL_OUT_CAP {
+        return s;
+    }
+    let idx = s
+        .char_indices()
+        .find_map(|(i, _)| (i >= TOOL_OUT_CAP).then_some(i))
+        .unwrap_or(s.len());
+    format!(
+        "{}\n…(输出过长,后面 {} 字符未留存;完整内容已交给模型/历史文件)",
+        &s[..idx],
+        s.chars().count() - s[..idx].chars().count()
+    )
+}
 
 /// 实时输出缓冲封顶:超限丢头保尾(按 char 边界切)
 fn cap_live_tail(s: &mut String) {
@@ -3103,16 +3097,6 @@ fn draw_confirm_popup(
     f.render_widget(Paragraph::new(lines).alignment(Alignment::Left), inner);
 }
 
-fn mode_str(mode: Mode) -> &'static str {
-    // 状态栏/界面显示的短标签(全中文)
-    match mode {
-        Mode::Ask => "询问",
-        Mode::AcceptEdits => "编辑放行",
-        Mode::BypassPermissions => "全自动",
-        Mode::Yolo => "超级",
-    }
-}
-
 /// 边框颜色 = 权限模式:询问绿 / 编辑放行天蓝 / 全自动紫 / 超级(YOLO)红
 fn mode_color(mode: Mode) -> Color {
     match mode {
@@ -3134,15 +3118,6 @@ fn next_mode(mode: Mode) -> Mode {
 }
 
 /// 模式的人话描述(切换提示里展示)
-fn mode_desc(mode: Mode) -> &'static str {
-    match mode {
-        Mode::Ask => "询问:写文件/执行命令前均需确认",
-        Mode::AcceptEdits => "编辑放行:文件修改自动放行,命令执行需确认",
-        Mode::BypassPermissions => "全自动:全部自动执行,高危命令仍要人工确认",
-        Mode::Yolo => "超级(YOLO):一切放行、无任何问询,高危判定也放行",
-    }
-}
-
 /// Shift+Tab 切换权限模式:更新状态栏、通知 agent 生效、留一条反馈
 fn cycle_permission_mode(
     current_mode: &mut Mode,
@@ -3154,7 +3129,7 @@ fn cycle_permission_mode(
     let _ = cmd_tx.send(AgentCmd::SetMode(next));
     items.push(MsgItem::Notice(format!(
         "🔒 权限模式:{} (Shift+Tab 循环切换)",
-        mode_desc(next)
+        next.hint()
     )));
 }
 
@@ -3177,12 +3152,8 @@ fn fmt_time(epoch_secs: f64) -> String {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let cut: String = s.chars().take(max).collect();
-        format!("{cut}…")
-    }
+    // 实现走 core 共用的一份(按字符截断,不切坏中文/emoji)
+    znaide_core::util::truncate_chars(s, max, "…")
 }
 
 #[cfg(test)]
@@ -3196,7 +3167,7 @@ mod key_tests {
 
     #[test]
     fn plain_enter_submits() {
-        let mut input = String::from("hello");
+        let input = String::from("hello");
         match handle_text_key(key(KeyCode::Enter, KeyModifiers::NONE)) {
             TextAction::Submit => {
                 // 宿主读取 input 后自行清空
@@ -3208,7 +3179,7 @@ mod key_tests {
 
     #[test]
     fn shift_enter_newline() {
-        let mut input = String::from("ab");
+        let input = String::from("ab");
         match handle_text_key(key(KeyCode::Enter, KeyModifiers::SHIFT)) {
             TextAction::Newline => {}
             _ => panic!("Shift+Enter 应换行"),
@@ -3218,7 +3189,6 @@ mod key_tests {
 
     #[test]
     fn alt_enter_newline() {
-        let mut input = String::from("ab");
         match handle_text_key(key(KeyCode::Enter, KeyModifiers::ALT)) {
             TextAction::Newline => {}
             _ => panic!("Alt+Enter 应换行"),
@@ -3227,7 +3197,6 @@ mod key_tests {
 
     #[test]
     fn ctrl_j_newline() {
-        let mut input = String::from("ab");
         match handle_text_key(key(KeyCode::Char('j'), KeyModifiers::CONTROL)) {
             TextAction::Newline => {}
             _ => panic!("Ctrl+J 应换行"),
@@ -3249,7 +3218,6 @@ mod key_tests {
 
     #[test]
     fn backspace() {
-        let mut input = String::from("ab");
         assert!(matches!(
             handle_text_key(key(KeyCode::Backspace, KeyModifiers::NONE)),
             TextAction::Backspace
@@ -3311,8 +3279,8 @@ mod key_tests {
         assert_eq!(next_mode(Mode::Yolo), Mode::Ask);
         // 四档都有可读描述(状态栏/提示用)
         for m in [Mode::Ask, Mode::AcceptEdits, Mode::BypassPermissions, Mode::Yolo] {
-            assert!(!mode_desc(m).is_empty());
-            assert!(!mode_str(m).is_empty());
+            assert!(!m.hint().is_empty());
+            assert!(!m.label().is_empty());
         }
         // 边框颜色:询问绿 / 编辑放行天蓝 / 全自动紫 / 超级红,两两互不相同
         let ask_c = mode_color(Mode::Ask);
@@ -3417,7 +3385,7 @@ mod token_tests {
         let mut sid = String::new();
         let mut persona = String::new();
         let mut st = TokenStats::default();
-        let mut fire = |e: SessionEvent,
+        let fire = |e: SessionEvent,
                         items: &mut Vec<MsgItem>,
                         busy: &mut bool,
                         kind: &mut BusyKind,
@@ -3551,7 +3519,7 @@ mod token_tests {
         let mut sid = String::new();
         let mut persona = String::new();
         let mut st = TokenStats::default();
-        let mut fire = |e: SessionEvent,
+        let fire = |e: SessionEvent,
                         items: &mut Vec<MsgItem>,
                         busy: &mut bool,
                         kind: &mut BusyKind,
@@ -4089,5 +4057,28 @@ mod ctx_usage_tests {
         // 还没有真实 usage 时如实说"窗口未知"
         let (t0, _) = ctx_usage_badge(0, None).unwrap();
         assert!(t0.contains('?'));
+    }
+
+    /// 工具输出入库封顶:短的原样留,长的保头并说明(卡片只渲染前 500 字符)
+    #[test]
+    fn tool_output_capped_at_ingest() {
+        let short = "ok".to_string();
+        assert_eq!(cap_tool_output(short.clone()), short);
+        // 正好等于上限:不截断
+        let edge = "a".repeat(TOOL_OUT_CAP);
+        assert_eq!(cap_tool_output(edge.clone()), edge);
+        // 超限:保头 + 标记;多字节字符不能被切坏
+        let long = "中".repeat(TOOL_OUT_CAP / 3 + 100);
+        let capped = cap_tool_output(long.clone());
+        assert!(capped.starts_with('中'), "要保头");
+        assert!(capped.contains("未留存"), "要有截断说明");
+        assert!(capped.chars().count() < long.chars().count());
+    }
+
+    /// 轮数上限优先级:命令行 --max-turns 覆盖 config(0 = 不限,不能被换成默认)
+    #[test]
+    fn cli_max_turns_overrides_config() {
+        assert_eq!(effective_max_turns(Some(5)), 5);
+        assert_eq!(effective_max_turns(Some(0)), 0);
     }
 }

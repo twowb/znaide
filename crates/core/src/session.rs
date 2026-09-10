@@ -186,11 +186,6 @@ impl Session {
         Ok(s)
     }
 
-    /// MCP 管理器引用
-    pub fn mcp(&self) -> &crate::mcp::McpManager {
-        &self.mcp
-    }
-
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
@@ -206,25 +201,8 @@ impl Session {
         self.max_turns = n;
     }
 
-    /// 当前轮数上限(0 = 不限)
-    pub fn max_turns(&self) -> usize {
-        self.max_turns
-    }
-
-    pub fn current_model(&self) -> &str {
-        self.llm.model()
-    }
-
     pub fn history_path(&self) -> Option<&Path> {
         self.history_path.as_deref()
-    }
-
-    pub fn cwd(&self) -> &Path {
-        &self.cwd
-    }
-
-    pub fn cancel_token(&self) -> CancellationToken {
-        self.cancel.clone()
     }
 
     pub fn reset_cancel(&mut self, cancel: CancellationToken) {
@@ -237,10 +215,6 @@ impl Session {
         self.command_always = false;
         // 系统提示里含模式描述,切换后重建,让模型感知当前模式
         self.refresh_system_prompt();
-    }
-
-    pub fn mode(&self) -> Mode {
-        self.mode
     }
 
     /// 清空上下文与历史文件(/clear):消息回到只剩系统提示,jsonl 截断,重新开始
@@ -569,22 +543,18 @@ impl Session {
         let warning = hazard.map(|(_, w)| w);
 
         if self.events.is_none() {
+            // 无头模式没人可问:直接拒,提示文案与 permissions 的检查共用同一份常量
+            // (以前这里手抄了一遍,已经和那边抄得不一样了)
             match kind {
                 PermKind::Write => match self.mode {
                     Mode::Ask => PermissionResult::Denied(
-                        "ask 模式下写文件要确认,无头模式直接拒绝。\
-                         要自动改文件就加 --permission acceptEdits"
-                            .into(),
+                        crate::permissions::NEED_ACCEPT_EDITS.into(),
                     ),
                     _ => PermissionResult::Allowed,
                 },
                 PermKind::Command => match self.mode {
                     Mode::BypassPermissions => PermissionResult::Allowed,
-                    _ => PermissionResult::Denied(
-                        "该模式下跑命令要确认,无头模式直接拒绝。\
-                         要自动执行就加 --permission bypassPermissions"
-                            .into(),
-                    ),
+                    _ => PermissionResult::Denied(crate::permissions::NEED_BYPASS.into()),
                 },
             }
         } else {
@@ -1252,13 +1222,9 @@ fn repair_tool_chain(messages: &mut Vec<ChatMessage>) -> usize {
 
 /// 工具输出要回给模型、也要显示,太长就截断,免得撑爆上下文/刷屏
 fn truncate_for_ui(s: &str) -> String {
+    /// 单条工具结果进上下文/展示时的字符上限
     const MAX: usize = 20_000;
-    if s.chars().count() <= MAX {
-        s.to_string()
-    } else {
-        let head: String = s.chars().take(MAX).collect();
-        format!("{head}\n…(结果过长已截断)")
-    }
+    crate::util::truncate_chars(s, MAX, "\n…(结果过长已截断)")
 }
 
 /// 组装 assistant 消息
@@ -1485,15 +1451,6 @@ pub fn list_history_sessions_detailed() -> Vec<HistoryEntry> {
     });
     out.reverse(); // 最新在前
     out
-}
-
-/// 列出 ~/.znaide/sessions 下所有历史会话(供 /resume)。
-/// 空文件(0 字节,通常是刚启动还没对话的当前会话)没有恢复价值,直接跳过。
-pub fn list_history_sessions() -> Vec<PathBuf> {
-    list_history_sessions_detailed()
-        .into_iter()
-        .map(|h| h.path)
-        .collect()
 }
 
 /// 清掉历史遗留的 0 字节空壳会话文件(懒创建后不再产生,启动时顺手清理旧账)。

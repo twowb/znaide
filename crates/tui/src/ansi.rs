@@ -3,32 +3,11 @@
 //! 终端里显示的不可信文本(模型回复 / 命令输出 / 工具结果)必须先过这里——
 //! 真实控制字节被写进终端会被真的执行,画面会错位到只能 resize 救。
 //! [`strip`] 直接剥干净;想保留颜色就用 [`render_lines`](SGR → ratatui 样式)。
+use crate::md::wc;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-/// 显示宽度近似(与 md.rs 的 `wc` 保持一致:CJK/全角/常见 emoji 按 2 列,
-/// 控制字符 0 列)。两边要一起改。
-fn wc(c: char) -> u16 {
-    if c.is_control() {
-        return 0;
-    }
-    let cp = c as u32;
-    if (0x1100..=0x115f).contains(&cp)
-        || (0x2e80..=0xa4cf).contains(&cp)
-        || (0xac00..=0xd7a3).contains(&cp)
-        || (0xf900..=0xfaff).contains(&cp)
-        || (0xfe30..=0xfe4f).contains(&cp)
-        || (0xff00..=0xff60).contains(&cp)
-        || (0xffe0..=0xffe6).contains(&cp)
-        || (0x1f000..=0x1faff).contains(&cp)
-        || (0x1f300..=0x1f64f).contains(&cp)
-        || (0x2600..=0x27bf).contains(&cp)
-    {
-        2
-    } else {
-        1
-    }
-}
+
 
 /// 剥掉全部 ESC 转义与 C0 控制字符;保留 `\n` `\t`。
 /// `\r` 直接丢(CRLF 靠 `\n` 换行;孤立的 \r 在静态显示里没意义);

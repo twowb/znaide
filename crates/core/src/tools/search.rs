@@ -95,33 +95,44 @@ fn walk_glob(root: &Path, pattern: &str) -> Result<Vec<std::path::PathBuf>, Tool
     Ok(out)
 }
 
-/// 极简 glob 匹配:支持 * ** ? ;逐段匹配
+/// 极简 glob 匹配:支持 `*` `**` `?`;逐段匹配。
+/// `*` 与 `**` 在本工具里等价——都匹配任意串(含 `/`);`?` 匹配单个字符。
+/// 用迭代式单星回溯(最坏 O(n·m)),代替原来的递归版:递归版在 `*a*a*a*…b` 这类
+/// pattern 上是指数级的,而 pattern 来自模型输出,能拖死整个进程。
 pub(crate) fn simple_glob_match(pattern: &str, text: &str) -> bool {
-    // ** 直接匹配剩余
-    if pattern == "**" {
-        return true;
-    }
-    let pat_chars: Vec<char> = pattern.chars().collect();
-    let txt_chars: Vec<char> = text.chars().collect();
-    // 递归式匹配
-    fn m(p: &[char], t: &[char]) -> bool {
-        if p.is_empty() {
-            return t.is_empty();
-        }
-        match p[0] {
-            '*' => {
-                if p.len() > 1 && p[1] == '*' {
-                    // ** 匹配任意(含多级 /) —— 简化:与 * 等价后继续匹配
-                    return m(&p[1..], t)
-                        || (!t.is_empty() && m(p, &t[1..]));
-                }
-                m(&p[1..], t) || (!t.is_empty() && m(p, &t[1..]))
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    // 最近一次 `*` 的位置,以及当时匹配到的文本位置(回溯点)
+    let mut star: Option<usize> = None;
+    let mut star_ti = 0usize;
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == '?' {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            // 连续多个 `*` 等价于一个:`**` 与 `*` 同义
+            while pi < p.len() && p[pi] == '*' {
+                pi += 1;
             }
-            '?' => !t.is_empty() && m(&p[1..], &t[1..]),
-            c => !t.is_empty() && t[0] == c && m(&p[1..], &t[1..]),
+            star = Some(pi);
+            star_ti = ti;
+        } else if pi < p.len() && p[pi] == t[ti] {
+            pi += 1;
+            ti += 1;
+        } else if let Some(sp) = star {
+            // 回溯:`*` 多吃一个字符再试
+            pi = sp;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
         }
     }
-    m(&pat_chars, &txt_chars)
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 #[derive(Debug, Deserialize)]
@@ -195,4 +206,46 @@ pub async fn grep_search(ctx: &ToolContext<'_>, args: &Value) -> Result<ToolOutp
         String::new()
     };
     Ok(format!("找到 {} 条匹配:\n{}{}", results.len(), shown.join("\n"), more))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::simple_glob_match;
+
+    #[test]
+    fn glob_basic_shapes() {
+        assert!(simple_glob_match("*.rs", "main.rs"));
+        assert!(simple_glob_match("main.?s", "main.rs"));
+        assert!(!simple_glob_match("main.?s", "main.rss"));
+        assert!(!simple_glob_match("*.rs", "main.py"));
+        // 空文本 / 单星
+        assert!(simple_glob_match("*", ""));
+        assert!(!simple_glob_match("a*", ""));
+    }
+
+    /// `**` 与 `*` 同义:都跨 `/`(旧实现里 `**` 分支与 `*` 分支代码相同,注释却写"含多级 /",
+    /// 那次只是把死分支删掉、把注释改成实话,匹配行为不变)
+    #[test]
+    fn glob_star_spans_slash() {
+        assert!(simple_glob_match("**/*.rs", "src/a/b/main.rs"));
+        assert!(simple_glob_match("*/main.rs", "src/main.rs"));
+        assert!(simple_glob_match("**", "any/deep/path"));
+        // 星号也跨 `/` 的老行为保持不变:`src/*.rs` 能吃到 `src/a/main.rs`
+        assert!(simple_glob_match("src/*.rs", "src/a/main.rs"));
+        // 想只匹配一层目录要靠调用方自己按段匹配(walk_glob 就是逐段调的)
+        assert!(!simple_glob_match("src/*.py", "src/a/main.rs"));
+    }
+
+    /// 多星回溯:结果正确且不会指数爆炸(pattern 来自模型输出,可被恶意构造)
+    #[test]
+    fn glob_multi_star_backtracks_without_blowup() {
+        assert!(simple_glob_match("*a*b*c", "xxayybyycc"));
+        assert!(!simple_glob_match("*a*b*c", "xxayybyyzz"));
+        // 经典回溯地狱:老递归实现会在这里 2^n 爆炸,现在必须秒回
+        let pat = "*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b";
+        let text = "a".repeat(64);
+        let start = std::time::Instant::now();
+        assert!(!simple_glob_match(pat, &text));
+        assert!(start.elapsed().as_secs() < 2, "不该出现指数级回溯");
+    }
 }

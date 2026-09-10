@@ -269,12 +269,10 @@ impl OpenAiClient {
 
     /// 连通性验证:发条最短请求确认端点/key/模型可用(配置向导用)
     pub async fn validate(&self) -> anyhow::Result<()> {
-        // 用最小 token 的对话试;一些端点对空内容敏感,给个"hi"
+        // 用最小 token 的对话试;一些端点对空内容敏感,给个"hi"。
+        // 有内容 / 无内容但请求成功都算可用(部分端点会返回空回复),所以这里只看请求本身成不成
         let messages = vec![ChatMessage::user("hi")];
-        let reply = self.chat(&messages, None).await?;
-        if reply.content.is_none() && reply.tool_calls.is_empty() {
-            // 无内容但请求成功:仍视为可用(部分端点返回空)
-        }
+        self.chat(&messages, None).await?;
         Ok(())
     }
 
@@ -285,20 +283,36 @@ impl OpenAiClient {
         }
     }
 
+    /// 组装请求体:流式与非流式只差 `stream` / `stream_options`,其余字段共用一份,
+    /// 免得以后加 temperature / max_tokens 时漏改一边。
+    fn build_body(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[ToolDef]>,
+        stream: bool,
+    ) -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
+        let mut body = serde_json::Map::new();
+        body.insert("model".into(), json!(self.model));
+        body.insert("messages".into(), serde_json::to_value(messages)?);
+        body.insert("user".into(), json!(REQ_USER));
+        body.insert("stream".into(), json!(stream));
+        if stream {
+            // 让 OpenAI 兼容端点把真实用量放在流末尾的那条 usage 事件里
+            body.insert("stream_options".into(), json!({"include_usage": true}));
+        }
+        if let Some(tools) = tools {
+            body.insert("tools".into(), serde_json::to_value(tools)?);
+        }
+        Ok(body)
+    }
+
     /// 发起一次非流式对话;`tools` 为 None 时不带工具声明
     pub async fn chat(
         &self,
         messages: &[ChatMessage],
         tools: Option<&[ToolDef]>,
     ) -> anyhow::Result<AssistantReply> {
-        let mut body = serde_json::Map::new();
-        body.insert("model".into(), json!(self.model));
-        body.insert("messages".into(), serde_json::to_value(messages)?);
-        body.insert("user".into(), json!(REQ_USER));
-        body.insert("stream".into(), json!(false));
-        if let Some(tools) = tools {
-            body.insert("tools".into(), serde_json::to_value(tools)?);
-        }
+        let body = self.build_body(messages, tools, false)?;
         let resp = self.auth(self.http.post(self.url())).json(&body).send().await?;
         let status = resp.status();
         let text = resp.text().await?;
@@ -319,15 +333,7 @@ impl OpenAiClient {
     where
         F: FnMut(StreamEvent),
     {
-        let mut body = serde_json::Map::new();
-        body.insert("model".into(), json!(self.model));
-        body.insert("messages".into(), serde_json::to_value(messages)?);
-        body.insert("user".into(), json!(REQ_USER));
-        body.insert("stream".into(), json!(true));
-        body.insert("stream_options".into(), json!({"include_usage": true}));
-        if let Some(tools) = tools {
-            body.insert("tools".into(), serde_json::to_value(tools)?);
-        }
+        let body = self.build_body(messages, tools, true)?;
 
         let resp = self
             .auth(self.http.post(self.url()))
@@ -501,12 +507,7 @@ pub async fn probe_chat(probe: &crate::config::Resolved) -> anyhow::Result<()> {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let cut: String = s.chars().take(max).collect();
-        format!("{cut}…(截断)")
-    }
+    crate::util::truncate_chars(s, max, "…(截断)")
 }
 
 #[cfg(test)]

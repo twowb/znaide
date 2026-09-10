@@ -577,7 +577,7 @@ async fn tool_call_survives_sse_line_split_across_network_chunks() {
                     // 在参数 JSON 字符串中间切开(模拟 TCP 分片)
                     let mid = data_line.find("echo").unwrap() + 4;
                     let (a, b) = data_line.split_at(mid);
-                    let mut chunk = |payload: &str| {
+                    let chunk = |payload: &str| {
                         format!("{:x}\r\n{payload}\r\n", payload.len()).into_bytes()
                     };
 

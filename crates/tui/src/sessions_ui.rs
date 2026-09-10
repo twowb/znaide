@@ -93,6 +93,9 @@ pub struct SessionsUi {
     cursor: usize,
     scroll: usize,
     mode: Mode,
+    /// 已生效的筛选词(小写)。以前筛选只活在 Mode::Filter 里,一按 Enter 就没了——
+    /// 敲完筛选结果立刻恢复全量,也就没法"筛完再上下翻着挑",现在 Enter 保留、Esc 清除。
+    filter: String,
     /// 最近一次操作结果 (是否成功, 文本)
     status: Option<(bool, String)>,
 }
@@ -148,11 +151,7 @@ fn strip_frontmatter(content: &str) -> String {
 
 /// 截断展示文本
 fn short(s: &str, max: usize) -> String {
-    let mut t: String = s.chars().take(max).collect();
-    if s.chars().count() > max {
-        t.push('…');
-    }
-    t
+    znaide_core::util::truncate_chars(s, max, "…")
 }
 
 impl SessionsUi {
@@ -205,6 +204,7 @@ impl SessionsUi {
             cursor: 0,
             scroll: 0,
             mode: Mode::Browse,
+            filter: String::new(),
             status: None,
         }
     }
@@ -214,6 +214,45 @@ impl SessionsUi {
             Tab::Sessions => self.sessions.len(),
             Tab::Memories => self.mems.len(),
         }
+    }
+
+    /// 当前页签第 i 行的可搜索文本(小写)。渲染与筛选判定共用同一份,
+    /// 免得"看得见"与"算得着"两套条件漂移。
+    fn row_hay(&self, i: usize) -> String {
+        match self.tab {
+            Tab::Sessions => {
+                let s = &self.sessions[i];
+                format!(
+                    "{} {} {}",
+                    s.note.clone().unwrap_or_default(),
+                    s.id,
+                    s.headless
+                )
+                .to_lowercase()
+            }
+            Tab::Memories => {
+                let m = &self.mems[i];
+                format!("{} {} {} {}", m.name, m.desc, m.filename, m.mtype).to_lowercase()
+            }
+        }
+    }
+
+    /// 生效的筛选词:输入中用正在敲的(实时预览),否则用已提交的
+    fn active_filter(&self) -> String {
+        match &self.mode {
+            Mode::Filter(buf) => buf.to_lowercase(),
+            _ => self.filter.clone(),
+        }
+    }
+
+    fn row_visible(&self, i: usize, filter: &str) -> bool {
+        filter.is_empty() || self.row_hay(i).contains(filter)
+    }
+
+    /// 当前页签下通过筛选的条数
+    fn visible_len(&self) -> usize {
+        let f = self.active_filter();
+        (0..self.rows_len()).filter(|i| self.row_visible(*i, &f)).count()
     }
 
     fn marks(&self) -> &[bool] {
@@ -246,6 +285,16 @@ impl SessionsUi {
             return;
         }
         self.cursor = self.cursor.min(n - 1);
+        // 筛选后光标可能落在被藏起来的行上:就近挑一行可见的(先向下找,到底再向上),
+        // 保证 ▶ 永远画得出来、Enter/空格作用的就是屏幕上那一行。
+        let f = self.active_filter();
+        if !self.row_visible(self.cursor, &f) {
+            let down = (self.cursor..n).find(|i| self.row_visible(*i, &f));
+            let up = (0..=self.cursor).rev().find(|i| self.row_visible(*i, &f));
+            if let Some(i) = down.or(up) {
+                self.cursor = i;
+            }
+        }
         if self.cursor < self.scroll {
             self.scroll = self.cursor;
         }
@@ -256,7 +305,34 @@ impl SessionsUi {
         if n == 0 {
             return;
         }
-        self.cursor = (self.cursor as isize + delta).clamp(0, n as isize - 1) as usize;
+        let f = self.active_filter();
+        let step: isize = if delta >= 0 { 1 } else { -1 };
+        let mut cur = self.cursor.min(n - 1);
+        // 先把光标挪到可见行上(筛选刚提交时它可能还在隐藏行)
+        if !self.row_visible(cur, &f) {
+            let mut probe = cur;
+            while !self.row_visible(probe, &f) {
+                let next = probe as isize + step;
+                if next < 0 || next as usize >= n {
+                    break;
+                }
+                probe = next as usize;
+            }
+            cur = probe;
+        }
+        // 再走 delta 步,但只在可见行之间计数(隐藏行不算一站)
+        let mut left = delta.abs();
+        while left > 0 {
+            let next = cur as isize + step;
+            if next < 0 || next as usize >= n {
+                break;
+            }
+            cur = next as usize;
+            if self.row_visible(cur, &f) {
+                left -= 1;
+            }
+        }
+        self.cursor = cur;
         self.clamp_cursor();
     }
 
@@ -456,20 +532,35 @@ impl SessionsUi {
             return UiAction::None;
         }
         // 过滤输入
-        if let Mode::Filter(buf) = &mut self.mode {
+        if matches!(self.mode, Mode::Filter(_)) {
+            let mut buf = match std::mem::replace(&mut self.mode, Mode::Browse) {
+                Mode::Filter(b) => b,
+                _ => unreachable!(),
+            };
             match key.code {
-                KeyCode::Enter | KeyCode::Esc => {
-                    self.mode = Mode::Browse;
+                KeyCode::Enter => {
+                    // 保留筛选:回到浏览后仍只列命中的行,可以继续上下翻着挑
+                    self.filter = buf.to_lowercase();
+                    self.clear_status();
+                    self.clamp_cursor();
+                }
+                KeyCode::Esc => {
+                    // Esc = 放弃筛选(不清空就退不出去,和"取消"的语义一致)
+                    self.filter.clear();
                     self.clear_status();
                     self.clamp_cursor();
                 }
                 KeyCode::Backspace => {
                     buf.pop();
+                    self.mode = Mode::Filter(buf);
                 }
                 KeyCode::Char(c) if !c.is_control() => {
                     buf.push(c);
+                    self.mode = Mode::Filter(buf);
                 }
-                _ => {}
+                _ => {
+                    self.mode = Mode::Filter(buf);
+                }
             }
             return UiAction::None;
         }
@@ -484,6 +575,8 @@ impl SessionsUi {
                 };
                 self.cursor = 0;
                 self.scroll = 0;
+                // 筛选词跨页签沿用的,先落到一行可见的(否则 ▶ 会停在被藏起来的第 0 行)
+                self.clamp_cursor();
                 self.clear_status();
                 UiAction::None
             }
@@ -553,15 +646,17 @@ impl SessionsUi {
                 UiAction::None
             }
             KeyCode::Char('/') => {
-                self.mode = Mode::Filter(String::new());
+                // 带上当前筛选词:想改就接着敲,想全清就退格
+                self.mode = Mode::Filter(self.filter.clone());
                 UiAction::None
             }
             _ => UiAction::None,
         }
     }
 
+    /// "没有可操作的行"——按筛选后的可见条数算(筛没了就别让 Enter 去恢复看不见的会话)
     fn empty(&self) -> bool {
-        self.rows_len() == 0
+        self.visible_len() == 0
     }
 
     /// 渲染(窗口打开时宿主替代消息区调用)
@@ -626,8 +721,19 @@ impl SessionsUi {
             ));
             spans.push(Span::raw("  "));
         }
+        let marked = self.marks().iter().filter(|m| **m).count();
         spans.push(Span::styled(
-            format!("共 {} 条 · 已选 {}    ", self.rows_len(), self.marks().iter().filter(|m| **m).count()),
+            if self.filter.is_empty() {
+                format!("共 {} 条 · 已选 {}    ", self.rows_len(), marked)
+            } else {
+                format!(
+                    "共 {} 条 · 筛选「{}」命中 {} 条 · 已选 {}    ",
+                    self.rows_len(),
+                    self.filter,
+                    self.visible_len(),
+                    marked
+                )
+            },
             Style::default().fg(Color::DarkGray),
         ));
         spans.push(Span::styled(
@@ -662,31 +768,22 @@ impl SessionsUi {
             ),
             Mode::Filter(buf) => (
                 Style::default().fg(Color::Cyan),
-                format!("🔍 过滤(输入即时筛选,Enter/Esc 结束): /{buf}"),
+                format!("🔍 过滤(输入即时筛选;Enter 保留筛选,Esc 清除): /{buf}"),
             ),
             Mode::Detail { .. } => (Style::default(), String::new()),
         };
         f.render_widget(Paragraph::new(ctx_txt).style(ctx_style), chunks[1]);
 
-        // 列表行
-        let filter = match &self.mode {
-            Mode::Filter(buf) => buf.to_lowercase(),
-            _ => String::new(),
-        };
+        // 列表行:筛选词 = 输入中的正在敲的那份(实时预览),否则用已生效的那份。
+        // 判定用 row_visible(),与光标移动/Enter 走同一套条件。
+        let filter = self.active_filter();
         let now = now_secs();
         let mut lines: Vec<String> = Vec::new();
         let mut cursor_line: Option<usize> = None; // 过滤后光标行的显示行号
         match self.tab {
             Tab::Sessions => {
                 for (i, s) in self.sessions.iter().enumerate() {
-                    let hay = format!(
-                        "{} {} {}",
-                        s.note.clone().unwrap_or_default(),
-                        s.id,
-                        s.headless
-                    )
-                    .to_lowercase();
-                    if !filter.is_empty() && !hay.contains(&filter) {
+                    if !self.row_visible(i, &filter) {
                         continue;
                     }
                     let mark = if self.sess_marks[i] { "[×]" } else { "[ ]" };
@@ -714,8 +811,7 @@ impl SessionsUi {
             }
             Tab::Memories => {
                 for (i, m) in self.mems.iter().enumerate() {
-                    let hay = format!("{} {} {} {}", m.name, m.desc, m.filename, m.mtype).to_lowercase();
-                    if !filter.is_empty() && !hay.contains(&filter) {
+                    if !self.row_visible(i, &filter) {
                         continue;
                     }
                     let mark = if self.mem_marks[i] { "[×]" } else { "[ ]" };
@@ -827,6 +923,7 @@ mod tests {
             cursor: 0,
             scroll: 0,
             mode: Mode::Browse,
+            filter: String::new(),
             status: None,
         };
         (ui, dir)
@@ -958,5 +1055,57 @@ mod tests {
         ui.on_key(key(KeyCode::Char('y')));
         assert_eq!(ui.mems.len(), 1, "行应移除");
         assert_eq!(ui.mem_marks.len(), 1);
+    }
+
+    /// 筛选:Enter 提交后仍然生效(以前只活在输入态,一按 Enter 就恢复全量),
+    /// 光标只在命中行之间走,Enter 作用的就是可见的那一行
+    #[test]
+    fn filter_persists_and_cursor_tracks_visible_rows() {
+        let (mut ui, _d) = fake_ui();
+        ui.on_key(key(KeyCode::Char('/')));
+        assert!(matches!(ui.mode, Mode::Filter(_)));
+        // 输入中:实时预览,但还没提交
+        for c in "bbb".chars() {
+            ui.on_key(key(KeyCode::Char(c)));
+        }
+        assert!(ui.filter.is_empty(), "输入态不该提前提交");
+        assert_eq!(ui.visible_len(), 1, "只该命中 bbb 这一行");
+
+        // Enter 提交:筛选保留,光标落到那唯一命中行(index 1)
+        ui.on_key(key(KeyCode::Enter));
+        assert!(matches!(ui.mode, Mode::Browse));
+        assert_eq!(ui.filter, "bbb", "Enter 后筛选要留着");
+        assert_eq!(ui.cursor, 1, "光标应落在命中行上");
+        assert_eq!(ui.visible_len(), 1);
+
+        // 只有一个命中行:↓ / ↑ 都该停在原地(不能走到隐藏行)
+        ui.on_key(key(KeyCode::Down));
+        assert_eq!(ui.cursor, 1);
+        ui.on_key(key(KeyCode::Up));
+        assert_eq!(ui.cursor, 1);
+
+        // 光标被挪到隐藏行时(如筛选把当前行藏了),下一次移动要就近落回可见行
+        ui.cursor = 2;
+        ui.on_key(key(KeyCode::Down));
+        assert_eq!(ui.cursor, 1, "index 2 不可见 → 就近退回 index 1");
+
+        // Enter 恢复的是可见的那个会话(bbb)
+        match ui.on_key(key(KeyCode::Enter)) {
+            UiAction::Resume(p) => assert!(p.to_string_lossy().contains("bbb")),
+            _ => panic!("应恢复可见行对应的会话"),
+        }
+
+        // Esc 在输入态 = 清除筛选;再进输入态会带上当前词,退格可清空
+        ui.on_key(key(KeyCode::Char('/')));
+        assert!(matches!(ui.mode, Mode::Filter(ref b) if b == "bbb"), "应带出当前筛选词");
+        ui.on_key(key(KeyCode::Esc));
+        assert!(ui.filter.is_empty(), "Esc 应清除筛选");
+        assert_eq!(ui.visible_len(), 3);
+
+        // 筛没了:Enter 不该去恢复看不见的行
+        ui.filter = "不存在的东西".into();
+        ui.clamp_cursor();
+        assert!(ui.empty());
+        assert!(matches!(ui.on_key(key(KeyCode::Enter)), UiAction::None));
     }
 }

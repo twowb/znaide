@@ -74,28 +74,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
-name = "async-stream"
-version = "0.3.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b5a71a6f37880a80d1d7f19efd781e4b5de42c88f0722cc13bcb6cc2cfe8476"
-dependencies = [
- "async-stream-impl",
- "futures-core",
- "pin-project-lite",
-]
-
-[[package]]
-name = "async-stream-impl"
-version = "0.3.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7c24de15d275a1ecfd47a380fb4d5ec9bfe0933f309ed5e705b775596a3574d"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1946,7 +1924,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "znaide-cli"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -1958,10 +1936,9 @@ dependencies = [
 
 [[package]]
 name = "znaide-core"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
- "async-stream",
  "dirs",
  "futures-util",
  "regex",
@@ -1974,12 +1951,11 @@ dependencies = [
 
 [[package]]
 name = "znaide-tui"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "crossterm",
  "dirs",
- "futures-util",
  "ratatui",
  "serde_json",
  "tokio",

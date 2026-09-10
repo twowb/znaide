@@ -14,5 +14,4 @@ anyhow = { workspace = true }
 dirs = { workspace = true }
 regex = { workspace = true }
 futures-util = { workspace = true }
-async-stream = { workspace = true }
 tokio-util = { workspace = true }

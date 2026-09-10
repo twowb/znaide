@@ -63,16 +63,18 @@ fn read_manifest() -> Vec<Snapshot> {
         .collect()
 }
 
-fn write_manifest(snaps: &[Snapshot]) {
+fn write_manifest(snaps: &[Snapshot]) -> anyhow::Result<()> {
     if let Some(p) = manifest_path().parent() {
-        let _ = std::fs::create_dir_all(p);
+        std::fs::create_dir_all(p)?;
     }
-    let text: String = snaps
-        .iter()
-        .map(|s| serde_json::to_string(s).unwrap_or_default())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let _ = std::fs::write(manifest_path(), text + "\n");
+    let mut text = String::new();
+    for s in snaps {
+        // 序列化失败不能静默吞:那会让刚落盘的快照"不在册",/undo 看不见也永不回收
+        text.push_str(&serde_json::to_string(s)?);
+        text.push('\n');
+    }
+    std::fs::write(manifest_path(), text)?;
+    Ok(())
 }
 
 /// 写文件前备份:把 `file` 复制为快照并登记。若文件不存在(新建)则返回 None。
@@ -93,7 +95,10 @@ pub fn backup_for_session(session_id: &str, file: &Path, action: &str) -> anyhow
     let ts = now_ms();
     let session_root = files_root().join(sanitize_session(session_id));
     std::fs::create_dir_all(&session_root)?;
-    let seq = count_in_session(&session_id);
+    // manifest 只读一次:序号与追加都要它(以前 count_in_session 读一遍、这里再读一遍)
+    let mut all = read_manifest();
+    let sid = sanitize_session(session_id);
+    let seq = all.iter().filter(|s| s.session == sid).count();
     let snap_rel = format!("{ts}-{seq:04}.bak");
     let snap_abs = session_root.join(&snap_rel);
     std::fs::copy(file, &snap_abs)?;
@@ -106,7 +111,6 @@ pub fn backup_for_session(session_id: &str, file: &Path, action: &str) -> anyhow
         action: action.to_string(),
         gen: Some(GEN_TAG.into()),
     };
-    let mut all = read_manifest();
     all.push(rec.clone());
     // 保留最近 MAX 条(并清理超出的物理文件)
     while all.len() > MAX_SNAPSHOTS {
@@ -115,7 +119,7 @@ pub fn backup_for_session(session_id: &str, file: &Path, action: &str) -> anyhow
         }
         all.remove(0);
     }
-    write_manifest(&all);
+    write_manifest(&all)?;
     Ok(Some(rec))
 }
 
@@ -129,14 +133,6 @@ fn sanitize_session(id: &str) -> String {
     } else {
         cleaned
     }
-}
-
-fn count_in_session(session_id: &str) -> usize {
-    let sid = sanitize_session(session_id);
-    read_manifest()
-        .iter()
-        .filter(|s| s.session == sid)
-        .count()
 }
 
 /// 列出全部快照(新→旧)

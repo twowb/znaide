@@ -125,6 +125,27 @@ fn emit_alert(events: Option<&mpsc::UnboundedSender<SessionEvent>>, level: u8) {
     }
 }
 
+/// 某个管道读到一段数据的公共处理:进原始缓冲、顺带进实时增量、重置静默计时
+/// (stdout / stderr 两个 select 分支以前是逐字节一样的两份,只差变量名)。
+fn on_pipe_chunk(
+    dst: &mut Vec<u8>,
+    chunk: &[u8],
+    pending: &mut Vec<u8>,
+    events: Option<&mpsc::UnboundedSender<SessionEvent>>,
+    last_output: &mut Instant,
+    silent_level: &mut u8,
+) {
+    push_output(dst, chunk);
+    if events.is_some() {
+        push_output(pending, chunk);
+    }
+    *last_output = Instant::now();
+    if *silent_level != 0 {
+        *silent_level = 0;
+        emit_alert(events, 0);
+    }
+}
+
 async fn run(
     command: &str,
     dir: &std::path::Path,
@@ -198,34 +219,28 @@ async fn run(
             r = async { stdout.read(&mut out_chunk).await }, if !out_eof => {
                 match r {
                     Ok(0) => out_eof = true,
-                    Ok(n) => {
-                        push_output(&mut out_buf, &out_chunk[..n]);
-                        if events.is_some() {
-                            push_output(&mut pending, &out_chunk[..n]);
-                        }
-                        last_output = Instant::now();
-                        if silent_level_now != 0 {
-                            silent_level_now = 0;
-                            emit_alert(events, 0);
-                        }
-                    }
+                    Ok(n) => on_pipe_chunk(
+                        &mut out_buf,
+                        &out_chunk[..n],
+                        &mut pending,
+                        events,
+                        &mut last_output,
+                        &mut silent_level_now,
+                    ),
                     Err(e) => return Err(ToolError(format!("读命令输出失败: {e}"))),
                 }
             }
             r = async { stderr.read(&mut err_chunk).await }, if !err_eof => {
                 match r {
                     Ok(0) => err_eof = true,
-                    Ok(n) => {
-                        push_output(&mut err_buf, &err_chunk[..n]);
-                        if events.is_some() {
-                            push_output(&mut pending, &err_chunk[..n]);
-                        }
-                        last_output = Instant::now();
-                        if silent_level_now != 0 {
-                            silent_level_now = 0;
-                            emit_alert(events, 0);
-                        }
-                    }
+                    Ok(n) => on_pipe_chunk(
+                        &mut err_buf,
+                        &err_chunk[..n],
+                        &mut pending,
+                        events,
+                        &mut last_output,
+                        &mut silent_level_now,
+                    ),
                     Err(e) => return Err(ToolError(format!("读命令输出失败: {e}"))),
                 }
             }
