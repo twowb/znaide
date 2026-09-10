@@ -228,6 +228,18 @@ impl SetupWizard {
         }
     }
 
+    /// 文本输入态收到粘贴:把内容追加进输入缓冲,**只填充、不提交**
+    /// (提交仍按回车),换行一律丢掉——Key / 端点 / 模型名 / 轮数都是单行。
+    /// 调用方负责先做终端控制字符消毒(避免鼠标残片混入)。返回是否接收。
+    pub fn paste_text(&mut self, text: &str) -> bool {
+        if !self.typing {
+            return false;
+        }
+        self.input_buf
+            .extend(text.chars().filter(|c| *c != '\n' && *c != '\r'));
+        true
+    }
+
     pub fn on_key(&mut self, key: KeyEvent) -> WizardAction {
         // 手动输入模式(模型名 / 自定义端点 / key 输入共用一个输入逻辑)
         if self.typing {
@@ -865,6 +877,44 @@ mod tests {
         assert_eq!(w.model, "m1");
         assert_eq!(w.max_turns, None);
         std::env::remove_var(VAR);
+    }
+
+    /// 粘贴只填充输入缓冲、不触发任何动作:多行/含尾换行压成单行,回车才算提交
+    #[test]
+    fn paste_fills_typing_buffer_without_triggering() {
+        // 端点(custom 流程):粘贴带尾换行的 URL,不该把换行带进去
+        let mut w = SetupWizard::new();
+        w.provider = "custom".into();
+        w.step = Step::Provider;
+        w.typing = true;
+        w.input_buf.clear();
+        assert!(w.paste_text("https://api.example.com/v1\r\n"));
+        assert_eq!(w.input_buf, "https://api.example.com/v1");
+        // 再粘一段是追加;多行粘贴的换行被丢掉(Key 这种长串最怕带换行)
+        assert!(w.paste_text("sk-abc\ndef\r\ngh"));
+        assert_eq!(w.input_buf, "https://api.example.com/v1sk-abcdefgh");
+        assert!(w.typing, "粘贴不该结束输入态");
+        assert_eq!(w.step, Step::Provider, "粘贴不该推进步骤");
+        // 仍要按回车才提交
+        match w.on_key(key(KeyCode::Enter)) {
+            WizardAction::FetchModels { base_url, .. } => {
+                assert_eq!(base_url, "https://api.example.com/v1sk-abcdefgh")
+            }
+            _ => panic!("回车才触发动作"),
+        }
+
+        // API Key 输入态同样能粘
+        let mut k = SetupWizard::new();
+        k.step = Step::ApiKey;
+        k.typing = true;
+        k.input_buf.clear();
+        assert!(k.paste_text("sk-proj-1234567890\n"));
+        assert_eq!(k.input_buf, "sk-proj-1234567890");
+
+        // 非输入态(选择列表 / 等待验证)不接受粘贴
+        let mut l = SetupWizard::new();
+        assert!(!l.paste_text("x"));
+        assert!(l.input_buf.is_empty());
     }
 
     #[test]
