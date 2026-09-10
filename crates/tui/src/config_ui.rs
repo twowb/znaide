@@ -7,6 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use znaide_core::config::Config;
+use znaide_core::config::ProviderDef;
 use znaide_core::config::Resolved;
 
 /// 向导步骤
@@ -68,6 +69,9 @@ pub struct SetupWizard {
     pub typing_max_turns: bool,
     /// Key 来自环境变量(api_key_env):面板里显示为空但实际可用
     pub key_from_env: bool,
+    /// 打开面板时快照的合并后 provider 表:切服务商时按名字取"它自己"的
+    /// 模型/端点/Key(避免沿用上一家的模型或把上一家的 Key 带过去)
+    pub provider_defs: std::collections::HashMap<String, ProviderDef>,
 }
 
 impl SetupWizard {
@@ -90,7 +94,44 @@ impl SetupWizard {
             max_turns: None,
             typing_max_turns: false,
             key_from_env: false,
+            provider_defs: std::collections::HashMap::new(),
         }
+    }
+
+    /// 切到某个服务商时,带上**它自己**的模型与 Key。
+    /// Key 取值顺序:该条目明文 > 该条目的 api_key_env 环境变量 > 空(请用户输入)。
+    /// 这条修的是"配好 A 再切回 B,面板里还是 A 的模型/Key"的错配。
+    fn apply_provider_defaults(&mut self, name: &str) {
+        let def = self.provider_defs.get(name).cloned();
+        self.model = def
+            .as_ref()
+            .and_then(|d| d.model.clone())
+            .unwrap_or_default();
+        let plain = def
+            .as_ref()
+            .and_then(|d| d.api_key.clone())
+            .filter(|k| !k.is_empty());
+        // 环境变量名也取自同一份快照(别再读盘,免得和 provider_defs 不一致)
+        let from_env = def
+            .as_ref()
+            .and_then(|d| d.api_key_env.clone())
+            .and_then(|e| std::env::var(e).ok())
+            .filter(|v| !v.is_empty());
+        self.api_key = plain.or(from_env).unwrap_or_default();
+        // 这家没有明文 Key、而是靠 api_key_env:标记出来(界面提示 + 保存时别把
+        // 环境变量里的 Key 落成明文)
+        let plain_in_entry = def
+            .as_ref()
+            .and_then(|d| d.api_key.clone())
+            .filter(|k| !k.is_empty())
+            .is_some();
+        self.key_from_env = !plain_in_entry
+            && def
+                .as_ref()
+                .map(|d| d.api_key_env.is_some())
+                .unwrap_or(false);
+        self.model_cursor = 0;
+        self.models.clear();
     }
 
     /// 用现有配置预填(重开 `/config` 时把已经配好的值显示出来)。
@@ -125,18 +166,18 @@ impl SetupWizard {
         // Key:顶层手动覆盖 > 当前 provider 条目里的明文。走 api_key_env 的
         // **不**预填成明文,否则验证通过保存时会把 key 落到文件里,违背用环境变量的初衷。
         let def = cfg.all_providers().get(&self.provider).cloned();
-        self.api_key = cfg
-            .api_key
-            .clone()
-            .filter(|k| !k.is_empty())
-            .or_else(|| {
-                def.as_ref()
-                    .and_then(|d| d.api_key.clone())
-                    .filter(|k| !k.is_empty())
-            })
-            .unwrap_or_default();
-        self.key_from_env =
-            self.api_key.is_empty() && def.as_ref().map(|d| d.api_key_env.is_some()).unwrap_or(false);
+        // 快照一份 provider 表:切服务商时按名字取"它自己"的模型/Key
+        self.provider_defs = cfg.all_providers();
+        let top_plain = cfg.api_key.clone().filter(|k| !k.is_empty());
+        let entry_plain = def
+            .as_ref()
+            .and_then(|d| d.api_key.clone())
+            .filter(|k| !k.is_empty());
+        self.api_key = top_plain.clone().or(entry_plain.clone()).unwrap_or_default();
+        // 文件里没有明文、这家靠 api_key_env → 标记(界面提示,且保存时不写明文)
+        self.key_from_env = top_plain.is_none()
+            && entry_plain.is_none()
+            && def.as_ref().map(|d| d.api_key_env.is_some()).unwrap_or(false);
         self.max_turns = cfg.max_turns;
     }
 
@@ -182,6 +223,12 @@ impl SetupWizard {
         self.typing = false;
         match result {
             Ok(models) if !models.is_empty() => {
+                let mut models = models;
+                // 当前模型不在服务商给出的列表里(如自定模型名)→ 保留它并置顶选中,
+                // 免得用户只是"切回这家",回车一下模型就被悄悄换成列表第一项
+                if !self.model.is_empty() && !models.iter().any(|m| *m == self.model) {
+                    models.insert(0, self.model.clone());
+                }
                 let n = models.len();
                 self.models = models;
                 self.notice = format!("找到 {n} 个模型:↑↓ 选择,m 手动输入");
@@ -283,8 +330,8 @@ impl SetupWizard {
                     let switching = name != self.provider;
                     self.provider = name.clone();
                     if switching {
-                        self.api_key = env_key_for(&name);
-                        self.key_from_env = self.api_key.is_empty();
+                        // 切到哪家就带哪家的模型/Key(关键:别沿用上一家的)
+                        self.apply_provider_defaults(&name);
                     }
                     if name == "custom" {
                         // 自定义服务商:先输入端点
@@ -462,6 +509,8 @@ impl SetupWizard {
             // 编辑 key(从 ApiKey 进入输入后,仍在 ApiKey 状态,typing 模式)
             _ => {
                 self.api_key = v.to_string();
+                // 用户手输了明文 → 不再是"来自环境变量",保存会写进配置文件
+                self.key_from_env = false;
                 self.notice = "key 已更新,按 s 验证连接".into();
                 WizardAction::None
             }
@@ -608,12 +657,10 @@ impl SetupWizard {
                     format!("服务商: {} | 模型: {}", self.provider, self.model),
                     Style::default().fg(Color::Green),
                 )));
-                let key_disp = if self.api_key.is_empty() {
-                    if self.key_from_env {
-                        "(来自环境变量,留空即保持)".to_string()
-                    } else {
-                        "(未设置)".to_string()
-                    }
+                let key_disp = if self.key_from_env {
+                    "(来自环境变量,保存不会写成明文)".to_string()
+                } else if self.api_key.is_empty() {
+                    "(未设置)".to_string()
                 } else {
                     "••••••••".to_string()
                 };
@@ -915,6 +962,124 @@ mod tests {
         let mut l = SetupWizard::new();
         assert!(!l.paste_text("x"));
         assert!(l.input_buf.is_empty());
+    }
+
+    /// 回归:配好 A、再配 B 之后切回 A,面板必须带出 **A 自己**的模型与 Key
+    /// (曾经会沿用 B 的模型/B 的 Key,甚至在保存时把 B 的模型写进 A 的条目)
+    #[test]
+    fn switching_back_loads_that_provider_settings() {
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "deepseek".into(),
+            znaide_core::config::ProviderDef {
+                base_url: Some("https://api.deepseek.com/v1".into()),
+                model: Some("deepseek-flash".into()),
+                api_key: Some("sk-deepseek".into()),
+                ..Default::default()
+            },
+        );
+        providers.insert(
+            "dashscope".into(),
+            znaide_core::config::ProviderDef {
+                base_url: Some("https://dashscope.aliyuncs.com/compatible-mode/v1".into()),
+                model: Some("qwen-plus".into()),
+                api_key: Some("sk-aliyun".into()),
+                ..Default::default()
+            },
+        );
+        // 当前生效的是阿里云(用户刚配完)
+        let cfg = Config {
+            provider: Some("dashscope".into()),
+            ..Default::default()
+        };
+        // apply_config 只认 cfg.providers 里的表,这里直接把表塞进 Config
+        let cfg = Config { providers, ..cfg };
+
+        let mut w = SetupWizard::new();
+        w.apply_config(&cfg);
+        assert_eq!(w.provider, "dashscope");
+        assert_eq!(w.model, "qwen-plus");
+        assert_eq!(w.api_key, "sk-aliyun");
+
+        // 切回 deepseek:模型与 Key 都该换成 deepseek 自己的
+        let ds = w
+            .providers
+            .iter()
+            .position(|(n, _, _)| n == "deepseek")
+            .expect("列表里应有 deepseek");
+        w.cursor = ds;
+        w.on_key(key(KeyCode::Enter));
+        assert_eq!(w.provider, "deepseek");
+        assert_eq!(w.model, "deepseek-flash", "不能还留着阿里云的模型");
+        assert_eq!(w.api_key, "sk-deepseek", "不能还留着阿里云的 Key");
+        assert_eq!(
+            w.base_url, "https://api.deepseek.com/v1",
+            "端点要跟着服务商走"
+        );
+        assert!(!w.key_from_env, "明文 Key 不该被标成来自环境变量");
+        assert!(w.models.is_empty(), "换家后旧模型列表要清掉");
+
+        // 再切回阿里云,同样各归各家(切之前先把步骤拨回选择服务商)
+        w.step = Step::Provider;
+        let al = w
+            .providers
+            .iter()
+            .position(|(n, _, _)| n == "dashscope")
+            .unwrap();
+        w.cursor = al;
+        w.on_key(key(KeyCode::Enter));
+        assert_eq!(w.model, "qwen-plus");
+        assert_eq!(w.api_key, "sk-aliyun");
+    }
+
+    /// 服务商给出的模型列表里没有"当前模型"时,保留它并置顶选中(避免回车被悄悄换掉)
+    #[test]
+    fn inject_models_keeps_current_model_on_top() {
+        let mut w = SetupWizard::new();
+        w.provider = "deepseek".into();
+        w.model = "deepseek-flash".into();
+        w.step = Step::Querying;
+        w.inject_models(Ok(vec!["deepseek-chat".into(), "deepseek-reasoner".into()]));
+        assert_eq!(w.models.first().map(|s| s.as_str()), Some("deepseek-flash"));
+        assert_eq!(w.model_cursor, 0, "当前模型应被选中");
+        // 回车确认后仍是当前模型,没被列表第一项覆盖
+        w.on_key(key(KeyCode::Enter));
+        assert_eq!(w.model, "deepseek-flash");
+    }
+
+    /// 条目没有明文 Key 但有 api_key_env:切过去时从环境变量取
+    #[test]
+    fn switching_provider_takes_key_from_env_when_no_plaintext() {
+        const VAR: &str = "ZNAIDE_TEST_SWITCH_KEY";
+        std::env::set_var(VAR, "sk-env-switch");
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "dashscope".into(),
+            znaide_core::config::ProviderDef {
+                base_url: Some("https://dashscope.aliyuncs.com/compatible-mode/v1".into()),
+                model: Some("qwen-plus".into()),
+                api_key_env: Some(VAR.into()),
+                ..Default::default()
+            },
+        );
+        let cfg = Config {
+            provider: Some("ollama".into()),
+            providers,
+            ..Default::default()
+        };
+        let mut w = SetupWizard::new();
+        w.apply_config(&cfg);
+        let al = w
+            .providers
+            .iter()
+            .position(|(n, _, _)| n == "dashscope")
+            .unwrap();
+        w.cursor = al;
+        w.on_key(key(KeyCode::Enter));
+        assert_eq!(w.model, "qwen-plus");
+        assert_eq!(w.api_key, "sk-env-switch");
+        assert!(w.key_from_env, "应标注为来自环境变量");
+        std::env::remove_var(VAR);
     }
 
     #[test]

@@ -959,11 +959,17 @@ pub async fn run(
                         let mut cfg = znaide_core::config::Config::load().unwrap_or_default();
                         // 面板里填的轮数上限一起落盘(空 = 清除,回到默认 200)
                         cfg.max_turns = wizard.max_turns;
+                        // Key 来自环境变量时不写明文(留空即保持环境变量那条路)
+                        let key_arg = if wizard.key_from_env {
+                            None
+                        } else {
+                            r.api_key.as_deref()
+                        };
                         let save_result = cfg.save(
                             &r.provider_name,
                             Some(&r.model),
                             Some(&r.base_url),
-                            r.api_key.as_deref(),
+                            key_arg,
                         );
                         // 状态栏立即跟上新的轮数上限
                         round_limit = cfg.effective_max_turns();
@@ -1188,11 +1194,17 @@ pub async fn run(
                                 let mut cfg = znaide_core::config::Config::load().unwrap_or_default();
                                 // 面板里填的轮数上限一起落盘(空 = 清除,回到默认 200)
                                 cfg.max_turns = w.max_turns;
+                                // Key 来自环境变量时不写明文(留空即保持环境变量那条路)
+                                let key_arg = if w.key_from_env {
+                                    None
+                                } else {
+                                    draft.api_key.as_deref()
+                                };
                                 let save_result = cfg.save(
                                     &draft.provider_name,
                                     Some(&draft.model),
                                     Some(&draft.base_url),
-                                    draft.api_key.as_deref(),
+                                    key_arg,
                                 );
                                 // 状态栏立即跟上新的轮数上限
                                 round_limit = cfg.effective_max_turns();
