@@ -46,6 +46,11 @@ struct Cli {
     #[arg(long, value_name = "TARGET")]
     resume: Option<String>,
 
+    /// 单条消息最多允许的模型往返轮数(一轮可含多次工具调用)。缺省取 config 的
+    /// `max_turns`,再兜底 200;传 0 表示不限(只靠"重复调用同一工具"刹车)
+    #[arg(long, value_name = "N")]
+    max_turns: Option<usize>,
+
     /// 检查并安装 GitHub 最新版本(见 --version 查看当前版本)
     #[arg(long)]
     update: bool,
@@ -135,7 +140,7 @@ async fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
             let resolved = resolved?;
-            run_headless(&resolved, mode, &cwd, prompt, &persona).await?;
+            run_headless(&resolved, mode, &cwd, prompt, &persona, cli.max_turns).await?;
         }
         None => {
             // 首次运行(无配置)自动进配置引导
@@ -268,6 +273,7 @@ async fn run_headless(
     cwd: &PathBuf,
     prompt: &str,
     persona: &str,
+    max_turns: Option<usize>,
 ) -> anyhow::Result<()> {
     let llm = OpenAiClient::new(resolved)?;
 
@@ -304,14 +310,17 @@ async fn run_headless(
         mcp,
         persona,
     )?;
+    // 轮数上限:命令行 > config > 默认 200(0 = 不限)
+    if let Some(n) = max_turns {
+        session.set_max_turns(n);
+    } else if let Ok(cfg) = znaide_core::config::Config::load() {
+        session.set_max_turns(cfg.effective_max_turns());
+    }
     let result = session
         .run_turn(prompt)
         .await
         .map_err(|e| anyhow::anyhow!("{}", znaide_core::session::describe_request_error(&e)))?;
 
-    if result.truncated && result.tool_calls > 0 {
-        eprintln!("\n⚠ 达到工具调用轮数上限,任务可能未完成。");
-    }
     println!("\n{}", result.text);
     if result.tool_calls > 0 || result.input_tokens > 0 || result.output_tokens > 0 {
         eprintln!(

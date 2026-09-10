@@ -126,6 +126,8 @@ struct PermissionPrompt {
 #[derive(Debug)]
 enum ConfirmAction {
     ClearSession,
+    /// 轮次预算用尽,问是否再放一批(引擎在等这个回答)
+    ContinueRounds(oneshot::Sender<bool>),
 }
 
 struct ConfirmBox {
@@ -335,6 +337,10 @@ pub async fn run(
             Ok(s) => s,
             Err(_) => return,
         };
+        // 轮数上限:config 的 max_turns(0 = 不限),缺省 DEFAULT_MAX_TURNS
+        if let Ok(cfg) = znaide_core::config::Config::load() {
+            session.set_max_turns(cfg.effective_max_turns());
+        }
         if !persona.is_empty() {
             let _ = ev_tx.send(SessionEvent::Notice(format!(
                 "人格:{persona}(全局生效,输入 /persona 可切换或关闭)"
@@ -364,6 +370,11 @@ pub async fn run(
                     }
                     Some(AgentCmd::Reconfigure(r)) => {
                         session.reconfigure(&r);
+                        // 轮数上限也跟着重读(/config 改了 max_turns 立即生效)。
+                        // 状态栏的 round_limit 由宿主在保存配置处同步(这里在 agent 任务里,拿不到 UI 变量)
+                        if let Ok(cfg) = znaide_core::config::Config::load() {
+                            session.set_max_turns(cfg.effective_max_turns());
+                        }
                         session.notify(format!(
                             "✔ 配置已切换: {} / {}",
                             r.provider_name, r.model
@@ -454,6 +465,11 @@ pub async fn run(
     let mut sb_dragging = false;
     // 当前生效配置(表单回填与状态栏展示用)
     let mut current_resolved = resolved.clone();
+    // 轮次:本轮已用轮数 / 上限(0 = 不限),状态栏展示用
+    let mut round_used: usize = 0;
+    let mut round_limit: usize = znaide_core::config::Config::load()
+        .map(|c| c.effective_max_turns())
+        .unwrap_or(znaide_core::session::DEFAULT_MAX_TURNS);
     // 当前会话 id(agent 经 SessionInfo 事件回传,状态栏展示用)
     let mut session_id = String::new();
     // 配置向导(None = 对话模式)
@@ -470,7 +486,9 @@ pub async fn run(
             "🎉 首次运行:先完成一次配置。选 AI 服务商,向导自动查询可用模型。".into(),
         ));
         items.push(MsgItem::Notice("配置完成并验证通过前对话不可用。需要时用 /config 重开向导。".into()));
-        config_wizard = Some(SetupWizard::new());
+        let mut w = SetupWizard::new();
+        w.prefill();
+        config_wizard = Some(w);
     }
 
     // 动画时钟(与 ~120ms 帧对齐)
@@ -697,12 +715,23 @@ pub async fn run(
                 } else {
                     format!(" | {}", persona_disp)
                 };
+                // 轮次段:本轮已用 / 上限(0 = 不限)
+                let round_info = format!(
+                    " · 轮 {}/{}",
+                    round_used,
+                    if round_limit == 0 {
+                        "∞".to_string()
+                    } else {
+                        round_limit.to_string()
+                    }
+                );
                 let status = format!(
-                    " {}{} | {} | {}{}{}{}",
+                    " {}{} | {} | {}{}{}{}{}",
                     mode_str(current_mode),
                     persona_seg,
                     current_resolved.model,
                     state_text,
+                    round_info,
                     token_info,
                     scroll_hint,
                     sess
@@ -805,7 +834,7 @@ pub async fn run(
                 }
                 continue;
             }
-            // 破坏性操作确认框(/clear 等):y 执行 / n、Esc 取消
+            // 确认框:权限以外的破坏性操作(/clear)与轮次续跑询问共用
             if let Some(cf) = confirm.take() {
                 match k.code {
                     KeyCode::Char('y') | KeyCode::Char('Y') => match cf.action {
@@ -814,10 +843,22 @@ pub async fn run(
                             items.clear();
                             let _ = cmd_tx.send(AgentCmd::ClearContext);
                         }
+                        ConfirmAction::ContinueRounds(tx) => {
+                            let _ = tx.send(true);
+                            items.push(MsgItem::Notice("▶ 继续执行,再放一批轮次。".into()));
+                        }
                     },
-                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                        items.push(MsgItem::Notice("已取消清空。".into()));
-                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => match cf.action {
+                        ConfirmAction::ContinueRounds(tx) => {
+                            let _ = tx.send(false);
+                            items.push(MsgItem::Notice(
+                                "已停在当前进度;要继续直接再发一条消息。".into(),
+                            ));
+                        }
+                        ConfirmAction::ClearSession => {
+                            items.push(MsgItem::Notice("已取消清空。".into()));
+                        }
+                    },
                     _ => {
                         confirm = Some(cf);
                     }
@@ -910,12 +951,16 @@ pub async fn run(
                     WizardAction::Save(r) => {
                         // 验证通过:落盘 + 运行时应用 + 解锁
                         let mut cfg = znaide_core::config::Config::load().unwrap_or_default();
+                        // 面板里填的轮数上限一起落盘(空 = 清除,回到默认 200)
+                        cfg.max_turns = wizard.max_turns;
                         let save_result = cfg.save(
                             &r.provider_name,
                             Some(&r.model),
                             Some(&r.base_url),
                             r.api_key.as_deref(),
                         );
+                        // 状态栏立即跟上新的轮数上限
+                        round_limit = cfg.effective_max_turns();
                         let _ = cmd_tx.send(AgentCmd::Reconfigure(r.clone()));
                         current_resolved = r.clone();
                         configured_ok = save_result.is_ok();
@@ -988,7 +1033,10 @@ pub async fn run(
                     }
                     if raw == "/config" {
                         items.push(MsgItem::Notice("打开配置向导…".into()));
-                        config_wizard = Some(SetupWizard::new());
+                        let mut w = SetupWizard::new();
+                        // 预填现有轮数上限(其余字段在向导里现选/现填)
+                        w.prefill();
+                        config_wizard = Some(w);
                         input.clear();
                         input_cursor = 0;
                     } else if raw.starts_with('/') {
@@ -1132,12 +1180,16 @@ pub async fn run(
                                 // 验证通过 → 保存并解锁
                                 let draft = w.draft();
                                 let mut cfg = znaide_core::config::Config::load().unwrap_or_default();
+                                // 面板里填的轮数上限一起落盘(空 = 清除,回到默认 200)
+                                cfg.max_turns = w.max_turns;
                                 let save_result = cfg.save(
                                     &draft.provider_name,
                                     Some(&draft.model),
                                     Some(&draft.base_url),
                                     draft.api_key.as_deref(),
                                 );
+                                // 状态栏立即跟上新的轮数上限
+                                round_limit = cfg.effective_max_turns();
                                 let _ = cmd_tx.send(AgentCmd::Reconfigure(draft.clone()));
                                 current_resolved = draft.clone();
                                 configured_ok = save_result.is_ok();
@@ -1178,16 +1230,35 @@ pub async fn run(
         loop {
             match ev_rx.try_recv() {
                 Ok(ev) => {
-                    handle_session_event(
-                        ev,
-                        &mut items,
-                        &mut busy,
-                        &mut busy_kind,
-                        &mut permission,
-                        &mut session_id,
-                        &mut persona_disp,
-                        &mut token_stats,
-                    )
+                    match ev {
+                        // 轮次进度:只更新状态栏,不进消息流
+                        SessionEvent::RoundStarted { used, limit } => {
+                            round_used = used;
+                            round_limit = limit;
+                        }
+                        // 轮次预算用尽:用确认框问用户要不要再放一批(引擎在等回答)
+                        SessionEvent::RoundsExhausted { used, tx } => {
+                            confirm = Some(ConfirmBox {
+                                title: "继续执行".into(),
+                                body: format!(
+                                    "已达 {used} 轮工具调用上限,任务还没干完。\n\
+                                     再放一批继续跑吗?(想一次跑更久:启动加 --max-turns N,\
+                                     或在 config.json 里设 max_turns,0 = 不限)"
+                                ),
+                                action: ConfirmAction::ContinueRounds(tx),
+                            });
+                        }
+                        other => handle_session_event(
+                            other,
+                            &mut items,
+                            &mut busy,
+                            &mut busy_kind,
+                            &mut permission,
+                            &mut session_id,
+                            &mut persona_disp,
+                            &mut token_stats,
+                        ),
+                    }
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
@@ -1607,7 +1678,7 @@ fn skill_list_text(cwd: &Path) -> String {
 const HELP_TEXT: &str = "可用命令:
   /help                    显示本帮助
   /skills                  列出已安装技能
-  /config                  打开配置面板(随时修改 provider/模型/端点/key,立即生效)
+  /config                  打开配置面板(随时修改 provider/模型/端点/key/轮数上限,立即生效)
   /undo                    列出 undo 快照; /undo <序号> 回滚
   /resume                  打开会话管理窗口(会话/记忆页签,多选批量删、备注、恢复); /resume <序号|片段> 恢复; /resume del <序号|片段> 删除
   /clear                   清空当前会话上下文与历史文件(需确认)
@@ -1816,6 +1887,13 @@ fn handle_session_event(
         }
         SessionEvent::PermissionRequest { title, body, warning, tx, .. } => {
             *permission = Some(PermissionPrompt { title, body, warning, tx });
+        }
+        SessionEvent::RoundsExhausted { .. } => {
+            // 正常路径下由事件循环拦截并弹"继续执行"确认框(见 run 的事件泵);
+            // 走到这里说明没人接管,直接丢弃发送端 = 引擎按"不续跑"收尾。
+        }
+        SessionEvent::RoundStarted { .. } => {
+            // 同上:状态栏用的轮次进度由事件泵直接消费,不进消息流
         }
         SessionEvent::Notice(t) => {
             items.push(MsgItem::Notice(t));

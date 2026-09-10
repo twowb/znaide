@@ -56,6 +56,12 @@ pub enum SessionEvent {
         warning: Option<String>,
         tx: oneshot::Sender<(bool, bool)>,
     },
+    /// 一轮模型往返开始(轮次预算用):used = 已用轮数(含本轮),limit = 上限
+    /// (0 = 不限)。UI 拿它显示"轮 x/y"。
+    RoundStarted { used: usize, limit: usize },
+    /// 轮次预算用尽、任务还没完(交互模式):问 UI 要不要再放一批。
+    /// tx 回 true = 再放一批(默认 200 轮),false / Esc / 通道关闭 = 就此收尾
+    RoundsExhausted { used: usize, tx: oneshot::Sender<bool> },
     /// 通知/提示(如危险命令拦截)
     Notice(String),
     /// 一次模型调用的真实 token 用量(端点不提供 usage 就不发)
@@ -91,6 +97,16 @@ pub struct TurnResult {
     /// 本回合输出 token 累计(端点不给 usage 则为 0)
     pub output_tokens: u64,
 }
+
+/// 单条消息默认允许的模型往返轮数(一轮可含多次工具调用)。可用
+/// `--max-turns` / config 的 `max_turns` 覆盖;0 = 不限。
+pub const DEFAULT_MAX_TURNS: usize = 200;
+
+/// 同一次(工具, 参数)完全相同的调用累计到这个次数:在工具结果里插一句提醒,
+/// 劝模型换方法——不死板地掐断,先给一次自救机会。
+const REPEAT_WARN: usize = 3;
+/// 相同调用累计到这个次数还没换路:判定原地打转,收尾。
+const REPEAT_ABORT: usize = 6;
 
 /// 会话:多轮对话 + 工具循环。交互模式把事件发给 UI,无头模式按规则自动放行/拒绝;
 /// persist=true 时消息记到 ~/.znaide/sessions/<id>.jsonl;写文件前自动做 undo 快照。
@@ -153,7 +169,7 @@ impl Session {
             file_always: false,
             command_always: false,
             messages: Vec::new(),
-            max_turns: 40,
+            max_turns: DEFAULT_MAX_TURNS,
             history_writer,
             history_path,
             mcp: mcp.unwrap_or_else(crate::mcp::McpManager::start_empty),
@@ -182,6 +198,17 @@ impl Session {
     /// 换模型/端点/key,立即生效,不打断会话
     pub fn reconfigure(&mut self, resolved: &crate::config::Resolved) {
         self.llm.reconfigure(resolved);
+    }
+
+    /// 设置单条消息的轮数上限(0 = 不限)。CLI `--max-turns` 与 config 的
+    /// `max_turns` 都从这里进来;/config 改动后由宿主重新调用即可即时生效。
+    pub fn set_max_turns(&mut self, n: usize) {
+        self.max_turns = n;
+    }
+
+    /// 当前轮数上限(0 = 不限)
+    pub fn max_turns(&self) -> usize {
+        self.max_turns
     }
 
     pub fn current_model(&self) -> &str {
@@ -638,7 +665,45 @@ impl Session {
         }
         defs.extend(self.mcp.tool_defs());
 
-        for _turn in 0..self.max_turns {
+        // D1 轮数预算:max_turns = 0 视为不限;每批用完问用户要不要续跑(D2)
+        let batch = if self.max_turns == 0 { usize::MAX } else { self.max_turns };
+        let mut budget = batch;
+        let mut used = 0usize;
+        // D3 刹车:完全相同(工具 + 参数)的调用计数
+        let mut sig_seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+        loop {
+            if used >= budget {
+                if !self.ask_continue_rounds(used).await {
+                    // 无人可问(无头)或用户选择就此收尾:说清怎么调大,别只说"没干完"
+                    let text = if self.events.is_some() {
+                        format!(
+                            "⚠ 已达 {used} 轮上限,按你的选择停在这里。要继续直接再发一条消息;\
+                             想一次跑更久可用 --max-turns N 调大上限(--max-turns 0 = 不限)"
+                        )
+                    } else {
+                        format!(
+                            "⚠ 已达 {used} 轮上限,任务可能没干完。用 --max-turns N 调大上限,\
+                             --max-turns 0 表示不限"
+                        )
+                    };
+                    self.emit(SessionEvent::TurnFinished { text: text.clone(), truncated: true });
+                    return Ok(TurnResult {
+                        text,
+                        tool_calls,
+                        truncated: true,
+                        input_tokens: usage_in,
+                        output_tokens: usage_out,
+                    });
+                }
+                budget = budget.saturating_add(batch);
+            }
+            used += 1;
+            // 状态栏/日志用:本轮第几轮、上限(0 = 不限)
+            self.emit(SessionEvent::RoundStarted {
+                used,
+                limit: if budget == usize::MAX { 0 } else { budget },
+            });
             let reply = if self.events.is_some() {
                 let ev = self.events.clone();
                 let cancel = self.cancel.clone();
@@ -701,7 +766,20 @@ impl Session {
             // tool_calls 却没有对应 tool 响应"的孤儿,恢复会话后端点 400。
             for (i, tc) in reply.tool_calls.iter().enumerate() {
                 tool_calls += 1;
-                let out = self.execute_tool_call(tc).await;
+                let mut out = self.execute_tool_call(tc).await;
+                // D3:同一 (工具, 参数) 重复调用先插一句提醒,给模型自救机会
+                let sig = format!("{}|{}", tc.function.name, tc.function.arguments);
+                let n = {
+                    let c = sig_seen.entry(sig).or_insert(0);
+                    *c += 1;
+                    *c
+                };
+                if n >= REPEAT_WARN && n < REPEAT_ABORT {
+                    out.push_str(&format!(
+                        "\n\n⚠ 同一个调用(工具 + 参数完全一样)你已经重复第 {n} 次了,结果不会变。\
+                         换参数/换工具/换思路,或直接汇报现状与卡点;再重复到 {REPEAT_ABORT} 次本轮会被中止。"
+                    ));
+                }
                 self.record(&ChatMessage::tool(&tc.id, out));
                 if self.cancel.is_cancelled() {
                     for rest in &reply.tool_calls[i + 1..] {
@@ -721,11 +799,38 @@ impl Session {
                     });
                 }
             }
+            // D3:重复到上限还没换路 → 判定原地打转,收尾(比烧到轮数上限更早、说得更明白)
+            if let Some((sig, n)) = sig_seen.iter().max_by_key(|(_, c)| **c) {
+                if *n >= REPEAT_ABORT {
+                    let name = sig.split('|').next().unwrap_or("?").to_string();
+                    let text = format!(
+                        "⚠ 检测到原地打转:工具 `{name}` 用完全相同的参数重复了 {n} 次,已中止本轮。\
+                         换个思路再来,或直接告诉我要什么。"
+                    );
+                    self.emit(SessionEvent::TurnFinished { text: text.clone(), truncated: true });
+                    return Ok(TurnResult {
+                        text,
+                        tool_calls,
+                        truncated: true,
+                        input_tokens: usage_in,
+                        output_tokens: usage_out,
+                    });
+                }
+            }
         }
+    }
 
-        let text = "⚠ 工具调用轮数到上限了,任务没干完就停了。".to_string();
-        self.emit(SessionEvent::TurnFinished { text: text.clone(), truncated: true });
-        Ok(TurnResult { text, tool_calls, truncated: true, input_tokens: usage_in, output_tokens: usage_out })
+    /// D2:轮次预算用尽时问 UI 要不要再放一批。无头模式(没有 UI)直接 false。
+    async fn ask_continue_rounds(&mut self, used: usize) -> bool {
+        if self.events.is_none() {
+            return false;
+        }
+        let (tx, rx) = oneshot::channel();
+        self.emit(SessionEvent::RoundsExhausted { used, tx });
+        tokio::select! {
+            r = rx => r.unwrap_or(false),
+            _ = self.cancel.cancelled() => false,
+        }
     }
 
     /// 执行单个工具调用(权限 → 分发),返回回填给模型的结果文本

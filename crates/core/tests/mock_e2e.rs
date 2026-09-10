@@ -955,3 +955,235 @@ async fn session_turn_error_notifies_and_finishes() {
     assert!(saw_notice, "错误应以 Notice 告知 UI");
     assert!(saw_finish, "错误后应发 TurnFinished 复位忙态");
 }
+
+/// D1/D2 无头模式:模型一直要调工具、轮数预算用尽 → 不再"静默硬停",
+/// 文本里说清"已达 N 轮"并给出 --max-turns 的调法(没有人可问,直接收尾)。
+#[tokio::test]
+async fn round_budget_exhausted_reports_headless() {
+    let base = spawn_mock(|_n, _body| {
+        http_json_resp(
+            r#"{"id":"1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"list_directory","arguments":"{\"path\":\".\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+        )
+    })
+    .await;
+
+    let cwd = std::env::temp_dir().join(format!("znaide_budget_{}", std::process::id()));
+    std::fs::create_dir_all(&cwd).unwrap();
+    let cfg = Resolved {
+        model: "m".into(),
+        base_url: base,
+        api_key: None,
+        provider_name: "mock".into(),
+        context_window: None,
+    };
+    let llm = OpenAiClient::new(&cfg).unwrap();
+    let mut session = Session::new(
+        llm,
+        cwd.clone(),
+        Mode::BypassPermissions,
+        None, // 无头:没有人可以问
+        CancellationToken::new(),
+        false,
+        Some("mock-budget".into()),
+        None,
+        "",
+    )
+    .unwrap();
+    session.set_max_turns(2);
+
+    let result = session.run_turn("一直干活").await.unwrap();
+    assert!(result.truncated, "轮数用尽应标记 truncated");
+    assert_eq!(result.tool_calls, 2, "只该跑满 2 轮");
+    assert!(
+        result.text.contains("2 轮上限") && result.text.contains("--max-turns"),
+        "提示要说清轮数与调法,got: {}",
+        result.text
+    );
+
+    std::fs::remove_dir_all(cwd).ok();
+}
+
+/// D1:max_turns = 0 表示不限——模型连着调十几轮工具也不会被轮数上限打断,
+/// 直到它自己给出无工具的回复。(每轮换一个文件,避免撞上 D3 的重复调用刹车)
+#[tokio::test]
+async fn max_turns_zero_means_unlimited() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_clone = calls.clone();
+    let base = spawn_mock(move |_n, _body| {
+        let i = calls_clone.fetch_add(1, Ordering::SeqCst);
+        if i < 11 {
+            http_json_resp(&format!(
+                r#"{{"id":"{i}","object":"chat.completion","choices":[{{"index":0,"message":{{"role":"assistant","tool_calls":[{{"id":"c{i}","type":"function","function":{{"name":"read_file","arguments":"{{\"path\":\"src/f{i}.rs\"}}"}}}}]}},"finish_reason":"tool_calls"}}]}}"#
+            ))
+        } else {
+            http_json_resp(
+                r#"{"id":"end","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"收工"},"finish_reason":"stop"}]}"#,
+            )
+        }
+    })
+    .await;
+
+    let cwd = std::env::temp_dir().join(format!("znaide_unlim_{}", std::process::id()));
+    std::fs::create_dir_all(cwd.join("src")).unwrap();
+    for i in 0..12 {
+        std::fs::write(cwd.join(format!("src/f{i}.rs")), "fn main() {}").unwrap();
+    }
+    let cfg = Resolved {
+        model: "m".into(),
+        base_url: base,
+        api_key: None,
+        provider_name: "mock".into(),
+        context_window: None,
+    };
+    let llm = OpenAiClient::new(&cfg).unwrap();
+    let mut session = Session::new(
+        llm,
+        cwd.clone(),
+        Mode::BypassPermissions,
+        None,
+        CancellationToken::new(),
+        false,
+        Some("mock-unlimited".into()),
+        None,
+        "",
+    )
+    .unwrap();
+    session.set_max_turns(2); // 先用 2 验证钳制
+    let capped = session.run_turn("先跑两轮").await.unwrap();
+    assert!(capped.truncated, "max_turns=2 应被钳制");
+    session.set_max_turns(0); // 再放开为不限
+    let free = session.run_turn("这次不限轮数").await.unwrap();
+    assert!(!free.truncated, "不限轮数时不该被截断: {}", free.text);
+    assert!(free.text.contains("收工"));
+    assert!(free.tool_calls >= 8, "应真的跑满 8 轮以上,got {}", free.tool_calls);
+
+    std::fs::remove_dir_all(cwd).ok();
+}
+
+/// 轮次进度事件:每轮模型调用前发 `RoundStarted`(used/limit),状态栏据此显示"轮 x/y";
+/// `max_turns = 0` 时 limit = 0(UI 显示 ∞)。只读工具不弹权限框,可在无人值守下跑完。
+#[tokio::test]
+async fn round_started_events_report_progress() {
+    use znaide_core::session::SessionEvent;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_clone = calls.clone();
+    let base = spawn_mock(move |_n, _body| {
+        let i = calls_clone.fetch_add(1, Ordering::SeqCst);
+        // events=Some → 走流式通道,必须回 SSE
+        if i < 3 {
+            sse_resp(&[
+                &format!(
+                    r#"{{"choices":[{{"delta":{{"tool_calls":[{{"index":0,"id":"c{i}","type":"function","function":{{"name":"list_directory","arguments":"{{\"path\":\"src/f{i}\"}}"}}}}]}},"finish_reason":null}}]}}"#
+                ),
+                r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+                "[DONE]",
+            ])
+        } else {
+            sse_resp(&[
+                r#"{"choices":[{"delta":{"content":"收工"},"finish_reason":null}]}"#,
+                r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+                "[DONE]",
+            ])
+        }
+    })
+    .await;
+
+    let cwd = std::env::temp_dir().join(format!("znaide_rounds_{}", std::process::id()));
+    std::fs::create_dir_all(cwd.join("src")).unwrap();
+    let cfg = Resolved {
+        model: "m".into(),
+        base_url: base,
+        api_key: None,
+        provider_name: "mock".into(),
+        context_window: None,
+    };
+    let llm = OpenAiClient::new(&cfg).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut session = Session::new(
+        llm,
+        cwd.clone(),
+        Mode::BypassPermissions,
+        Some(tx),
+        CancellationToken::new(),
+        false,
+        Some("mock-rounds".into()),
+        None,
+        "",
+    )
+    .unwrap();
+
+    // 有上限:每轮都要报 used/limit
+    session.set_max_turns(50);
+    session.run_turn("跑几轮").await.unwrap();
+    let mut got: Vec<(usize, usize)> = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        if let SessionEvent::RoundStarted { used, limit } = ev {
+            got.push((used, limit));
+        }
+    }
+    assert_eq!(got, vec![(1, 50), (2, 50), (3, 50), (4, 50)], "每轮都要带上限");
+
+    // 不限:limit = 0(UI 用 ∞ 表示)
+    session.set_max_turns(0);
+    session.run_turn("再来一次").await.unwrap();
+    let mut last: Option<(usize, usize)> = None;
+    while let Ok(ev) = rx.try_recv() {
+        if let SessionEvent::RoundStarted { used, limit } = ev {
+            last = Some((used, limit));
+        }
+    }
+    assert_eq!(last, Some((1, 0)), "不限时 limit 报 0");
+
+    std::fs::remove_dir_all(cwd).ok();
+}
+
+/// D3:同一个 (工具, 参数) 反复调用 → 不烧到轮数上限,判"原地打转"提前收尾;
+/// 中间会先在工具结果里插提醒(给了自救机会)。
+#[tokio::test]
+async fn repeated_identical_call_is_stopped() {
+    let base = spawn_mock(|_n, _body| {
+        http_json_resp(
+            r#"{"id":"1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"list_directory","arguments":"{\"path\":\".\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+        )
+    })
+    .await;
+
+    let cwd = std::env::temp_dir().join(format!("znaide_stuck_{}", std::process::id()));
+    std::fs::create_dir_all(&cwd).unwrap();
+    let cfg = Resolved {
+        model: "m".into(),
+        base_url: base,
+        api_key: None,
+        provider_name: "mock".into(),
+        context_window: None,
+    };
+    let llm = OpenAiClient::new(&cfg).unwrap();
+    let mut session = Session::new(
+        llm,
+        cwd.clone(),
+        Mode::BypassPermissions,
+        None,
+        CancellationToken::new(),
+        false,
+        Some("mock-stuck".into()),
+        None,
+        "",
+    )
+    .unwrap();
+
+    let result = session.run_turn("重复同一个调用").await.unwrap();
+    assert!(result.truncated, "判打转应标记 truncated");
+    assert!(
+        result.text.contains("原地打转"),
+        "应明确说检测到原地打转,got: {}",
+        result.text
+    );
+    // 默认轮数上限 200,这里必须远早于它停下(6 次重复即中止)
+    assert!(
+        result.tool_calls <= 6,
+        "应在第 6 次重复时中止,实际 {} 次",
+        result.tool_calls
+    );
+
+    std::fs::remove_dir_all(cwd).ok();
+}
