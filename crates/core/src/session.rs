@@ -2,7 +2,7 @@ use crate::config::data_dir;
 use crate::llm::openai::{AssistantReply, StreamEvent};
 use crate::llm::types::{ChatMessage, ToolCall, ToolDef};
 use crate::llm::OpenAiClient;
-use crate::permissions::{is_dangerous_command, Mode, Permission};
+use crate::permissions::{inspect_command, CommandRisk, Mode, Permission};
 use crate::refs::expand_at_refs;
 use crate::tools::{self, ToolContext};
 use serde_json::{json, Value};
@@ -51,6 +51,9 @@ pub enum SessionEvent {
         kind: PermKind,
         title: String,
         body: String,
+        /// Some(说明) = 高危命令或目标无法判定:UI 用红色渲染该说明,且不提供
+        /// "本会话都允许"(只允许单次放行)
+        warning: Option<String>,
         tx: oneshot::Sender<(bool, bool)>,
     },
     /// 通知/提示(如危险命令拦截)
@@ -492,19 +495,52 @@ impl Session {
         self.emit(SessionEvent::Notice(msg.into()));
     }
 
-    /// 权限总判定:YOLO 直接放行 → 危险命令拦截 → 无头按档位静态判 / 交互弹窗问
+    /// 权限总判定:YOLO 直接放行 → 命令风险判定(高危/无法判定)→ 无头按档位静态判 /
+    /// 交互弹窗问。
+    ///
+    /// 命令风险来自 permissions::inspect_command(启发式,解析目标路径而非匹配原文):
+    /// - 解析出高危目标 → 交互模式弹红色确认框、只允许单次放行(不给"本会话都允许");
+    ///   无头模式直接拒(bypassPermissions 也不放行)。
+    /// - 目标无法判定(变量未知/通配符越界/间接调用)→ 同样要人点头,且不吃"本会话都允许"。
     async fn check_permission(&mut self, kind: PermKind, cmd: &str) -> PermissionResult {
-        // YOLO(超级模式):一切放行、无任何问询,危险命令黑名单也跳过
+        // YOLO(超级模式):一切放行、无任何问询,危险命令判定也跳过
         if self.mode == Mode::Yolo {
             return PermissionResult::Allowed;
         }
+        // 高危(true)或无法判定(false)时携带给 UI 的说明
+        let mut hazard: Option<(bool, String)> = None;
         if kind == PermKind::Command && !cmd.is_empty() {
-            if let Some(reason) = is_dangerous_command(cmd) {
-                return PermissionResult::Denied(format!(
-                    "命令被安全策略拦截: {reason}\n要执行就自己去终端手动跑"
-                ));
+            match inspect_command(cmd, &self.cwd) {
+                CommandRisk::Blocked { reason, target } => {
+                    if self.events.is_none() {
+                        return PermissionResult::Denied(format!(
+                            "命令被安全策略拦截: {reason}(解析出的目标:{target})。\
+                             无头模式无法交互确认,已拒绝;如确需执行,请自行在终端跑"
+                        ));
+                    }
+                    hazard = Some((true, format!("⚠ {reason}\n解析出的目标:{target}")));
+                }
+                CommandRisk::Uncertain { reason, detail } => {
+                    if self.events.is_none() {
+                        return match self.mode {
+                            Mode::BypassPermissions => PermissionResult::Allowed,
+                            _ => PermissionResult::Denied(format!(
+                                "命令目标无法确定({reason}:{detail}),无头模式已拒绝。\
+                                 要自动执行就加 --permission bypassPermissions"
+                            )),
+                        };
+                    }
+                    hazard = Some((
+                        false,
+                        format!("⚠ {reason}\n{detail}\n(含变量/通配符或间接调用,判定看不穿)"),
+                    ));
+                }
+                CommandRisk::Safe => {}
             }
         }
+        let has_warning = hazard.is_some();
+        let warning = hazard.map(|(_, w)| w);
+
         if self.events.is_none() {
             match kind {
                 PermKind::Write => match self.mode {
@@ -527,7 +563,10 @@ impl Session {
         } else {
             match kind {
                 PermKind::Write if self.file_always => PermissionResult::Allowed,
-                PermKind::Command if self.command_always => PermissionResult::Allowed,
+                // 高危/无法判定的命令不吃"本会话都允许"
+                PermKind::Command if self.command_always && !has_warning => {
+                    PermissionResult::Allowed
+                }
                 _ => {
                     let (tx, rx) = oneshot::channel();
                     let title = match kind {
@@ -539,11 +578,11 @@ impl Session {
                         PermKind::Write => "znaide 想要修改文件".to_string(),
                         PermKind::Command => cmd.to_string(),
                     };
-                    self.emit(SessionEvent::PermissionRequest { kind, title, body, tx });
+                    self.emit(SessionEvent::PermissionRequest { kind, title, body, warning, tx });
                     tokio::select! {
                         r = rx => match r {
                             Ok((allow, always)) => {
-                                if allow && always {
+                                if allow && always && !has_warning {
                                     match kind {
                                         PermKind::Write => self.file_always = true,
                                         PermKind::Command => self.command_always = true,
@@ -799,7 +838,7 @@ impl Session {
             }
             PermissionResult::Allowed => {
                 self.emit(SessionEvent::ToolStarted { name: name.clone(), args: pretty_args(&args), idle_ms: tool_idle_ms(&name, &args) });
-                // 会话已放行:工具内权限给"全放行";YOLO 会话透传 YOLO,连危险命令黑名单也跳过
+                // 会话已放行:工具内权限给"全放行";YOLO 会话透传 YOLO,连高危命令判定也跳过
                 let tool_mode = if self.mode == Mode::Yolo {
                     Mode::Yolo
                 } else {
@@ -865,7 +904,7 @@ impl Session {
                             let run_args = json!({
                                 "command": cmd,
                             });
-                            // 同 after_permission:YOLO 会话透传 YOLO(入口脚本也跳过黑名单)
+                            // 同 after_permission:YOLO 会话透传 YOLO(入口脚本也跳过高危判定)
                             let tool_mode = if self.mode == Mode::Yolo {
                                 Mode::Yolo
                             } else {

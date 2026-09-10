@@ -47,13 +47,20 @@ pub async fn run_shell_command(ctx: &ToolContext<'_>, args: &Value) -> Result<To
             "command 不能为空:请传入要执行的完整命令字符串,如 {\"command\": \"ls -la\"}".into(),
         ));
     }
-    // 危险命令拦截(任何模式;YOLO 超级模式除外——它把全部判断交给模型)
-    if ctx.permission.mode != crate::permissions::Mode::Yolo {
-        if let Some(reason) = crate::permissions::is_dangerous_command(&a.command) {
-            return Err(ToolError(format!("命令被安全策略拦截: {reason}")));
+    // 高危命令兜底:交互模式由 session 层带确认地统一把关(见 session::check_permission),
+    // 这里只在没有人在环路里时生效(无头 / 宿主直调)。YOLO 超级模式把全部判断交给模型。
+    if ctx.events.is_none() && ctx.permission.mode != crate::permissions::Mode::Yolo {
+        if let crate::permissions::CommandRisk::Blocked { reason, target } =
+            crate::permissions::inspect_command(&a.command, ctx.cwd)
+        {
+            return Err(ToolError(format!(
+                "命令被安全策略拦截: {reason}(解析出的目标:{target})。\
+                 无头模式无法交互确认,已拒绝(bypassPermissions 也不放行高危命令);\
+                 如确需执行,请自行在终端跑"
+            )));
         }
     }
-    // 权限判定
+    // 权限判定(档位)
     deny_to_result(ctx.permission.check_command(&a.command))?;
 
     let dir = match &a.cwd {
@@ -515,5 +522,41 @@ mod tests {
         assert_eq!(silent_level(cap, Duration::from_secs(60)), 0);
         assert_eq!(silent_level(cap, Duration::from_secs(75)), 1);
         assert_eq!(silent_level(cap, Duration::from_secs(85)), 2);
+    }
+
+    /// 无头模式(events=None)高危命令直接拒:连 bypassPermissions 也不放行,
+    /// 且多打空格这种绕过写法同样拦得住
+    #[tokio::test]
+    async fn headless_blocked_command_is_rejected_even_in_bypass() {
+        let perm = crate::permissions::Permission::new(crate::permissions::Mode::BypassPermissions);
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let ctx = ToolContext {
+            cwd: dir,
+            permission: &perm,
+            session_id: "test",
+            cancel: None,
+            events: None,
+        };
+        for cmd in ["rm -rf /", "rm  -rf /"] {
+            let r = run_shell_command(&ctx, &serde_json::json!({ "command": cmd })).await;
+            let e = r.expect_err("高危命令应被拒绝").0;
+            assert!(e.contains("拦截"), "应说明被拦截: {e}");
+        }
+    }
+
+    /// 具体路径不再被误伤(`rm -rf /tmp/123` 在原 contains 实现里会命中 `rm -rf /`)
+    #[tokio::test]
+    async fn headless_allows_concrete_path_command() {
+        let perm = crate::permissions::Permission::new(crate::permissions::Mode::BypassPermissions);
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let ctx = ToolContext {
+            cwd: dir,
+            permission: &perm,
+            session_id: "test",
+            cancel: None,
+            events: None,
+        };
+        let r = run_shell_command(&ctx, &serde_json::json!({ "command": "echo ok" })).await;
+        assert!(r.is_ok(), "普通命令应能执行: {:?}", r.err().map(|e| e.0));
     }
 }
