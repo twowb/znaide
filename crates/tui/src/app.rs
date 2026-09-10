@@ -117,6 +117,8 @@ fn logo_lines() -> Vec<String> {
 struct PermissionPrompt {
     title: String,
     body: String,
+    /// Some(说明) = 高危命令或目标无法判定:红色渲染,且不提供"本会话都允许"
+    warning: Option<String>,
     tx: oneshot::Sender<(bool, bool)>,
 }
 
@@ -732,6 +734,7 @@ pub async fn run(
                         &cf.title,
                         &cf.body,
                         "y 确认 | n / Esc 取消",
+                        false,
                     );
                 }
             })?;
@@ -784,11 +787,13 @@ pub async fn run(
                 break;
             }
             if let Some(pp) = permission.take() {
+                let danger = pp.warning.is_some();
                 match k.code {
                     KeyCode::Char('y') | KeyCode::Char('Y') => {
                         let _ = pp.tx.send((true, false));
                     }
-                    KeyCode::Char('a') | KeyCode::Char('A') => {
+                    // 高危/目标无法判定的命令不提供"本会话都允许"
+                    KeyCode::Char('a') | KeyCode::Char('A') if !danger => {
                         let _ = pp.tx.send((true, true));
                     }
                     KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -1623,8 +1628,8 @@ const HELP_TEXT: &str = "可用命令:
 权限模式说明(Shift+Tab 循环切换;输入框与消息区边框颜色随模式变化):
   询问       写文件、执行命令前均需你确认(默认,边框绿色)
   编辑放行   文件修改自动放行,命令执行仍确认(边框天蓝)
-  全自动     全部自动执行,危险命令仍被拦截(边框紫色)
-  超级 YOLO  一切放行、无任何问询,危险命令黑名单也跳过——高度危险,后果自负(边框红色)
+  全自动     全部自动执行,高危命令仍要人工确认(边框紫色)
+  超级 YOLO  一切放行、无任何问询,高危判定也跳过——高度危险,后果自负(边框红色)
 ";
 
 /// 把一条历史消息转成 UI 展示条目(供 /resume 恢复后展示)
@@ -1809,8 +1814,8 @@ fn handle_session_event(
             // 状态栏人格显示跟随切换(空 = 关闭人格)
             *persona = name;
         }
-        SessionEvent::PermissionRequest { title, body, tx, .. } => {
-            *permission = Some(PermissionPrompt { title, body, tx });
+        SessionEvent::PermissionRequest { title, body, warning, tx, .. } => {
+            *permission = Some(PermissionPrompt { title, body, warning, tx });
         }
         SessionEvent::Notice(t) => {
             items.push(MsgItem::Notice(t));
@@ -2930,29 +2935,52 @@ fn jump_scroll_to(
 }
 
 fn draw_permission(f: &mut ratatui::Frame<'_>, area: Rect, pp: &PermissionPrompt) {
-    draw_confirm_popup(f, area, &pp.title, &pp.body, "y 允许一次 | a 本会话都允许 | n 拒绝 | Esc 取消");
+    match &pp.warning {
+        // 高危/无法判定:红色弹窗,把解析出的目标/原因一并显示,只给单次放行
+        Some(w) => {
+            let body = format!("{}\n\n{w}", pp.body);
+            draw_confirm_popup(f, area, &pp.title, &body, "y 允许一次 | n 拒绝 | Esc 取消", true);
+        }
+        None => draw_confirm_popup(
+            f,
+            area,
+            &pp.title,
+            &pp.body,
+            "y 允许一次 | a 本会话都允许 | n 拒绝 | Esc 取消",
+            false,
+        ),
+    }
 }
 
-/// 居中确认弹窗(权限确认与 /clear 等破坏性操作确认共用)
-fn draw_confirm_popup(f: &mut ratatui::Frame<'_>, area: Rect, title: &str, body: &str, hint: &str) {
+/// 居中确认弹窗(权限确认与 /clear 等破坏性操作确认共用)。danger=true 用红色,
+/// 弹窗略高以容纳多出来的说明行。
+fn draw_confirm_popup(
+    f: &mut ratatui::Frame<'_>,
+    area: Rect,
+    title: &str,
+    body: &str,
+    hint: &str,
+    danger: bool,
+) {
     let popup_w = area.width.min(90);
-    let popup_h = 10u16;
+    let popup_h = if danger { 14u16 } else { 10u16 };
+    let color = if danger { Color::Red } else { Color::Yellow };
     let x = area.x + (area.width.saturating_sub(popup_w)) / 2;
     let y = area.y + (area.height.saturating_sub(popup_h)) / 2;
     let popup = Rect { x, y, width: popup_w, height: popup_h };
     f.render_widget(Clear, popup);
     let block = Block::default()
-        .title(" 操作确认 ")
+        .title(if danger { " 高危命令确认 " } else { " 操作确认 " })
         .borders(ratatui::widgets::Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Yellow));
+        .border_style(Style::default().fg(color));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
     let body = truncate(body, 78);
     let lines = vec![
         Line::from(Span::styled(
             format!("  {title}"),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(Span::raw(body)),
@@ -2997,8 +3025,8 @@ fn mode_desc(mode: Mode) -> &'static str {
     match mode {
         Mode::Ask => "询问:写文件/执行命令前均需确认",
         Mode::AcceptEdits => "编辑放行:文件修改自动放行,命令执行需确认",
-        Mode::BypassPermissions => "全自动:全部自动执行,危险命令除外",
-        Mode::Yolo => "超级(YOLO):一切放行、无任何问询,危险命令黑名单也放行",
+        Mode::BypassPermissions => "全自动:全部自动执行,高危命令仍要人工确认",
+        Mode::Yolo => "超级(YOLO):一切放行、无任何问询,高危判定也放行",
     }
 }
 

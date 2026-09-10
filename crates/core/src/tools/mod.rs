@@ -146,7 +146,8 @@ impl ToolRegistry {
             (
                 "run_shell_command",
                 "执行一条终端命令(shell 命令,支持管道/重定向/&& 等)。\
-                 危险命令(rm -rf / 等)会被安全策略拦截;命令是否需确认取决于权限模式",
+                 高危命令(递归删根/家目录、dd 或 mkfs 写块设备、git push --force 等)会被启发式判定:命中会要求用户确认,\
+                 无头模式直接拒绝。判定看的是解析出的目标路径,所以请写明确路径,不要用变量或通配符(会因无法判定而要求确认)",
                 schema(
                     json!({
                         "command": {"type": "string", "description": "要执行的完整命令,如 'ls -la'"},

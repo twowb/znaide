@@ -17,7 +17,7 @@ Tell it what to do in plain language and it gets it done — edit files, run com
 - **Any OpenAI-compatible backend**: local ollama / vLLM, cloud DeepSeek / DashScope (Qwen) / OpenRouter, etc. — any `base_url + key + model`
 - **Setup wizard**: step-by-step on first run — pick a provider → **auto-fetch its real model list** (`/models`) → choose/type a model → enter key → **unlocks only after a live request succeeds**; reopen anytime with `/config`, changes apply immediately
 - **Toolbox**: file read/write/edit (auto-snapshot before writes), directory listing, glob, regex search, shell commands (with timeouts), web fetch, long-term memory
-- **Four permission tiers**: **ask** (default; confirm file writes/commands) / **acceptEdits** (file edits auto-approved) / **bypassPermissions** (fully automatic) / **yolo** (everything allowed, dangerous commands included — on you); cycle with `Shift+Tab`. Dangerous commands (`rm -rf /`, `dd` to disk, `git push --force`, …) are blocked by default; only **yolo** skips the blacklist
+- **Four permission tiers**: **ask** (default; confirm file writes/commands) / **acceptEdits** (file edits auto-approved) / **bypassPermissions** (fully automatic) / **yolo** (everything allowed, dangerous commands included — on you); cycle with `Shift+Tab`. Dangerous commands go through a **heuristic risk check** that resolves target paths instead of matching raw text: a high-risk target (root / home / an ancestor of the working directory / a block device) or an undeterminable one brings up a **red confirm dialog** that only allows a single approval, and is denied outright in headless mode; **yolo** skips the check. `rm  -rf /` (extra space) is still caught while `rm -rf /tmp/123` (a concrete path) passes — but note this is a **heuristic guardrail, not a security boundary**
 - **undo**: auto-snapshot before every file change; `/undo` rolls back — no git needed
 - **Long-term memory**: remembers your environment and preferences across sessions; injected into context at startup
 - **MCP support**: drop a `~/.znaide/mcp.json` and any MCP server's tools join the toolbox
@@ -120,7 +120,7 @@ A global personality for the AI. `/persona` lists/switches built-ins: **Sarcasti
 
 ### Skills
 
-**A skill = a capability pack the model can invoke on its own, or you can run with `/name`.** The model calls a `skill` tool with the matching name; the manual body (with `{args}` rendered) plus any entry-script output is injected, and the model follows the manual using base tools. Skills add no privileges — every write/command still goes through permission tiers, the dangerous-command blacklist and undo snapshots.
+**A skill = a capability pack the model can invoke on its own, or you can run with `/name`.** The model calls a `skill` tool with the matching name; the manual body (with `{args}` rendered) plus any entry-script output is injected, and the model follows the manual using base tools. Skills add no privileges — every write/command still goes through permission tiers, the command risk check and undo snapshots.
 
 Three layers (same name → **project overrides user, user overrides built-in**):
 
