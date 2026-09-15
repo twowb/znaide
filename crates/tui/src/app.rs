@@ -1301,11 +1301,12 @@ pub async fn run(
         let completable = !busy && permission.is_none() && confirm.is_none() && config_wizard.is_none();
         refresh_completion(&input, input_cursor, cwd, completable, &mut completion);
         // 上下文占用警示:空闲时 >=90% 提示一次(可 /compact 或开新会话);回落后重新武装。
-        // 窗口未知时不提示——宁可不说,也不拿猜出来的窗口劝人做没必要的压缩。
+        // 窗口未知不提示(宁可不说,也不拿猜出来的窗口劝人做没必要的压缩);
+        // 占用还没测到(None)也不提示——resume 完第一轮的占用恰恰是未知的。
         if !busy {
             if let Some(win) = ctx_window.filter(|w| *w > 0) {
-                if token_stats.last_prompt > 0 {
-                    let pct = (token_stats.last_prompt as u128) * 100 / (win as u128);
+                if let Some(used) = token_stats.last_prompt.filter(|u| *u > 0) {
+                    let pct = (used as u128) * 100 / (win as u128);
                     if pct >= 90 && !ctx_warn_shown {
                         items.push(MsgItem::Notice(format!(
                             "⚠ 上下文已用约 {pct}%,再聊可能丢最早的记录。\
@@ -1796,13 +1797,15 @@ fn push_history_item(
 }
 
 /// token 统计(会话级):input/output = 服务端真实 usage 累计(端点不返回就 0);
-/// last_prompt = 最近一次请求的真实 prompt(即当前上下文占用);
+/// last_prompt = 最近一次请求的真实 prompt(即当前上下文占用),
+/// **None = 还没测到**(新会话、刚 /resume 或 /compact 完,一次请求都没发),
+/// 与 `Some(0)`(/clear 之后真的空)在显示上必须分开;
 /// round_est = 当前回复的流式估算,该轮真实 usage 到账后清零。
 #[derive(Default)]
 struct TokenStats {
     input: u64,
     output: u64,
-    last_prompt: u64,
+    last_prompt: Option<u64>,
     round_est: u64,
 }
 
@@ -1841,7 +1844,7 @@ fn handle_session_event(
             // 该轮真实用量到账:输入/输出分别累计,进行中估算清零(已按真实记账)
             stats.input += prompt;
             stats.output += completion;
-            stats.last_prompt = prompt; // 当前上下文占用 = 最近一次请求的 prompt
+            stats.last_prompt = Some(prompt); // 当前上下文占用 = 最近一次请求的 prompt
             stats.round_est = 0;
         }
         SessionEvent::ToolStarted { name, args, idle_ms } => {
@@ -1929,8 +1932,10 @@ fn handle_session_event(
                 "✔ 已清空会话上下文与历史文件,可重新开始。".into(),
             ));
             // 历史文件都清了 = 换了个会话:占用与累计用量一起归零
-            // (ctx 旧占用是"未知",等下一次真实 usage;累计 in/out 不再残留上一个会话的数字)
+            // (累计 in/out 不再残留上一个会话的数字);这里的 0 是**真的空**,
+            // 不是"没测到",所以显式给 Some(0),徽标照常画 0%。
             *stats = TokenStats::default();
+            stats.last_prompt = Some(0);
         }
         SessionEvent::CompactionStarted => {
             // 压缩是耗时操作:置忙(收纳推进条动画由忙行动画呈现),不再 push 静态提示
@@ -1959,8 +1964,9 @@ fn handle_session_event(
                 }
             }
             // 压缩后占用大幅下降;旧占用显示清零,待下一次真实 usage 再更新。
+            // 是"未知"不是"0%":摘要占多少只有下一次请求才知道。
             // 注意:累计 in/out 不归零——压缩没换会话,已经花掉的账不该消失。
-            stats.last_prompt = 0;
+            stats.last_prompt = None;
         }
         SessionEvent::SessionInfo { id, .. } => {
             // 会话创建事件(启动即到达):记下当前会话 id 供状态栏展示
@@ -2036,17 +2042,18 @@ fn fmt_tokens(n: u64) -> String {
 }
 
 /// 上下文占用徽标:10 格占用条 + 百分比,窗口已知就常驻显示;
-/// 占用 90% 及以上变红、70% 及以上变黄、其余灰;还没有真实 usage 时从 0% 起步。
+/// 占用 90% 及以上变红、70% 及以上变黄、其余灰。
+/// **占用还没测到时**(`None`,如刚 /resume 或 /compact 完)画 `ctx ?`,不编成 0%——
+/// resume 出来的历史明明占着上下文,画成空条会让人以为还能再塞很多。
 /// 窗口未知(模型不在内置表里、配置里也没写死)时不编百分比:只报真实绝对量
 /// `ctx ~21.4k`,也不参与变红与压缩提示——猜错的窗口比没有窗口更误事。
-fn ctx_usage_badge(used: u64, window: Option<usize>) -> Option<(String, Color)> {
+fn ctx_usage_badge(used: Option<u64>, window: Option<usize>) -> Option<(String, Color)> {
     let window = match window {
         Some(w) => w,
         None => {
-            let txt = if used == 0 {
-                "ctx ? 窗口未知".to_string()
-            } else {
-                format!("ctx ~{} 窗口未知", fmt_tokens(used))
+            let txt = match used {
+                Some(n) if n > 0 => format!("ctx ~{} 窗口未知", fmt_tokens(n)),
+                _ => "ctx ? 窗口未知".to_string(),
             };
             return Some((txt, Color::DarkGray));
         }
@@ -2054,6 +2061,11 @@ fn ctx_usage_badge(used: u64, window: Option<usize>) -> Option<(String, Color)> 
     if window == 0 {
         return None;
     }
+    // 占用还没测到(刚 /resume 或 /compact 完、或还没发过消息):不编 0%——那会让人
+    // 以为上下文很空,而 resume 出来的历史其实占着;如实说"?"。真实值在下一轮回复后到账。
+    let Some(used) = used else {
+        return Some(("ctx ?".to_string(), Color::DarkGray));
+    };
     let raw = if used == 0 {
         0
     } else {
@@ -3429,7 +3441,7 @@ mod token_tests {
         );
         assert_eq!(st.input, 100);
         assert_eq!(st.output, 40);
-        assert_eq!(st.last_prompt, 100); // 当前上下文占用 = 最近一次 prompt
+        assert_eq!(st.last_prompt, Some(100)); // 当前上下文占用 = 最近一次 prompt
         assert_eq!(st.round_est, 0);
         handle_session_event(SessionEvent::TurnFinished { text: String::new(), truncated: false }, &mut items, &mut busy, &mut kind, &mut perm, &mut sid, &mut persona, &mut st);
         assert!(!busy);
@@ -4100,42 +4112,58 @@ mod anim_tests {
 mod ctx_usage_tests {
     use super::*;
 
-    /// 上下文占用徽标:只要窗口已知就常驻显示;阈值变色;无占用时 0% 起步
+    /// 上下文占用徽标:只要窗口已知就常驻显示;阈值变色;没测到的占用画 `?` 不画 0%
     #[test]
     fn badge_usage_and_colors() {
         // 窗口为 0(配置里写了无效值)才不显示
-        assert!(ctx_usage_badge(100, Some(0)).is_none());
-        let (t, c) = ctx_usage_badge(0, Some(40_960)).unwrap();
+        assert!(ctx_usage_badge(Some(100), Some(0)).is_none());
+        // /clear 之后是真的空 → 老实画 0%
+        let (t, c) = ctx_usage_badge(Some(0), Some(40_960)).unwrap();
         assert!(t.contains("0%"));
         assert!(t.matches('░').count() == 10);
         assert_eq!(c, Color::DarkGray);
         // 约 25% → 5 格窗口 10 格内应填 2-3 格(round:25% → 2.5 → 3)
-        let (t, c) = ctx_usage_badge(10_240, Some(40_960)).unwrap();
+        let (t, c) = ctx_usage_badge(Some(10_240), Some(40_960)).unwrap();
         assert!(t.starts_with("ctx "));
         assert!(t.contains("25%"));
         assert!(t.matches('█').count() >= 2 && t.matches('█').count() <= 3);
         assert_eq!(c, Color::DarkGray);
         // 70%+ → 黄
-        let (_, c) = ctx_usage_badge(28_672, Some(40_960)).unwrap(); // 70%
+        let (_, c) = ctx_usage_badge(Some(28_672), Some(40_960)).unwrap(); // 70%
         assert_eq!(c, Color::Yellow);
         // 90%+ → 红
-        let (t, c) = ctx_usage_badge(37_000, Some(40_960)).unwrap();
+        let (t, c) = ctx_usage_badge(Some(37_000), Some(40_960)).unwrap();
         assert_eq!(c, Color::Red);
         assert!(t.contains('█'));
         // 超窗保护:百分比封顶显示但不越界 panic
-        let (t, _) = ctx_usage_badge(1_000_000, Some(40_960)).unwrap();
+        let (t, _) = ctx_usage_badge(Some(1_000_000), Some(40_960)).unwrap();
         assert!(t.ends_with("100%"));
+    }
+
+    /// B:占用还没测到(刚 /resume 或 /compact 完)时画 `ctx ?`,不画 0%——
+    /// 恢复出来的历史明明占着上下文,空条会让人以为还能再塞很多
+    #[test]
+    fn badge_unknown_usage_is_not_zero_percent() {
+        let (t, c) = ctx_usage_badge(None, Some(40_960)).unwrap();
+        assert_eq!(t, "ctx ?", "窗口已知但占用未知:应如实说没测到,而不是 0%");
+        assert!(!t.contains('%'));
+        assert!(!t.contains('░'));
+        assert_eq!(c, Color::DarkGray, "未知占用不该被当成红/黄");
+        // 窗口也未知时同样只是"没数",不编绝对量
+        let (t2, _) = ctx_usage_badge(None, None).unwrap();
+        assert!(t2.contains('?'));
+        assert!(!t2.contains('~'));
     }
 
     /// B:窗口未知时只报真实绝对量,不编百分比、不变红(猜错的窗口比没窗口更误事)
     #[test]
     fn badge_unknown_window_reports_absolute_only() {
-        let (t, c) = ctx_usage_badge(21_400, None).unwrap();
+        let (t, c) = ctx_usage_badge(Some(21_400), None).unwrap();
         assert!(t.contains("21.4k"), "未知窗口也要给出真实绝对量: {t}");
         assert!(!t.contains('%'), "不该编百分比: {t}");
         assert_eq!(c, Color::DarkGray, "未知窗口不参与红/黄升级");
         // 还没有真实 usage 时如实说"窗口未知"
-        let (t0, _) = ctx_usage_badge(0, None).unwrap();
+        let (t0, _) = ctx_usage_badge(Some(0), None).unwrap();
         assert!(t0.contains('?'));
     }
 
