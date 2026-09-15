@@ -76,7 +76,7 @@ A banner shows at startup; `/quit` or `/exit` exits (or `Ctrl+C`), printing this
 
 | Key | Action |
 |---|---|
-| `Enter` | Send |
+| `Enter` | Send (queued while the model is working — runs after the current turn) |
 | `Shift+Enter` (or `Alt+Enter` / `Ctrl+J`) | New line |
 | `Shift+Tab` | Cycle permission mode (ask → acceptEdits → bypassPermissions → yolo) |
 | `↑` / `↓` | Scroll message area 3 lines |
@@ -84,6 +84,8 @@ A banner shows at startup; `/quit` or `/exit` exits (or `Ctrl+C`), printing this
 | `Home` / `End` | Jump to top / bottom |
 | `Esc` | Interrupt generation / cancel confirm |
 | `Ctrl+C` | Quit |
+
+**Typing while the model works (queue)**: the input stays usable during a turn (no longer greyed out; the label shows `Enter 排队`) and `Enter` is no longer dropped — you get a `⏳ 已排队` note and the message is sent automatically once the current turn ends (the status bar shows `队列 N`). Queued messages never interrupt a running turn; press `Esc` to stop the current work early and the queue takes over right after.
 
 **Live completion**: typing `/` opens a command menu (built-ins + installed skills); typing `@` opens file/dir completion (`@dir/` digs deeper, `@~/` goes home) — candidates filter as you type, first candidate previewed as a dim **ghost** in the input. `↑`/`↓` to pick, **`Tab` or `Enter` to accept** (press `Enter` again to actually send — prevents misfires), `Esc` to close. Names with spaces/punctuation are auto-wrapped into `@"path with spaces"` form.
 

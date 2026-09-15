@@ -7,6 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 use ratatui::Terminal;
+use std::collections::VecDeque;
 use std::io::stdout;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -431,7 +432,8 @@ pub async fn run(
 
     let mut items: Vec<MsgItem> = vec![MsgItem::Logo];
     items.push(MsgItem::Notice(
-        "znaide 就绪。Enter 发送,Shift+Enter(或 Alt+Enter / Ctrl+J)换行;\
+        "znaide 就绪。Enter 发送(工作中 Enter 排队,本回合结束后自动执行),\
+         Shift+Enter(或 Alt+Enter / Ctrl+J)换行;\
          复制文字要按住 Shift 拖动选;退出用 /quit 或 /exit;/help 看全部命令。"
             .into(),
     ));
@@ -449,6 +451,8 @@ pub async fn run(
     let mut busy = false;
     // 忙碌场景(回合执行 / 压缩),决定忙行动画与文案
     let mut busy_kind = BusyKind::Work;
+    // 工作中输入队列:回合执行时 Enter 入队,回合结束后自动接手(见 InputQueue)
+    let mut queue = InputQueue::default();
     // /quit、/exit 请求退出(置位后主循环退出)
     let mut quit_requested = false;
     // 上下文 >=90% 的提示是否已显示(回落到 <90% 后重新武装)
@@ -489,8 +493,12 @@ pub async fn run(
     let mut sessions_ui: Option<SessionsUi> = None;
     // 配置向导异步回传通道
     let (wiz_tx, mut wiz_rx) = mpsc::unbounded_channel::<WizardReply>();
-    // 是否已有可用配置(未配置成功时禁止使用)
-    let mut configured_ok = znaide_core::config::config_exists();
+    // 是否已有可用配置(未配置成功时禁止使用)。与首启判定同源:first_run 就是
+    // cli 那边 `!config_provided()`(配置文件 / 环境变量 / 命令行覆盖)的结果取反。
+    // 以前这里单独查 `config_exists()`(只看文件),于是"环境变量或命令行把 provider、
+    // model、key 都配齐了 → 不弹向导 → 却仍被判没配置、不能对话";同一件事在两个
+    // 宿主各写一份就一定会漂,现在只剩一个来源。
+    let mut configured_ok = !first_run;
     if first_run {
         items.push(MsgItem::Notice(
             "🎉 首次运行:先完成一次配置。选 AI 服务商,向导自动查询可用模型。".into(),
@@ -534,6 +542,8 @@ pub async fn run(
                 // 输入框内部滚动跟随光标(render_input 的窗口逻辑)。消息区最少 3 行。
                 let label = if permission.is_some() || confirm.is_some() {
                     " [等待确认]"
+                } else if busy {
+                    " [Enter 排队]"
                 } else {
                     ""
                 };
@@ -633,18 +643,9 @@ pub async fn run(
                 scroll_range = total.saturating_sub(view_h);
                 // 消息区滚动条:贴右边框画一段拇指,位置随 scroll_back 移动
                 draw_msg_scrollbar(f, chunks[1], total, view_h, scroll_back);
-                let input_style = if busy && permission.is_none() {
-                    Style::default().fg(Color::DarkGray)
-                } else {
-                    Style::default()
-                };
-                // 输入框边框颜色 = 当前权限模式(询问绿 / 编辑放行天蓝 / 全自动紫 / 超级红);
-                // busy 时输入被禁用,边框随文字一起变灰
-                let border_color = if busy && permission.is_none() {
-                    Color::DarkGray
-                } else {
-                    mode_color(current_mode)
-                };
+                // 输入框边框颜色 = 当前权限模式(询问绿 / 编辑放行天蓝 / 全自动紫 / 超级红)。
+                // 工作中不再整框变灰:忙时照样能输入(Enter 入队),灰掉会让人以为不能用。
+                let border_color = mode_color(current_mode);
                 // 多行输入渲染(带光标指示):把光标所在位置渲染成反白块。
                 // 可视行 = 动态 input_rows(内容不足即包住内容,超过上限则内部滚动)。
                 // ghost 预览仅在光标位于整段末尾时给出
@@ -658,7 +659,7 @@ pub async fn run(
                     &input,
                     input_cursor,
                     label,
-                    input_style,
+                    Style::default(),
                     input_h,
                     chunks[2].width.saturating_sub(2),
                     ghost.as_deref(),
@@ -712,14 +713,23 @@ pub async fn run(
                         String::new()
                     }
                 };
-                // 工作中/压缩中:状态栏按场景播放动画(执行=流动光条,压缩=收纳推进)
+                // 工作中/压缩中:状态栏按场景播放动画(执行=流动光条,压缩=收纳推进);
+                // 排了队就附上条数,免得以为排的消息丢了
+                let queue_seg = if queue.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · 队列 {}", queue.len())
+                };
                 let state_text = if busy {
                     match busy_kind {
-                        BusyKind::Work => format!("工作中… {}", wave_row(anim_frame, 8)),
+                        BusyKind::Work => format!("工作中… {}{queue_seg}", wave_row(anim_frame, 8)),
                         BusyKind::Compacting => {
-                            format!("压缩中… {}", shrink_char(anim_frame / 2))
+                            format!("压缩中… {}{queue_seg}", shrink_char(anim_frame / 2))
                         }
                     }
+                } else if !queue_seg.is_empty() {
+                    // 空闲却还有排队(被弹窗挡着放行):如实显示,别让人干等
+                    format!("就绪{queue_seg}")
                 } else {
                     "就绪".to_string()
                 };
@@ -1085,8 +1095,11 @@ pub async fn run(
                         input.clear();
                         input_cursor = 0;
                     } else if busy {
-                        // 工作中不发送(忽略)
-                        continue;
+                        // 工作中不丢弃:入队,本回合结束后自动发送(以前是静默忽略,
+                        // 用户打了字按 Enter 毫无反应、只能等回合结束再按一次)
+                        items.push(MsgItem::Notice(queue.push(&raw)));
+                        input.clear();
+                        input_cursor = 0;
                     } else if !configured_ok {
                         items.push(MsgItem::Notice(
                             "⚠ 尚未完成配置,不能对话。先输入 /config 完成配置。".into(),
@@ -1266,6 +1279,17 @@ pub async fn run(
                     anyhow::bail!("会话引擎已退出");
                 }
             }
+        }
+        // 排队消息放行:回合结束(busy → false)且没有任何模态弹窗时,自动接手队列里的下一条。
+        // 自然结束、被 Esc 中断、回合出错中止都落在同一个 busy=false 上,队列不会卡死;
+        // 反过来,回合还在跑(或弹窗挂着)时一律不放行——排队消息不打断正在跑的回合。
+        let modal = permission.is_some() || confirm.is_some() || config_wizard.is_some() || sessions_ui.is_some();
+        if let Some(next) = queue.pop_ready(!busy, modal) {
+            items.push(MsgItem::User(next.clone()));
+            let _ = cmd_tx.send(AgentCmd::Prompt(next));
+            busy = true;
+            busy_kind = BusyKind::Work;
+            at_bottom = true;
         }
         // 输入补全刷新:基于最新 input/光标;前缀与位置未变时保留选中,不做磁盘 IO。
         // 向导/确认框/工作中时不触发(相关层已拦截按键,这里兜底清空状态)。
@@ -2511,6 +2535,43 @@ fn draw_completion_menu(f: &mut ratatui::Frame<'_>, input_area: Rect, cm: &Compl
 
 /// 输入区内容行数上限:超过后输入框不再增高,内部滚动跟随光标
 const MAX_INPUT_ROWS: usize = 8;
+
+/// 工作中输入的消息队列。回合执行时按 Enter 不再被静默吞掉:内容入队,
+/// 等本回合结束后自动按 FIFO 逐条执行(每条配额一个完整回合,不合并)。
+#[derive(Default)]
+struct InputQueue {
+    items: VecDeque<String>,
+}
+
+impl InputQueue {
+    /// 入队一条,返回给用户看的提示(预览压成一行并按字符截断,不切坏中文)。
+    fn push(&mut self, raw: &str) -> String {
+        self.items.push_back(raw.to_string());
+        let flat = raw.replace('\n', " ");
+        format!(
+            "⏳ 已排队(本回合结束后发送):{}",
+            znaide_core::util::truncate_chars(&flat, 40, "…")
+        )
+    }
+
+    /// 空闲且没有模态弹窗(权限确认 / 确认框 / 配置向导 / 会话管理)时取出下一条。
+    /// 忙或弹窗期间一律不放行——排队消息不去打断正在跑的回合。
+    fn pop_ready(&mut self, idle: bool, modal: bool) -> Option<String> {
+        if idle && !modal {
+            self.items.pop_front()
+        } else {
+            None
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
 
 /// 输入框前缀:首行 "❯[label] ",续行等宽缩进。渲染与高度计算共用,保证折行口径一致。
 fn input_prefix(label: &str) -> (String, String) {
@@ -4080,5 +4141,49 @@ mod ctx_usage_tests {
     fn cli_max_turns_overrides_config() {
         assert_eq!(effective_max_turns(Some(5)), 5);
         assert_eq!(effective_max_turns(Some(0)), 0);
+    }
+}
+
+#[cfg(test)]
+mod input_queue_tests {
+    use super::*;
+
+    /// 排队消息按 FIFO 逐条执行,每条配额一个完整回合(不合并)
+    #[test]
+    fn queued_input_runs_in_fifo_order() {
+        let mut q = InputQueue::default();
+        assert!(q.is_empty());
+        assert!(q.pop_ready(true, false).is_none(), "空队列取出应为 None");
+        let _ = q.push("第一条");
+        let _ = q.push("第二条");
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.pop_ready(true, false).as_deref(), Some("第一条"));
+        assert_eq!(q.pop_ready(true, false).as_deref(), Some("第二条"));
+        assert!(q.is_empty());
+    }
+
+    /// 忙 / 弹窗期间一律不放行:排队消息不打断正在跑的回合;
+    /// 回合结束(含被 Esc 中断、出错中止,都落到 busy=false)且无弹窗才接手
+    #[test]
+    fn queued_input_waits_while_busy_or_modal() {
+        let mut q = InputQueue::default();
+        let _ = q.push("等这轮跑完");
+        assert!(q.pop_ready(false, false).is_none(), "回合还在跑,不能放行");
+        assert!(q.pop_ready(true, true).is_none(), "弹窗挂着,不能放行");
+        assert_eq!(q.len(), 1, "放行不了时队列必须原样留着");
+        assert_eq!(q.pop_ready(true, false).as_deref(), Some("等这轮跑完"));
+    }
+
+    /// 入队提示:多行压成一行、超长按字符截断(不切坏中文)
+    #[test]
+    fn queued_notice_previews_on_one_line() {
+        let mut q = InputQueue::default();
+        let notice = q.push("第一行\n第二行\n第三行");
+        assert!(notice.contains("第一行 第二行"), "多行预览要压成一行: {notice}");
+        assert!(!notice.contains('\n'), "提示本身不能是消息区里的多行: {notice}");
+        let long = q.push(&"很长的一段话".repeat(20));
+        assert!(long.ends_with('…'), "超长要带省略号: {long}");
+        assert!(long.chars().count() < 80, "预览不该把整段贴回来: {long}");
+        assert_eq!(q.len(), 2);
     }
 }
