@@ -1797,16 +1797,27 @@ fn push_history_item(
 }
 
 /// token 统计(会话级):input/output = 服务端真实 usage 累计(端点不返回就 0);
-/// last_prompt = 最近一次请求的真实 prompt(即当前上下文占用),
-/// **None = 还没测到**(新会话、刚 /resume 或 /compact 完,一次请求都没发),
-/// 与 `Some(0)`(/clear 之后真的空)在显示上必须分开;
+/// last_prompt = 最近一次请求的真实 prompt(即当前上下文占用)。
+/// **默认 `Some(0)`**:新会话、`/clear` 之后,上下文里确实没有对话,画 0% 是对的。
+/// "**还没测到**"必须是显式的 `None`——只有刚 `/resume` / `/compact` 完是这样:
+/// 恢复出来的历史、压缩后的摘要都实打实占着上下文,画成 0% 会让人以为还能再塞很多。
 /// round_est = 当前回复的流式估算,该轮真实 usage 到账后清零。
-#[derive(Default)]
 struct TokenStats {
     input: u64,
     output: u64,
     last_prompt: Option<u64>,
     round_est: u64,
+}
+
+impl Default for TokenStats {
+    fn default() -> Self {
+        Self {
+            input: 0,
+            output: 0,
+            last_prompt: Some(0),
+            round_est: 0,
+        }
+    }
 }
 
 fn handle_session_event(
@@ -1932,10 +1943,8 @@ fn handle_session_event(
                 "✔ 已清空会话上下文与历史文件,可重新开始。".into(),
             ));
             // 历史文件都清了 = 换了个会话:占用与累计用量一起归零
-            // (累计 in/out 不再残留上一个会话的数字);这里的 0 是**真的空**,
-            // 不是"没测到",所以显式给 Some(0),徽标照常画 0%。
+            // (累计 in/out 不再残留上一个会话的数字;ctx 回到"默认的空"= 0%,见 TokenStats)
             *stats = TokenStats::default();
-            stats.last_prompt = Some(0);
         }
         SessionEvent::CompactionStarted => {
             // 压缩是耗时操作:置忙(收纳推进条动画由忙行动画呈现),不再 push 静态提示
@@ -1978,6 +1987,9 @@ fn handle_session_event(
             // 换了会话:状态栏的 ctx 占用与累计 in/out 都是**上一个会话**的数字,
             // 留着会让人以为恢复出来的历史占据/花费了这些(真实值等下一次 usage 到账)
             *stats = TokenStats::default();
+            // 但"默认的空"在这里是错的:恢复出来的历史实打实占着上下文,只是占多少
+            // 得等下一轮 usage 才算得出——显式标"未知",徽标画 `ctx ?` 而不是 0%。
+            stats.last_prompt = None;
             items.push(MsgItem::Notice(format!(
                 "━━━ 已恢复历史会话({count} 条消息),内容如下 ━━━"
             )));
@@ -4153,6 +4165,36 @@ mod ctx_usage_tests {
         let (t2, _) = ctx_usage_badge(None, None).unwrap();
         assert!(t2.contains('?'));
         assert!(!t2.contains('~'));
+    }
+
+    /// B:新会话 / `/clear` 之后画真实的 0%;刚 `/resume` 完则是"未知"(见上一个用例)
+    #[test]
+    fn new_session_starts_at_zero_but_resume_is_unknown() {
+        let mut st = TokenStats::default();
+        assert_eq!(st.last_prompt, Some(0), "新会话里没有对话,就是 0");
+        let mut items = Vec::new();
+        let mut busy = false;
+        let mut kind = BusyKind::Work;
+        let mut perm = None;
+        let mut sid = String::new();
+        let mut persona = String::new();
+        handle_session_event(
+            SessionEvent::HistoryLoaded {
+                count: 1,
+                messages: vec![znaide_core::llm::types::ChatMessage::user("hi")],
+            },
+            &mut items,
+            &mut busy,
+            &mut kind,
+            &mut perm,
+            &mut sid,
+            &mut persona,
+            &mut st,
+        );
+        assert_eq!(
+            st.last_prompt, None,
+            "resume 出来的历史占着上下文,占多少要等下一轮 usage 才算得出"
+        );
     }
 
     /// B:窗口未知时只报真实绝对量,不编百分比、不变红(猜错的窗口比没窗口更误事)
