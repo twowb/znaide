@@ -7,7 +7,6 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 use ratatui::Terminal;
-use std::collections::VecDeque;
 use std::io::stdout;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -19,7 +18,7 @@ use znaide_core::config::Resolved;
 use znaide_core::llm::OpenAiClient;
 use znaide_core::permissions::Mode;
 use znaide_core::session::{
-    list_history_sessions_detailed, remove_session, Session, SessionEvent,
+    list_history_sessions_detailed, remove_session, Session, SessionEvent, SharedInbox,
 };
 
 /// 配置向导异步结果回传
@@ -306,9 +305,12 @@ pub async fn run(
     let (update_tx, mut update_rx) = mpsc::unbounded_channel::<String>();
     // 共享取消槽:每个回合的新 token 都放这里,UI 的 Esc 直接 cancel 它
     let shared_cancel: SharedCancel = std::sync::Arc::default();
+    // 运行中插话的投递箱:UI 主循环入队,会话引擎在轮边界取走(两边看同一个队列)
+    let inbox: SharedInbox = std::sync::Arc::default();
 
     let cwd_buf: PathBuf = cwd.to_path_buf();
     let shared_cancel_agent = shared_cancel.clone();
+    let inbox_agent = inbox.clone();
     // --resume:直接"开在"被恢复的会话上(沿用其 ID/历史文件,后续对话续写回同一文件)
     let start_session_id: Option<String> = resume
         .as_ref()
@@ -353,6 +355,8 @@ pub async fn run(
         // 轮数上限:--max-turns > config 的 max_turns(0 = 不限)> 默认。
         // 以前这里只读 config,`znaide --max-turns N` 在交互模式下被静默忽略。
         session.set_max_turns(effective_max_turns(max_turns));
+        // 运行中插话:引擎在每个轮边界从这个投递箱取一条插进对话(见 InputQueue)
+        session.set_inbox(inbox_agent);
         if !persona.is_empty() {
             let _ = ev_tx.send(SessionEvent::Notice(format!(
                 "人格:{persona}(全局生效,输入 /persona 可切换或关闭)"
@@ -432,7 +436,7 @@ pub async fn run(
 
     let mut items: Vec<MsgItem> = vec![MsgItem::Logo];
     items.push(MsgItem::Notice(
-        "znaide 就绪。Enter 发送(工作中 Enter 排队,本回合结束后自动执行),\
+        "znaide 就绪。Enter 发送(工作中 Enter 排队,下一个轮边界发出),\
          Shift+Enter(或 Alt+Enter / Ctrl+J)换行;\
          复制文字要按住 Shift 拖动选;退出用 /quit 或 /exit;/help 看全部命令。"
             .into(),
@@ -451,8 +455,8 @@ pub async fn run(
     let mut busy = false;
     // 忙碌场景(回合执行 / 压缩),决定忙行动画与文案
     let mut busy_kind = BusyKind::Work;
-    // 工作中输入队列:回合执行时 Enter 入队,回合结束后自动接手(见 InputQueue)
-    let mut queue = InputQueue::default();
+    // 工作中输入队列:回合执行时 Enter 入队,引擎在轮边界插话(见 InputQueue)
+    let mut queue = InputQueue::new(inbox);
     // /quit、/exit 请求退出(置位后主循环退出)
     let mut quit_requested = false;
     // 上下文 >=90% 的提示是否已显示(回落到 <90% 后重新武装)
@@ -1095,8 +1099,8 @@ pub async fn run(
                         input.clear();
                         input_cursor = 0;
                     } else if busy {
-                        // 工作中不丢弃:入队,本回合结束后自动发送(以前是静默忽略,
-                        // 用户打了字按 Enter 毫无反应、只能等回合结束再按一次)
+                        // 工作中不丢弃:入队,会话引擎会在下一个轮边界把它插进对话
+                        // (以前是静默忽略:用户打了字按 Enter 毫无反应)
                         items.push(MsgItem::Notice(queue.push(&raw)));
                         input.clear();
                         input_cursor = 0;
@@ -1280,9 +1284,10 @@ pub async fn run(
                 }
             }
         }
-        // 排队消息放行:回合结束(busy → false)且没有任何模态弹窗时,自动接手队列里的下一条。
-        // 自然结束、被 Esc 中断、回合出错中止都落在同一个 busy=false 上,队列不会卡死;
-        // 反过来,回合还在跑(或弹窗挂着)时一律不放行——排队消息不打断正在跑的回合。
+        // 队列兜底放行:正常情况下回合执行中排的消息由**引擎在轮边界**取走(忙态不变);
+        // 只有"这一回合已无后续轮次"(模型给出终结答复)时,剩下的才落到这里——
+        // 回合结束(busy → false)且没有模态弹窗时,逐条当作新回合发出,一条一个回合。
+        // 自然结束、被 Esc 中断、回合出错中止都落在同一个 busy=false 上,队列不会卡死。
         let modal = permission.is_some() || confirm.is_some() || config_wizard.is_some() || sessions_ui.is_some();
         if let Some(next) = queue.pop_ready(!busy, modal) {
             items.push(MsgItem::User(next.clone()));
@@ -1910,6 +1915,10 @@ fn handle_session_event(
         SessionEvent::RoundStarted { .. } => {
             // 同上:状态栏用的轮次进度由事件泵直接消费,不进消息流
         }
+        SessionEvent::UserInjected { text } => {
+            // 排队消息已在轮边界插进对话:补一张"你:"卡片(忙态不变,这一轮还在跑)
+            items.push(MsgItem::User(text));
+        }
         SessionEvent::Notice(t) => {
             items.push(MsgItem::Notice(t));
         }
@@ -2536,40 +2545,50 @@ fn draw_completion_menu(f: &mut ratatui::Frame<'_>, input_area: Rect, cm: &Compl
 /// 输入区内容行数上限:超过后输入框不再增高,内部滚动跟随光标
 const MAX_INPUT_ROWS: usize = 8;
 
-/// 工作中输入的消息队列。回合执行时按 Enter 不再被静默吞掉:内容入队,
-/// 等本回合结束后自动按 FIFO 逐条执行(每条配额一个完整回合,不合并)。
+/// 工作中输入队列:回合执行中按 Enter 入队,消息交给会话引擎在**下一个轮边界**
+/// 插进对话(它自己会继续往下干,不会被这条打断);若这一回合已没有后续轮次
+/// (模型给出终结答复),队列里剩下的在回合结束时作为新回合发出。
+///
+/// 存储与 `Session` 共享同一个投递箱(`SharedInbox`),因此"队列 N"只有一个来源:
+/// 引擎取走一条,UI 这边的计数自动减少,不会出现两边各记一份而对不上。
 #[derive(Default)]
 struct InputQueue {
-    items: VecDeque<String>,
+    items: SharedInbox,
 }
 
 impl InputQueue {
+    fn new(items: SharedInbox) -> Self {
+        Self { items }
+    }
+
     /// 入队一条,返回给用户看的提示(预览压成一行并按字符截断,不切坏中文)。
-    fn push(&mut self, raw: &str) -> String {
-        self.items.push_back(raw.to_string());
+    fn push(&self, raw: &str) -> String {
+        if let Ok(mut q) = self.items.lock() {
+            q.push_back(raw.to_string());
+        }
         let flat = raw.replace('\n', " ");
         format!(
-            "⏳ 已排队(本回合结束后发送):{}",
+            "⏳ 已排队(下一个轮边界发出):{}",
             znaide_core::util::truncate_chars(&flat, 40, "…")
         )
     }
 
-    /// 空闲且没有模态弹窗(权限确认 / 确认框 / 配置向导 / 会话管理)时取出下一条。
-    /// 忙或弹窗期间一律不放行——排队消息不去打断正在跑的回合。
+    /// 回合结束(空闲)且没有模态弹窗时取出下一条,当作新回合发出。
+    /// 忙的时候不取——正在跑的回合由引擎自己在轮边界插话。
     fn pop_ready(&mut self, idle: bool, modal: bool) -> Option<String> {
         if idle && !modal {
-            self.items.pop_front()
+            self.items.lock().ok()?.pop_front()
         } else {
             None
         }
     }
 
     fn len(&self) -> usize {
-        self.items.len()
+        self.items.lock().map(|q| q.len()).unwrap_or(0)
     }
 
     fn is_empty(&self) -> bool {
-        self.items.is_empty()
+        self.len() == 0
     }
 }
 
@@ -4174,16 +4193,33 @@ mod input_queue_tests {
         assert_eq!(q.pop_ready(true, false).as_deref(), Some("等这轮跑完"));
     }
 
-    /// 入队提示:多行压成一行、超长按字符截断(不切坏中文)
+    /// 入队提示:多行压成一行、超长按字符截断(不切坏中文),并说清什么时候发
     #[test]
     fn queued_notice_previews_on_one_line() {
-        let mut q = InputQueue::default();
+        let q = InputQueue::default();
         let notice = q.push("第一行\n第二行\n第三行");
         assert!(notice.contains("第一行 第二行"), "多行预览要压成一行: {notice}");
         assert!(!notice.contains('\n'), "提示本身不能是消息区里的多行: {notice}");
+        assert!(notice.contains("轮边界"), "要说清发出时机是轮边界: {notice}");
         let long = q.push(&"很长的一段话".repeat(20));
         assert!(long.ends_with('…'), "超长要带省略号: {long}");
         assert!(long.chars().count() < 80, "预览不该把整段贴回来: {long}");
         assert_eq!(q.len(), 2);
+    }
+
+    /// 队列只有一份存储:引擎(会话侧)在轮边界取走一条后,界面这边的"队列 N"自动减少
+    #[test]
+    fn queue_count_shares_one_source_with_engine() {
+        let shared: SharedInbox = std::sync::Arc::default();
+        let q = InputQueue::new(shared.clone());
+        let _ = q.push("第一条");
+        let _ = q.push("第二条");
+        assert_eq!(q.len(), 2);
+        // 模拟 core 的轮边界取走一条(它拿的是同一个投递箱)
+        assert_eq!(shared.lock().unwrap().pop_front().as_deref(), Some("第一条"));
+        assert_eq!(q.len(), 1, "界面计数必须跟着引擎走,不能各记一份");
+        assert!(!q.is_empty());
+        assert_eq!(shared.lock().unwrap().pop_front().as_deref(), Some("第二条"));
+        assert!(q.is_empty(), "最后一条也被插走后,界面不该再显示队列");
     }
 }

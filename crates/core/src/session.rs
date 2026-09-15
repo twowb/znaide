@@ -13,6 +13,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+/// 运行中插话的投递箱:交互宿主在回合执行中把用户输入投进来,引擎在每个**轮边界**
+/// (本轮工具结果全部落库、下一次模型调用之前)取一条插进对话历史。无头模式为空。
+pub type SharedInbox = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>;
+
 /// 需要权限的动作类别
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermKind {
@@ -59,6 +63,9 @@ pub enum SessionEvent {
     /// 一轮模型往返开始(轮次预算用):used = 已用轮数(含本轮),limit = 上限
     /// (0 = 不限)。UI 拿它显示"轮 x/y"。
     RoundStarted { used: usize, limit: usize },
+    /// 排队消息已在**轮边界**插进对话历史(UI 据此在正确位置补一张"你:"卡片)。
+    /// 与 TurnFinished 不同:忙态不变,这一轮还在继续跑。
+    UserInjected { text: String },
     /// 轮次预算用尽、任务还没完(交互模式):问 UI 要不要再放一批。
     /// tx 回 true = 再放一批(默认 200 轮),false / Esc / 通道关闭 = 就此收尾
     RoundsExhausted { used: usize, tx: oneshot::Sender<bool> },
@@ -127,6 +134,8 @@ pub struct Session {
     mcp: crate::mcp::McpManager,
     /// 全局人格(空 = 不注入,见 persona 模块);切换会写回 config 持久
     persona: String,
+    /// 运行中插话投递箱(交互宿主用;无头模式为 None,零开销)
+    inbox: Option<SharedInbox>,
 }
 
 impl Session {
@@ -174,6 +183,7 @@ impl Session {
             history_path,
             mcp: mcp.unwrap_or_else(crate::mcp::McpManager::start_empty),
             persona: persona.to_string(),
+            inbox: None,
         };
         s.push_system_prompt();
         s.emit(SessionEvent::SessionInfo {
@@ -199,6 +209,17 @@ impl Session {
     /// `max_turns` 都从这里进来;/config 改动后由宿主重新调用即可即时生效。
     pub fn set_max_turns(&mut self, n: usize) {
         self.max_turns = n;
+    }
+
+    /// 设置运行中插话的投递箱(交互宿主专用)。引擎在**每个轮边界**取一条插进历史,
+    /// 见 `SharedInbox`;不设(无头模式)则整条链路零开销。
+    pub fn set_inbox(&mut self, inbox: SharedInbox) {
+        self.inbox = Some(inbox);
+    }
+
+    /// 从投递箱取一条待插话的消息(没设投递箱或为空 → None;锁中毒也不致命,当空处理)
+    fn take_inbox_message(&self) -> Option<String> {
+        self.inbox.as_ref()?.lock().ok()?.pop_front()
     }
 
     pub fn history_path(&self) -> Option<&Path> {
@@ -768,6 +789,16 @@ impl Session {
                         output_tokens: usage_out,
                     });
                 }
+            }
+            // 轮边界(交互模式的插话点):本轮工具结果**已全部落库**、下一次模型调用之前。
+            // 只能插在这里——在 assistant 的 tool_calls 与它的 tool 结果之间插,历史里会留下
+            // 孤儿调用,恢复会话时端点直接 400(下面 cancel 分支给剩余工具补占位也是这个道理)。
+            // 插进来就是一条普通的 user 消息:当前的活继续干,模型从下一轮起带着你的新要求。
+            // 插话代表新意图,顺带清掉"原地打转"计数,给它一次重新起步的机会。
+            if let Some(text) = self.take_inbox_message() {
+                sig_seen.clear();
+                self.record(&ChatMessage::user(text.clone()));
+                self.emit(SessionEvent::UserInjected { text });
             }
             // D3:重复到上限还没换路 → 判定原地打转,收尾(比烧到轮数上限更早、说得更明白)
             if let Some((sig, n)) = sig_seen.iter().max_by_key(|(_, c)| **c) {

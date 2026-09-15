@@ -11,7 +11,7 @@ use znaide_core::config::Resolved;
 use znaide_core::llm::openai::StreamEvent;
 use znaide_core::llm::{ChatMessage, OpenAiClient, Usage};
 use znaide_core::permissions::Mode;
-use znaide_core::session::Session;
+use znaide_core::session::{Session, SessionEvent, SharedInbox};
 use tokio_util::sync::CancellationToken;
 
 /// 启动 mock:每个连接读完整请求(header + content-length body),调用 handler 生成响应
@@ -240,6 +240,111 @@ async fn session_run_turn_executes_tools() {
     assert_eq!(result.input_tokens, 50);
     assert_eq!(result.output_tokens, 7);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    std::fs::remove_dir_all(cwd).ok();
+}
+
+/// 轮边界插话:回合执行中排队的消息**不等整个回合结束**——本轮工具结果全部落库之后、
+/// 下一次模型调用之前就插进历史(顺序必须是 tool 结果 → user 插话),并给 UI 发
+/// UserInjected,让它知道在哪儿补一张"你:"卡片。
+#[tokio::test]
+async fn queued_message_is_injected_at_round_boundary() {
+    let seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Arc::default();
+    let seen_mock = seen.clone();
+    let base = spawn_mock(move |_n, body| {
+        let msgs = body
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let has_tool_result = msgs
+            .iter()
+            .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"));
+        seen_mock.lock().unwrap().push(body.clone());
+        if !has_tool_result {
+            // 第 1 轮:调个工具(回合远没结束)。带事件通道 = 走流式,回 SSE
+            sse_resp(&[
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"list_directory","arguments":"{\"path\":\"src\"}"}}]},"finish_reason":null}]}"#,
+                r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            ])
+        } else {
+            // 第 2 轮:带着插话收尾
+            sse_resp(&[
+                r#"{"choices":[{"delta":{"content":"收到,顺带一起改"},"finish_reason":null}]}"#,
+                r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":80,"completion_tokens":9,"total_tokens":89}}"#,
+            ])
+        }
+    })
+    .await;
+
+    let cwd = std::env::temp_dir().join(format!("znaide_inject_{}", std::process::id()));
+    std::fs::create_dir_all(cwd.join("src")).unwrap();
+    std::fs::write(cwd.join("src/a.rs"), "fn main() {}").unwrap();
+
+    let cfg = Resolved {
+        model: "m".into(),
+        base_url: base,
+        api_key: None,
+        provider_name: "mock".into(),
+        context_window: None,
+    };
+    let llm = OpenAiClient::new(&cfg).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut session = Session::new(
+        llm,
+        cwd.clone(),
+        Mode::BypassPermissions,
+        Some(tx),
+        CancellationToken::new(),
+        false, // 测试不写历史
+        Some("mock-inject".into()),
+        None,
+        "",
+    )
+    .unwrap();
+
+    // 投递箱里先放一条(等价于"回合执行中用户按了 Enter"),它应该在本轮工具跑完后被插进去
+    let inbox: SharedInbox = Arc::default();
+    session.set_inbox(inbox.clone());
+    inbox.lock().unwrap().push_back("顺便把 y 也改了".to_string());
+
+    let result = session.run_turn("看看 src").await.unwrap();
+    assert_eq!(result.text, "收到,顺带一起改");
+
+    let reqs = seen.lock().unwrap();
+    assert_eq!(reqs.len(), 2, "工具那轮 + 收尾那轮 = 两次模型调用");
+    let msgs = reqs[1]
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .cloned()
+        .unwrap();
+    let roles: Vec<&str> = msgs
+        .iter()
+        .map(|m| m.get("role").and_then(|r| r.as_str()).unwrap_or(""))
+        .collect();
+    let tool_at = roles
+        .iter()
+        .rposition(|r| *r == "tool")
+        .expect("第 2 轮请求里应带着工具结果");
+    assert_eq!(
+        roles.get(tool_at + 1).copied(),
+        Some("user"),
+        "插话必须紧跟工具结果之后(插在中间会留孤儿调用、端点 400): {roles:?}"
+    );
+    assert_eq!(
+        msgs[tool_at + 1].get("content").and_then(|c| c.as_str()),
+        Some("顺便把 y 也改了")
+    );
+    assert!(inbox.lock().unwrap().is_empty(), "插过的消息要从投递箱里消失");
+
+    // UI 靠这个事件补卡片,否则历史里多了一条 user 却看不见
+    let mut injected = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        if let SessionEvent::UserInjected { text } = ev {
+            injected.push(text);
+        }
+    }
+    assert_eq!(injected, vec!["顺便把 y 也改了".to_string()]);
 
     std::fs::remove_dir_all(cwd).ok();
 }
