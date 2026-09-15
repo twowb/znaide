@@ -85,7 +85,7 @@ A banner shows at startup; `/quit` or `/exit` exits (or `Ctrl+C`), printing this
 | `Esc` | Interrupt generation / cancel confirm |
 | `Ctrl+C` | Quit |
 
-**Typing while the model works (queue)**: the input stays usable during a turn (no longer greyed out; the label shows `Enter 排队`) and `Enter` is no longer dropped — you get a `⏳ 已排队` note, and the model picks the message up at its **next round boundary** (one model round trip; the status bar shows `队列 N` and `轮 N/200`). Queued messages never interrupt a running turn; press `Esc` to stop the current work early and the rest of the queue goes right after.
+**Typing while the model works (queue)**: the input stays usable during a turn (no longer greyed out; the label shows `Enter 排队`), and `Enter` is no longer dropped — the message goes into a queue (`队列 N` in the status bar) and the model picks it up on its **next call**, so the current work keeps running. Queued messages never interrupt what is already running; press `Esc` to stop early and the rest of the queue goes right after.
 
 **Live completion**: typing `/` opens a command menu (built-ins + installed skills); typing `@` opens file/dir completion (`@dir/` digs deeper, `@~/` goes home) — candidates filter as you type, first candidate previewed as a dim **ghost** in the input. `↑`/`↓` to pick, **`Tab` or `Enter` to accept** (press `Enter` again to actually send — prevents misfires), `Esc` to close. Names with spaces/punctuation are auto-wrapped into `@"path with spaces"` form.
 
