@@ -544,6 +544,99 @@ async fn interactive_session_writes_schema_meta() {
     std::fs::remove_dir_all(cwd).ok();
 }
 
+/// 恢复会话要把"身份"一并接过来:后续消息必须续写回**被恢复的那个文件**,
+/// 而不是启动时新建的会话 —— 否则历史被切成两半(被恢复的文件不再增长、
+/// 新消息落到新 id 下、状态栏 id 也对不上)。
+#[tokio::test]
+async fn load_history_takes_over_session_identity() {
+    let base = spawn_mock(|_n, _body| {
+        sse_resp(&[
+            r#"{"choices":[{"delta":{"content":"续上了"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ])
+    })
+    .await;
+
+    let cwd = std::env::temp_dir().join(format!("znaide_resumeident_{}", std::process::id()));
+    std::fs::create_dir_all(&cwd).unwrap();
+    let cfg = Resolved {
+        model: "m".into(),
+        base_url: base,
+        api_key: None,
+        provider_name: "mock".into(),
+        context_window: None,
+    };
+    let llm = OpenAiClient::new(&cfg).unwrap();
+
+    let pid = std::process::id();
+    let old_id = format!("resumeident_old_{pid}");
+    let new_id = format!("resumeident_new_{pid}");
+    let dir = znaide_core::config::data_dir().join("sessions");
+    std::fs::create_dir_all(&dir).unwrap();
+    let target = dir.join(format!("{old_id}.jsonl"));
+    std::fs::write(
+        &target,
+        "{\"meta\":{\"headless\":false,\"schema\":\"c4a23d6e50c7\"}}\n\
+         {\"role\":\"user\",\"content\":\"老问题\"}\n\
+         {\"role\":\"assistant\",\"content\":\"老回答\"}\n",
+    )
+    .unwrap();
+
+    // 启动时的身份 = 新会话(等价于 TUI 启动时生成的那个 id)
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+    let mut session = Session::new(
+        llm,
+        cwd.clone(),
+        Mode::BypassPermissions,
+        Some(tx),
+        CancellationToken::new(),
+        true,
+        Some(new_id.clone()),
+        None,
+        "",
+    )
+    .unwrap();
+
+    let n = session.load_history(&target).unwrap();
+    assert_eq!(n, 2, "应恢复 2 条消息");
+    assert_eq!(session.session_id(), old_id, "身份要切到被恢复的会话");
+    assert_eq!(
+        session.history_path(),
+        Some(target.as_path()),
+        "历史文件要指向被恢复的文件"
+    );
+
+    session.run_turn("接着聊").await.unwrap();
+
+    let got = std::fs::read_to_string(&target).unwrap();
+    assert!(got.contains("接着聊"), "新消息要续写回被恢复的文件: {got}");
+    assert!(got.contains("老问题"), "老内容不能被抹掉: {got}");
+    assert_eq!(
+        got.matches("\"meta\"").count(),
+        1,
+        "不能写出第二条 meta: {got}"
+    );
+    let stray = dir.join(format!("{new_id}.jsonl"));
+    assert!(!stray.exists(), "不该再往启动时那个会话里落盘");
+
+    // UI 侧:要拿到新的会话 id(状态栏)与恢复内容
+    let mut ids = Vec::new();
+    let mut loaded = 0usize;
+    while let Ok(ev) = rx.try_recv() {
+        match ev {
+            SessionEvent::SessionInfo { id, .. } => ids.push(id),
+            SessionEvent::HistoryLoaded { count, .. } => loaded = count,
+            _ => {}
+        }
+    }
+    assert!(ids.contains(&old_id), "恢复后应补发 SessionInfo: {ids:?}");
+    assert_eq!(loaded, 2, "应发 HistoryLoaded(带恢复条数)");
+
+    std::fs::remove_file(&target).ok();
+    std::fs::remove_file(&stray).ok();
+    std::fs::remove_dir_all(cwd).ok();
+}
+
 /// 历史格式版本异源(meta schema ≠ 当前):恢复时发出提示;当前版本无提示
 #[tokio::test]
 async fn foreign_schema_in_history_emits_notice() {

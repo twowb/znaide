@@ -348,8 +348,24 @@ impl Session {
     }
 
     /// 从历史 jsonl 恢复会话(替换当前消息,重建系统提示)
+    ///
+    /// **恢复 = 接着这个会话往下走**:除了把消息读进来,还要把"身份"一并接过来
+    /// (`session_id` / `history_path`,以及作废已打开的文件句柄)。否则后续 `record`
+    /// 会继续写启动时那个会话的文件,历史被切成两半:被恢复的文件从此不增长,
+    /// 新消息落到一个新 id 下,状态栏显示的也是那个新 id。
     pub fn load_history(&mut self, path: &Path) -> anyhow::Result<usize> {
         let text = std::fs::read_to_string(path)?;
+        // 身份切换先做:下面重建系统提示要用新的 session_id(与 `--resume` 启动路径同口径)
+        if let Some(stem) = path.file_stem().map(|s| s.to_string_lossy().to_string()) {
+            self.session_id = stem;
+        }
+        self.history_path = Some(path.to_path_buf());
+        // 旧的句柄还开在启动会话的文件上,作废掉,让下一次 record 用新路径重新打开
+        self.history_writer = None;
+        self.emit(SessionEvent::SessionInfo {
+            id: self.session_id.clone(),
+            history: self.history_path.as_ref().map(|p| p.display().to_string()),
+        });
         let mut loaded = 0usize;
         // 首行 meta 里的历史格式版本(老文件没有则无提示)
         let mut meta_schema: Option<String> = None;
@@ -392,12 +408,12 @@ impl Session {
             .filter(|m| m.role != crate::llm::types::Role::System)
             .cloned()
             .collect();
-        if !history_msgs.is_empty() {
-            self.emit(SessionEvent::HistoryLoaded {
-                count: loaded,
-                messages: history_msgs,
-            });
-        }
+        // 空会话(文件里没有消息)也要回一次:UI 据此清空展示,跟引擎的状态保持一致
+        // (以前不发,界面会留着上一段对话,而引擎的上下文其实已经空了)
+        self.emit(SessionEvent::HistoryLoaded {
+            count: loaded,
+            messages: history_msgs,
+        });
         if repaired > 0 {
             self.emit(SessionEvent::Notice(format!(
                 "⚠ 历史里有 {repaired} 个中断遗留的未完成工具调用,已自动补齐占位。"
@@ -475,6 +491,8 @@ impl Session {
 
     /// 首次写入时创建历史文件并写 meta 首行(全会话一致;load 时跳过该行)。
     /// headless 标记供 resume 列表区分命令行 -p 会话;schema 是历史格式版本。
+    /// **已有内容的文件不写 meta**:`/resume` 接上的历史文件本来就有首行 meta,
+    /// 再写一条会让文件变成两份 meta(每次恢复都多一条)。
     fn ensure_history_writer(&mut self) {
         if self.history_writer.is_some() {
             return;
@@ -482,14 +500,17 @@ impl Session {
         let Some(path) = self.history_path.clone() else {
             return;
         };
+        let fresh = std::fs::metadata(&path).map(|m| m.len() == 0).unwrap_or(true);
         if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
-            let _ = writeln!(
-                f,
-                r#"{{"meta":{{"headless":{},"schema":"{}"}}}}"#,
-                self.events.is_none(),
-                HISTORY_SCHEMA
-            );
-            let _ = f.flush();
+            if fresh {
+                let _ = writeln!(
+                    f,
+                    r#"{{"meta":{{"headless":{},"schema":"{}"}}}}"#,
+                    self.events.is_none(),
+                    HISTORY_SCHEMA
+                );
+                let _ = f.flush();
+            }
             self.history_writer = Some(f);
         }
     }
