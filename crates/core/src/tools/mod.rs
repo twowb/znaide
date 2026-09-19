@@ -19,6 +19,9 @@ pub struct ToolContext<'a> {
     pub cancel: Option<CancellationToken>,
     /// 工具运行期事件通道(shell 静默预警等实时信号;无头模式为 None)
     pub events: Option<&'a tokio::sync::mpsc::UnboundedSender<crate::session::SessionEvent>>,
+    /// 生效代理快照（随 Session 重配刷新；`web_fetch` 用同一份，不再直读 env）。
+    /// None = 直连；Some(url) = 走该出口。
+    pub proxy_url: Option<String>,
 }
 
 /// 工具执行结果:直接回给模型的文本

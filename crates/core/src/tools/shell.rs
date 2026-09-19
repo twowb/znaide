@@ -551,6 +551,7 @@ mod tests {
             session_id: "test",
             cancel: None,
             events: None,
+            proxy_url: None,
         };
         for cmd in ["rm -rf /", "rm  -rf /"] {
             let r = run_shell_command(&ctx, &serde_json::json!({ "command": cmd })).await;
@@ -570,6 +571,7 @@ mod tests {
             session_id: "test",
             cancel: None,
             events: None,
+            proxy_url: None,
         };
         let r = run_shell_command(&ctx, &serde_json::json!({ "command": "echo ok" })).await;
         assert!(r.is_ok(), "普通命令应能执行: {:?}", r.err().map(|e| e.0));

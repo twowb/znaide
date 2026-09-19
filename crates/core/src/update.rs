@@ -161,12 +161,11 @@ pub fn version_gt(a: &str, b: &str) -> bool {
     false
 }
 
-/// 组装发布下载用 HTTP 客户端(尊重代理环境变量)
-pub fn http_client() -> anyhow::Result<reqwest::Client> {
-    let mut b = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(240))
-        .user_agent(concat!("znaide-updater/", env!("CARGO_PKG_VERSION")));
+/// 从环境变量读取代理(顺序: HTTPS_PROXY → ALL_PROXY → HTTP_PROXY,大小写均可),
+/// 返回可直接塞进 `ClientBuilder::proxy` 的 `reqwest::Proxy`。
+/// 未设置或解析失败返回 `None`(直连)。
+/// `NO_PROXY/no_proxy` 一并处理:本地 `ollama` 等地址不走代理。
+pub fn proxy_from_env() -> Option<reqwest::Proxy> {
     for var in [
         "HTTPS_PROXY",
         "https_proxy",
@@ -178,12 +177,89 @@ pub fn http_client() -> anyhow::Result<reqwest::Client> {
         if let Ok(v) = std::env::var(var) {
             let v = v.trim().to_string();
             if !v.is_empty() {
-                if let Ok(p) = reqwest::Proxy::all(&v) {
-                    b = b.proxy(p);
+                if let Ok(mut p) = reqwest::Proxy::all(&v) {
+                    if let Some(no) = reqwest::NoProxy::from_string(
+                        &no_proxy_from_env().unwrap_or_default(),
+                    ) {
+                        p = p.no_proxy(Some(no));
+                    }
+                    return Some(p);
                 }
-                break;
             }
         }
+    }
+    None
+}
+
+/// 读 `NO_PROXY/no_proxy` 环境变量(逗号分隔),未设置返回 `None`。
+fn no_proxy_from_env() -> Option<String> {
+    for var in ["NO_PROXY", "no_proxy"] {
+        if let Ok(v) = std::env::var(var) {
+            let v = v.trim().to_string();
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// `NO_PROXY` 豁免表（公用版，`proxy_from_env` 内联逻辑的提取）。
+pub fn no_proxy() -> Option<reqwest::NoProxy> {
+    reqwest::NoProxy::from_string(&no_proxy_from_env().unwrap_or_default())
+}
+
+/// 纯读环境代理地址(顺序 HTTPS_PROXY → ALL_PROXY → HTTP_PROXY，大小写均可)，
+/// 返回第一个非空值（归一：trim + 去尾斜杠）。未设置返回 `None`。
+pub fn env_proxy_url() -> Option<String> {
+    for var in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ] {
+        if let Ok(v) = std::env::var(var) {
+            let v = v.trim().trim_end_matches('/').to_string();
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// 按生效代理构造 `reqwest::Proxy`（含 NO_PROXY 豁免）。
+/// url 非法 → Err（显式传入的地址必须有效）；调用方警告 + 降级直连。
+pub fn proxy_with_url(url: &str) -> anyhow::Result<reqwest::Proxy> {
+    let mut p =
+        reqwest::Proxy::all(url).map_err(|e| anyhow::anyhow!("代理地址无效 {url:?}: {e:#}"))?;
+    if let Some(no) = no_proxy() {
+        p = p.no_proxy(Some(no));
+    }
+    Ok(p)
+}
+
+/// 组装发布下载用 HTTP 客户端(尊重代理环境变量)
+pub fn http_client() -> anyhow::Result<reqwest::Client> {
+    let env = env_proxy_url();
+    match http_client_with_proxy(env.as_deref()) {
+        Ok(c) => Ok(c),
+        // 非法 env 吞错直连（与旧 proxy_from_env 同口径，零回归）
+        Err(_) => http_client_with_proxy(None),
+    }
+}
+
+/// 按生效代理组装更新客户端（超时 240s + connect 10s 不变）。
+/// None = 直连；Some(url) = 走该出口（含 NO_PROXY 豁免）；显式非法 → Err。
+pub fn http_client_with_proxy(proxy_url: Option<&str>) -> anyhow::Result<reqwest::Client> {
+    let mut b = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(240))
+        .user_agent(concat!("znaide-updater/", env!("CARGO_PKG_VERSION")));
+    if let Some(u) = proxy_url.map(str::trim).filter(|u| !u.is_empty()) {
+        b = b.proxy(proxy_with_url(u)?);
     }
     Ok(b.build()?)
 }
@@ -347,11 +423,17 @@ impl UpdateResult {
 /// 完整执行一次更新:按源顺序[Gitee → GitHub]探测 → 比较 → 下载 → 自检 → 安装。
 /// - 首个能连通(探测成功)的源决定"最新版本":已是最新即结束;
 ///   有新版就从该源下载,下载失败自动尝试其它源(同版本资产)。
-/// - 全部源探测失败 → CheckFailed,按源列出原因(GitHub 失败附 HTTPS_PROXY 提示)。
-/// 不发网络请求的前提错误(代理构造失败)也并入 CheckFailed。
+/// - 全部源探测失败 → CheckFailed,按源列出原因(GitHub 失败附 HTTPS_PROXY 提示)；
+///   不发网络请求的前提错误(代理构造失败)也并入 CheckFailed。
 pub async fn perform_update() -> UpdateResult {
+    let env = env_proxy_url();
+    perform_update_with_proxy(env.as_deref()).await
+}
+
+/// 按生效代理完整执行一次更新（None = 直连；调用方传 resolved 落定值）。
+pub async fn perform_update_with_proxy(proxy_url: Option<&str>) -> UpdateResult {
     let cur = current_version();
-    let client = match http_client() {
+    let client = match http_client_with_proxy(proxy_url) {
         Ok(c) => c,
         Err(e) => return UpdateResult::CheckFailed(format!("客户端构造失败: {e:#}")),
     };
@@ -431,6 +513,26 @@ pub fn verify_download(exe: &Path, expect_version: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_from_env_reads_and_clears() {
+        // 单函数覆盖"有/无"两种情况:多测试并行改同一批 env 会打架
+        for v in [
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+        ] {
+            std::env::remove_var(v);
+        }
+        assert!(proxy_from_env().is_none(), "未设置时代理应为直连");
+        std::env::set_var("HTTPS_PROXY", "http://127.0.0.1:10808");
+        assert!(proxy_from_env().is_some(), "HTTPS_PROXY 应被识别");
+        std::env::remove_var("HTTPS_PROXY");
+        assert!(proxy_from_env().is_none());
+    }
 
     #[test]
     fn version_compare() {

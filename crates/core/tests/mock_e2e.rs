@@ -7,12 +7,12 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::{timeout, Duration};
+use tokio_util::sync::CancellationToken;
 use znaide_core::config::Resolved;
 use znaide_core::llm::openai::StreamEvent;
-use znaide_core::llm::{ChatMessage, OpenAiClient, Usage};
+use znaide_core::llm::{build_llm_client, ChatMessage, Usage};
 use znaide_core::permissions::Mode;
 use znaide_core::session::{Session, SessionEvent, SharedInbox};
-use tokio_util::sync::CancellationToken;
 
 /// 启动 mock:每个连接读完整请求(header + content-length body),调用 handler 生成响应
 async fn spawn_mock<F>(handler: F) -> String
@@ -25,7 +25,9 @@ where
     let handler = Arc::new(tokio::sync::Mutex::new(handler));
     tokio::spawn(async move {
         loop {
-            let Ok((mut sock, _)) = listener.accept().await else { break };
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
             let counter = counter.clone();
             let handler = handler.clone();
             tokio::spawn(async move {
@@ -132,11 +134,15 @@ async fn sse_stream_accumulates_text() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        protocol: znaide_core::config::ProtocolKind::Chat,
+        session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
+        proxy: znaide_core::config::EffectiveProxy::Direct,
     };
-    let client = OpenAiClient::new(&cfg).unwrap();
+    let client = build_llm_client(&cfg).unwrap();
     let mut deltas: Vec<String> = Vec::new();
     let reply = client
-        .chat_stream(&[ChatMessage::user("hi")], None, |ev| match ev {
+        .chat_stream(&[ChatMessage::user("hi")], None, &mut |ev| match ev {
             StreamEvent::TextDelta(t) => deltas.push(t),
             StreamEvent::ReasoningDelta(_) => {}
         })
@@ -172,15 +178,22 @@ async fn sse_stream_accumulates_tool_calls() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        protocol: znaide_core::config::ProtocolKind::Chat,
+        session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
+        proxy: znaide_core::config::EffectiveProxy::Direct,
     };
-    let client = OpenAiClient::new(&cfg).unwrap();
+    let client = build_llm_client(&cfg).unwrap();
     let reply = client
-        .chat_stream(&[ChatMessage::user("hi")], None, |_| {})
+        .chat_stream(&[ChatMessage::user("hi")], None, &mut |_| {})
         .await
         .unwrap();
     assert_eq!(reply.tool_calls.len(), 1);
     assert_eq!(reply.tool_calls[0].function.name, "read_file");
-    assert_eq!(reply.tool_calls[0].function.arguments, r#"{"path":"/tmp/x"}"#);
+    assert_eq!(
+        reply.tool_calls[0].function.arguments,
+        r#"{"path":"/tmp/x"}"#
+    );
 }
 
 #[tokio::test]
@@ -219,18 +232,24 @@ async fn session_run_turn_executes_tools() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        protocol: znaide_core::config::ProtocolKind::Chat,
+        session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
+        proxy: znaide_core::config::EffectiveProxy::Direct,
     };
-    let llm = OpenAiClient::new(&cfg).unwrap();
+    let llm = build_llm_client(&cfg).unwrap();
     let mut session = Session::new(
         llm,
+        cfg.protocol,
         cwd.clone(),
         Mode::BypassPermissions,
         None,
         CancellationToken::new(),
         false, // persist=false:测试不写历史
         Some("mock-e2e-test".into()),
-        None,  // 无 MCP
-        "",    // 无人格
+        None, // 无 MCP
+        "",   // 无人格
+        false,
     )
     .unwrap();
     let result = session.run_turn("看看 src 目录").await.unwrap();
@@ -287,11 +306,16 @@ async fn queued_message_is_injected_at_round_boundary() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        protocol: znaide_core::config::ProtocolKind::Chat,
+        session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
+        proxy: znaide_core::config::EffectiveProxy::Direct,
     };
-    let llm = OpenAiClient::new(&cfg).unwrap();
+    let llm = build_llm_client(&cfg).unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut session = Session::new(
         llm,
+        cfg.protocol,
         cwd.clone(),
         Mode::BypassPermissions,
         Some(tx),
@@ -300,13 +324,17 @@ async fn queued_message_is_injected_at_round_boundary() {
         Some("mock-inject".into()),
         None,
         "",
+        false,
     )
     .unwrap();
 
     // 投递箱里先放一条(等价于"回合执行中用户按了 Enter"),它应该在本轮工具跑完后被插进去
     let inbox: SharedInbox = Arc::default();
     session.set_inbox(inbox.clone());
-    inbox.lock().unwrap().push_back("顺便把 y 也改了".to_string());
+    inbox
+        .lock()
+        .unwrap()
+        .push_back("顺便把 y 也改了".to_string());
 
     let result = session.run_turn("看看 src").await.unwrap();
     assert_eq!(result.text, "收到,顺带一起改");
@@ -335,7 +363,10 @@ async fn queued_message_is_injected_at_round_boundary() {
         msgs[tool_at + 1].get("content").and_then(|c| c.as_str()),
         Some("顺便把 y 也改了")
     );
-    assert!(inbox.lock().unwrap().is_empty(), "插过的消息要从投递箱里消失");
+    assert!(
+        inbox.lock().unwrap().is_empty(),
+        "插过的消息要从投递箱里消失"
+    );
 
     // UI 靠这个事件补卡片,否则历史里多了一条 user 却看不见
     let mut injected = Vec::new();
@@ -377,11 +408,16 @@ async fn session_clear_context_wipes_messages_and_history() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        protocol: znaide_core::config::ProtocolKind::Chat,
+        session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
+        proxy: znaide_core::config::EffectiveProxy::Direct,
     };
-    let llm = OpenAiClient::new(&cfg).unwrap();
+    let llm = build_llm_client(&cfg).unwrap();
     let sid = format!("clear_test_{}", std::process::id());
     let mut session = Session::new(
         llm,
+        cfg.protocol,
         cwd.clone(),
         Mode::BypassPermissions,
         None,
@@ -390,6 +426,7 @@ async fn session_clear_context_wipes_messages_and_history() {
         Some(sid.clone()),
         None,
         "",
+        false,
     )
     .unwrap();
 
@@ -436,15 +473,20 @@ async fn headless_session_lazy_file_meta_and_resume() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        protocol: znaide_core::config::ProtocolKind::Chat,
+        session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
+        proxy: znaide_core::config::EffectiveProxy::Direct,
     };
     let sid = format!("meta_test_{}", std::process::id());
     let hp = znaide_core::config::data_dir()
         .join("sessions")
         .join(format!("{sid}.jsonl"));
 
-    let llm = OpenAiClient::new(&cfg).unwrap();
+    let llm = build_llm_client(&cfg).unwrap();
     let mut session = Session::new(
         llm,
+        cfg.protocol,
         cwd.clone(),
         Mode::BypassPermissions,
         None, // events=None → 无头
@@ -453,6 +495,7 @@ async fn headless_session_lazy_file_meta_and_resume() {
         Some(sid.clone()),
         None,
         "",
+        false,
     )
     .unwrap();
     // 懒创建:刚建会话、尚未对话 → 文件还不存在
@@ -462,18 +505,21 @@ async fn headless_session_lazy_file_meta_and_resume() {
     assert_eq!(r1.text, "收到");
     assert!(hp.exists());
     let text = std::fs::read_to_string(&hp).unwrap();
-    let first: serde_json::Value =
-        serde_json::from_str(text.lines().next().unwrap_or("")).unwrap();
-    assert_eq!(first["meta"]["headless"], true, "无头会话首行应有 headless 标记");
+    let first: serde_json::Value = serde_json::from_str(text.lines().next().unwrap_or("")).unwrap();
+    assert_eq!(
+        first["meta"]["headless"], true,
+        "无头会话首行应有 headless 标记"
+    );
     assert_eq!(
         first["meta"]["schema"], "c4a23d6e50c7",
         "无头会话首行同样带历史格式版本"
     );
 
     // 恢复:meta 行被跳过,消息正常加载
-    let llm2 = OpenAiClient::new(&cfg).unwrap();
+    let llm2 = build_llm_client(&cfg).unwrap();
     let mut sess2 = Session::new(
         llm2,
+        cfg.protocol,
         cwd.clone(),
         Mode::BypassPermissions,
         None,
@@ -482,6 +528,7 @@ async fn headless_session_lazy_file_meta_and_resume() {
         None,
         None,
         "",
+        false,
     )
     .unwrap();
     let loaded = sess2.load_history(&hp).unwrap();
@@ -509,16 +556,21 @@ async fn interactive_session_writes_schema_meta() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        protocol: znaide_core::config::ProtocolKind::Chat,
+        session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
+        proxy: znaide_core::config::EffectiveProxy::Direct,
     };
     let sid = format!("imeta_test_{}", std::process::id());
     let hp = znaide_core::config::data_dir()
         .join("sessions")
         .join(format!("{sid}.jsonl"));
 
-    let llm = OpenAiClient::new(&cfg).unwrap();
+    let llm = build_llm_client(&cfg).unwrap();
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<znaide_core::session::SessionEvent>();
     let mut session = Session::new(
         llm,
+        cfg.protocol,
         cwd.clone(),
         Mode::BypassPermissions,
         Some(tx),
@@ -527,6 +579,7 @@ async fn interactive_session_writes_schema_meta() {
         Some(sid.clone()),
         None,
         "",
+        false,
     )
     .unwrap();
     session.run_turn("你好").await.unwrap();
@@ -565,8 +618,12 @@ async fn load_history_takes_over_session_identity() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        protocol: znaide_core::config::ProtocolKind::Chat,
+        session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
+        proxy: znaide_core::config::EffectiveProxy::Direct,
     };
-    let llm = OpenAiClient::new(&cfg).unwrap();
+    let llm = build_llm_client(&cfg).unwrap();
 
     let pid = std::process::id();
     let old_id = format!("resumeident_old_{pid}");
@@ -586,6 +643,7 @@ async fn load_history_takes_over_session_identity() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
     let mut session = Session::new(
         llm,
+        cfg.protocol,
         cwd.clone(),
         Mode::BypassPermissions,
         Some(tx),
@@ -594,6 +652,7 @@ async fn load_history_takes_over_session_identity() {
         Some(new_id.clone()),
         None,
         "",
+        false,
     )
     .unwrap();
 
@@ -654,6 +713,10 @@ async fn foreign_schema_in_history_emits_notice() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        protocol: znaide_core::config::ProtocolKind::Chat,
+        session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
+        proxy: znaide_core::config::EffectiveProxy::Direct,
     };
     let hp = znaide_core::config::data_dir()
         .join("sessions")
@@ -667,11 +730,11 @@ async fn foreign_schema_in_history_emits_notice() {
     )
     .unwrap();
 
-    let (tx, mut rx) =
-        tokio::sync::mpsc::unbounded_channel::<znaide_core::session::SessionEvent>();
-    let llm = OpenAiClient::new(&cfg).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<znaide_core::session::SessionEvent>();
+    let llm = build_llm_client(&cfg).unwrap();
     let mut session = Session::new(
         llm,
+        cfg.protocol,
         cwd.clone(),
         Mode::BypassPermissions,
         Some(tx),
@@ -680,6 +743,7 @@ async fn foreign_schema_in_history_emits_notice() {
         None,
         None,
         "",
+        false,
     )
     .unwrap();
     let loaded = session.load_history(&hp).unwrap();
@@ -703,9 +767,10 @@ async fn foreign_schema_in_history_emits_notice() {
     .unwrap();
     let (tx2, mut rx2) =
         tokio::sync::mpsc::unbounded_channel::<znaide_core::session::SessionEvent>();
-    let llm2 = OpenAiClient::new(&cfg).unwrap();
+    let llm2 = build_llm_client(&cfg).unwrap();
     let mut session2 = Session::new(
         llm2,
+        cfg.protocol,
         cwd.clone(),
         Mode::BypassPermissions,
         Some(tx2),
@@ -714,6 +779,7 @@ async fn foreign_schema_in_history_emits_notice() {
         None,
         None,
         "",
+        false,
     )
     .unwrap();
     session2.load_history(&hp).unwrap();
@@ -738,7 +804,9 @@ async fn tool_call_survives_sse_line_split_across_network_chunks() {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         loop {
-            let Ok((mut sock, _)) = listener.accept().await else { break };
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
             tokio::spawn(async move {
                 let _ = timeout(Duration::from_secs(10), async {
                     // 读完请求 header + body
@@ -804,10 +872,14 @@ async fn tool_call_survives_sse_line_split_across_network_chunks() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        protocol: znaide_core::config::ProtocolKind::Chat,
+        session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
+        proxy: znaide_core::config::EffectiveProxy::Direct,
     };
-    let client = OpenAiClient::new(&cfg).unwrap();
+    let client = build_llm_client(&cfg).unwrap();
     let reply = client
-        .chat_stream(&[ChatMessage::user("hi")], None, |_| {})
+        .chat_stream(&[ChatMessage::user("hi")], None, &mut |_| {})
         .await
         .unwrap();
     // 跨包截断后工具调用必须完整保留,arguments 一字不差
@@ -862,10 +934,15 @@ async fn empty_and_null_tool_arguments_keep_loop_alive() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        protocol: znaide_core::config::ProtocolKind::Chat,
+        session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
+        proxy: znaide_core::config::EffectiveProxy::Direct,
     };
-    let llm = OpenAiClient::new(&cfg).unwrap();
+    let llm = build_llm_client(&cfg).unwrap();
     let mut session = Session::new(
         llm,
+        cfg.protocol,
         cwd.clone(),
         Mode::BypassPermissions,
         None,
@@ -874,6 +951,7 @@ async fn empty_and_null_tool_arguments_keep_loop_alive() {
         Some("mock-null-args".into()),
         None,
         "",
+        false,
     )
     .unwrap();
     let result = session.run_turn("测试空参数工具调用").await.unwrap();
@@ -883,7 +961,8 @@ async fn empty_and_null_tool_arguments_keep_loop_alive() {
     let log = tool_results.lock().unwrap().clone();
     // list_directory 空参数:应正常执行(列出目录),而不是 "invalid type: null"
     assert!(
-        log.iter().any(|c| c.contains("目录") && !c.contains("参数解析错误")),
+        log.iter()
+            .any(|c| c.contains("目录") && !c.contains("参数解析错误")),
         "list_directory 空参数应正常执行,实际: {log:?}"
     );
     // run_shell_command "null" 参数:归一化为 {} → 返回带指引的错误信息,循环继续
@@ -955,10 +1034,15 @@ async fn model_invokes_skill_with_entry_script() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        protocol: znaide_core::config::ProtocolKind::Chat,
+        session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
+        proxy: znaide_core::config::EffectiveProxy::Direct,
     };
-    let llm = OpenAiClient::new(&cfg).unwrap();
+    let llm = build_llm_client(&cfg).unwrap();
     let mut session = Session::new(
         llm,
+        cfg.protocol,
         cwd.clone(),
         Mode::BypassPermissions,
         None, // 无头
@@ -967,6 +1051,7 @@ async fn model_invokes_skill_with_entry_script() {
         Some("mock-skill".into()),
         None,
         "",
+        false,
     )
     .unwrap();
     let result = session.run_turn("用 demo 技能处理").await.unwrap();
@@ -1001,10 +1086,15 @@ async fn manual_skill_unknown_name_fails_gracefully() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        protocol: znaide_core::config::ProtocolKind::Chat,
+        session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
+        proxy: znaide_core::config::EffectiveProxy::Direct,
     };
-    let llm = OpenAiClient::new(&cfg).unwrap();
+    let llm = build_llm_client(&cfg).unwrap();
     let mut session = Session::new(
         llm,
+        cfg.protocol,
         cwd.clone(),
         Mode::BypassPermissions,
         None,
@@ -1013,6 +1103,7 @@ async fn manual_skill_unknown_name_fails_gracefully() {
         Some("mock-skill-none".into()),
         None,
         "",
+        false,
     )
     .unwrap();
     // 未知技能:run_skill_turn 应立刻返回(不发起任何网络请求),text 为空
@@ -1065,10 +1156,15 @@ async fn compact_context_shrinks_next_request() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        protocol: znaide_core::config::ProtocolKind::Chat,
+        session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
+        proxy: znaide_core::config::EffectiveProxy::Direct,
     };
-    let llm = OpenAiClient::new(&cfg).unwrap();
+    let llm = build_llm_client(&cfg).unwrap();
     let mut session = Session::new(
         llm,
+        cfg.protocol,
         cwd.clone(),
         Mode::BypassPermissions,
         None,
@@ -1077,6 +1173,7 @@ async fn compact_context_shrinks_next_request() {
         Some("mock-compact".into()),
         None,
         "",
+        false,
     )
     .unwrap();
     // 积累 4 轮对话(每轮 2 条消息)
@@ -1094,8 +1191,14 @@ async fn compact_context_shrinks_next_request() {
     assert_eq!(r.text, "收到");
     let after = *last_len.lock().unwrap();
     // 摘要(1)+保留最近(≤4)+本回合新 user → 显著小于压缩前
-    assert!(after < before, "压缩后请求应更小:before={before} after={after}");
-    assert!(saw_summary.load(Ordering::SeqCst), "压缩后请求应含【上下文摘要】注入");
+    assert!(
+        after < before,
+        "压缩后请求应更小:before={before} after={after}"
+    );
+    assert!(
+        saw_summary.load(Ordering::SeqCst),
+        "压缩后请求应含【上下文摘要】注入"
+    );
 
     std::fs::remove_dir_all(cwd).ok();
 }
@@ -1112,12 +1215,17 @@ async fn session_turn_error_notifies_and_finishes() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        protocol: znaide_core::config::ProtocolKind::Chat,
+        session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
+        proxy: znaide_core::config::EffectiveProxy::Direct,
     };
-    let llm = OpenAiClient::new(&cfg).unwrap();
+    let llm = build_llm_client(&cfg).unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let cwd = std::env::temp_dir();
     let mut session = Session::new(
         llm,
+        cfg.protocol,
         cwd.clone(),
         Mode::BypassPermissions,
         Some(tx),
@@ -1126,6 +1234,7 @@ async fn session_turn_error_notifies_and_finishes() {
         Some("mock-turn-err".into()),
         None,
         "",
+        false,
     )
     .unwrap();
 
@@ -1173,10 +1282,15 @@ async fn round_budget_exhausted_reports_headless() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        protocol: znaide_core::config::ProtocolKind::Chat,
+        session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
+        proxy: znaide_core::config::EffectiveProxy::Direct,
     };
-    let llm = OpenAiClient::new(&cfg).unwrap();
+    let llm = build_llm_client(&cfg).unwrap();
     let mut session = Session::new(
         llm,
+        cfg.protocol,
         cwd.clone(),
         Mode::BypassPermissions,
         None, // 无头:没有人可以问
@@ -1185,6 +1299,7 @@ async fn round_budget_exhausted_reports_headless() {
         Some("mock-budget".into()),
         None,
         "",
+        false,
     )
     .unwrap();
     session.set_max_turns(2);
@@ -1232,10 +1347,15 @@ async fn max_turns_zero_means_unlimited() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        protocol: znaide_core::config::ProtocolKind::Chat,
+        session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
+        proxy: znaide_core::config::EffectiveProxy::Direct,
     };
-    let llm = OpenAiClient::new(&cfg).unwrap();
+    let llm = build_llm_client(&cfg).unwrap();
     let mut session = Session::new(
         llm,
+        cfg.protocol,
         cwd.clone(),
         Mode::BypassPermissions,
         None,
@@ -1244,6 +1364,7 @@ async fn max_turns_zero_means_unlimited() {
         Some("mock-unlimited".into()),
         None,
         "",
+        false,
     )
     .unwrap();
     session.set_max_turns(2); // 先用 2 验证钳制
@@ -1253,7 +1374,11 @@ async fn max_turns_zero_means_unlimited() {
     let free = session.run_turn("这次不限轮数").await.unwrap();
     assert!(!free.truncated, "不限轮数时不该被截断: {}", free.text);
     assert!(free.text.contains("收工"));
-    assert!(free.tool_calls >= 8, "应真的跑满 8 轮以上,got {}", free.tool_calls);
+    assert!(
+        free.tool_calls >= 8,
+        "应真的跑满 8 轮以上,got {}",
+        free.tool_calls
+    );
 
     std::fs::remove_dir_all(cwd).ok();
 }
@@ -1294,11 +1419,16 @@ async fn round_started_events_report_progress() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        protocol: znaide_core::config::ProtocolKind::Chat,
+        session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
+        proxy: znaide_core::config::EffectiveProxy::Direct,
     };
-    let llm = OpenAiClient::new(&cfg).unwrap();
+    let llm = build_llm_client(&cfg).unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut session = Session::new(
         llm,
+        cfg.protocol,
         cwd.clone(),
         Mode::BypassPermissions,
         Some(tx),
@@ -1307,6 +1437,7 @@ async fn round_started_events_report_progress() {
         Some("mock-rounds".into()),
         None,
         "",
+        false,
     )
     .unwrap();
 
@@ -1319,7 +1450,11 @@ async fn round_started_events_report_progress() {
             got.push((used, limit));
         }
     }
-    assert_eq!(got, vec![(1, 50), (2, 50), (3, 50), (4, 50)], "每轮都要带上限");
+    assert_eq!(
+        got,
+        vec![(1, 50), (2, 50), (3, 50), (4, 50)],
+        "每轮都要带上限"
+    );
 
     // 不限:limit = 0(UI 用 ∞ 表示)
     session.set_max_turns(0);
@@ -1354,10 +1489,15 @@ async fn repeated_identical_call_is_stopped() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        protocol: znaide_core::config::ProtocolKind::Chat,
+        session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
+        proxy: znaide_core::config::EffectiveProxy::Direct,
     };
-    let llm = OpenAiClient::new(&cfg).unwrap();
+    let llm = build_llm_client(&cfg).unwrap();
     let mut session = Session::new(
         llm,
+        cfg.protocol,
         cwd.clone(),
         Mode::BypassPermissions,
         None,
@@ -1366,6 +1506,7 @@ async fn repeated_identical_call_is_stopped() {
         Some("mock-stuck".into()),
         None,
         "",
+        false,
     )
     .unwrap();
 
@@ -1381,6 +1522,218 @@ async fn repeated_identical_call_is_stopped() {
         result.tool_calls <= 6,
         "应在第 6 次重复时中止,实际 {} 次",
         result.tool_calls
+    );
+
+    std::fs::remove_dir_all(cwd).ok();
+}
+/// ---- Responses 协议集成测试(07 §7.3):mock 服务器 + 真实 Session ----
+
+fn responses_cfg(base: String) -> Resolved {
+    Resolved {
+        model: "m".into(),
+        base_url: base,
+        api_key: None,
+        provider_name: "mock".into(),
+        context_window: None,
+        protocol: znaide_core::config::ProtocolKind::Response,
+        session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
+        proxy: znaide_core::config::EffectiveProxy::Direct,
+    }
+}
+
+#[tokio::test]
+async fn responses_sse_text() {
+    let base = spawn_mock(|_n, body| {
+        assert!(body.get("input").is_some(), "Responses 请求应发 input: {body}");
+        assert!(body.get("messages").is_none(), "Responses 请求不应带 messages: {body}");
+        sse_resp(&[
+            r#"{"type":"response.created","response":{"id":"resp_1"}}"#,
+            r#"{"type":"response.output_text.delta","output_index":0,"delta":"你好"}"#,
+            r#"{"type":"response.output_text.delta","output_index":0,"delta":"世界"}"#,
+            r#"{"type":"response.completed","response":{"usage":{"input_tokens":20,"output_tokens":2}}}"#,
+        ])
+    })
+    .await;
+
+    let cfg = responses_cfg(base);
+    let client = build_llm_client(&cfg).unwrap();
+    let mut deltas: Vec<String> = Vec::new();
+    let reply = client
+        .chat_stream(&[ChatMessage::user("hi")], None, &mut |ev| match ev {
+            StreamEvent::TextDelta(t) => deltas.push(t),
+            StreamEvent::ReasoningDelta(_) => {}
+        })
+        .await
+        .unwrap();
+    assert_eq!(reply.content.as_deref(), Some("你好世界"));
+    assert_eq!(deltas.join(""), "你好世界");
+    assert_eq!(
+        reply.usage,
+        Usage {
+            prompt_tokens: 20,
+            completion_tokens: 2
+        }
+    );
+}
+
+#[tokio::test]
+async fn responses_tool_loop() {
+    let seen_output = Arc::new(AtomicBool::new(false));
+    let seen_clone = seen_output.clone();
+    let base = spawn_mock(move |_n, body| {
+        let has_tool_result = body
+            .get("input")
+            .and_then(|m| m.as_array())
+            .map(|items| {
+                items.iter().any(|m| {
+                    m.get("type").and_then(|t| t.as_str()) == Some("function_call_output")
+                })
+            })
+            .unwrap_or(false);
+        if !has_tool_result {
+            // 第 1 轮:回 function_call(SSE,带事件通道走流式)
+            sse_resp(&[
+                r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_1","name":"list_directory","arguments":""}}"#,
+                r#"{"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"path\":\"src\"}"}"#,
+                r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","call_id":"call_1","name":"list_directory","arguments":"{\"path\":\"src\"}"}}"#,
+                r#"{"type":"response.completed","response":{}}"#,
+            ])
+        } else {
+            seen_clone.store(true, Ordering::SeqCst);
+            // 第 2 轮:带着工具结果收尾
+            sse_resp(&[
+                r#"{"type":"response.output_text.delta","output_index":0,"delta":"已完成侦查"}"#,
+                r#"{"type":"response.completed","response":{"usage":{"input_tokens":50,"output_tokens":7}}}"#,
+            ])
+        }
+    })
+    .await;
+
+    let cwd = std::env::temp_dir().join(format!("znaide_resp_tool_{}", std::process::id()));
+    std::fs::create_dir_all(cwd.join("src")).unwrap();
+    std::fs::write(cwd.join("src/a.rs"), "fn main() {}").unwrap();
+
+    let cfg = responses_cfg(base);
+    let llm = build_llm_client(&cfg).unwrap();
+    // 带事件通道 = 走流式 chat_stream
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut session = Session::new(
+        llm,
+        cfg.protocol,
+        cwd.clone(),
+        Mode::BypassPermissions,
+        Some(tx),
+        CancellationToken::new(),
+        false,
+        Some("mock-resp-tool".into()),
+        None,
+        "",
+        false,
+    )
+    .unwrap();
+    let result = session.run_turn("看看 src 目录").await.unwrap();
+    assert_eq!(result.text, "已完成侦查");
+    assert!(result.tool_calls >= 1);
+    assert_eq!(result.input_tokens, 50);
+    assert_eq!(result.output_tokens, 7);
+    assert!(
+        seen_output.load(Ordering::SeqCst),
+        "第二轮 input 里应含 function_call_output"
+    );
+
+    std::fs::remove_dir_all(cwd).ok();
+}
+
+#[tokio::test]
+async fn responses_non_stream_headless() {
+    // 无头(events=None)走非流式 chat 路径
+    let base = spawn_mock(|_n, body| {
+        assert!(body.get("input").is_some(), "Responses 请求应发 input: {body}");
+        http_json_resp(
+            r#"{"id":"resp_1","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"收到"}]}],"usage":{"input_tokens":3,"output_tokens":2}}"#,
+        )
+    })
+    .await;
+
+    let cwd = std::env::temp_dir().join(format!("znaide_resp_ns_{}", std::process::id()));
+    std::fs::create_dir_all(&cwd).unwrap();
+    let cfg = responses_cfg(base);
+    let llm = build_llm_client(&cfg).unwrap();
+    let mut session = Session::new(
+        llm,
+        cfg.protocol,
+        cwd.clone(),
+        Mode::BypassPermissions,
+        None,
+        CancellationToken::new(),
+        false,
+        Some("mock-resp-ns".into()),
+        None,
+        "",
+        false,
+    )
+    .unwrap();
+    let result = session.run_turn("你好").await.unwrap();
+    assert_eq!(result.text, "收到");
+
+    std::fs::remove_dir_all(cwd).ok();
+}
+
+#[tokio::test]
+async fn responses_compact_uses_responses() {
+    // 记录所有请求 body:compact 的摘要请求也应是 Responses 形(含 instructions)
+    let seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Arc::default();
+    let seen_mock = seen.clone();
+    let base = spawn_mock(move |_n, body| {
+        seen_mock.lock().unwrap().push(body);
+        http_json_resp(
+            r#"{"id":"r","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"要点摘要"}]}],"usage":{"input_tokens":10,"output_tokens":3}}"#,
+        )
+    })
+    .await;
+
+    let cwd = std::env::temp_dir().join(format!("znaide_resp_compact_{}", std::process::id()));
+    std::fs::create_dir_all(&cwd).unwrap();
+    let cfg = responses_cfg(base);
+    let llm = build_llm_client(&cfg).unwrap();
+    let mut session = Session::new(
+        llm,
+        cfg.protocol,
+        cwd.clone(),
+        Mode::BypassPermissions,
+        None,
+        CancellationToken::new(),
+        false,
+        Some("mock-resp-compact".into()),
+        None,
+        "",
+        false,
+    )
+    .unwrap();
+    // 攒 6 条 tail(system + 3 轮 user/assistant),超过 KEEP_TAIL+1 才有可压缩空间
+    for i in 0..3 {
+        let r = session.run_turn(&format!("第{i}轮问题")).await.unwrap();
+        assert_eq!(r.text, "要点摘要");
+    }
+    let removed = session.compact_context().await.unwrap();
+    assert!(removed > 0, "应压缩掉旧消息");
+
+    let reqs = seen.lock().unwrap();
+    let last = reqs.last().expect("应有 compact 请求");
+    assert!(
+        last.get("instructions")
+            .and_then(|v| v.as_str())
+            .map(|s| s.contains("压缩器"))
+            .unwrap_or(false),
+        "compact 请求应带 instructions(摘要 system): {last}"
+    );
+    assert_eq!(
+        last.get("input")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len()),
+        Some(1),
+        "compact 请求 input 应只有 1 条 user: {last}"
     );
 
     std::fs::remove_dir_all(cwd).ok();

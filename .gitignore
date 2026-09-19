@@ -1,0 +1,19 @@
+# Rust 构建产物
+/target/
+**/*.rs.bk
+
+# 本地环境与密钥(默认不进版本管理)
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+*secret*.json
+
+# 编辑器与系统杂物
+.idea/
+.vscode/settings.json
+*.swp
+*.swo
+Thumbs.db
+.DS_Store

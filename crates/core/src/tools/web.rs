@@ -11,15 +11,27 @@ struct WebArgs {
 }
 
 pub async fn web_fetch(ctx: &ToolContext<'_>, args: &Value) -> Result<ToolOutput, ToolError> {
-    let _ = ctx;
     let a: WebArgs = serde_json::from_value(args.clone())?;
     if !(a.url.starts_with("http://") || a.url.starts_with("https://")) {
         return Err(ToolError("url 必须以 http:// 或 https:// 开头".into()));
     }
 
-    let client = reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
-        .user_agent("znaide/0.1 (terminal AI assistant)")
+        .user_agent("znaide/0.1 (terminal AI assistant)");
+    // 生效代理来自 Session 快照（与模型客户端同一份，不再直读 env）；
+    // None = 直连（即使环境有代理也不走，Off 语义在此落地）
+    if let Some(u) = ctx
+        .proxy_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+    {
+        let p = crate::update::proxy_with_url(u)
+            .map_err(|e| ToolError(format!("代理地址无效: {e:#}")))?;
+        builder = builder.proxy(p);
+    }
+    let client = builder
         .build()
         .map_err(|e| ToolError(format!("HTTP 客户端初始化失败: {e}")))?;
 

@@ -136,6 +136,7 @@ mod tests {
             session_id: "ut",
             cancel: None,
             events: None,
+            proxy_url: None,
         }
     }
 

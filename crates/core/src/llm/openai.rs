@@ -1,4 +1,6 @@
 use crate::config::Resolved;
+use crate::llm::client::{http_error, new_http_client_with_proxy, truncate, LlmClient};
+use crate::llm::sse::SseParser;
 use crate::llm::types::{ChatMessage, FunctionCall, ToolCall, ToolDef, Usage};
 use futures_util::StreamExt;
 use serde_json::json;
@@ -10,10 +12,28 @@ pub struct OpenAiClient {
     base_url: String,
     api_key: Option<String>,
     model: String,
+    /// 稳定会话头的值(Some = 开，None = 关)。空串 = 开但真实会话 ID 未到(占位，不发头)。
+    session_header: Option<String>,
+    /// 生效代理快照（与 base_url/model/api_key 并列的连接属性；变化即重建 http）
+    proxy: crate::config::EffectiveProxy,
 }
 
 /// 请求 user 标识:chat 请求顶层 user 字段(遥测/实例区分用)
 const REQ_USER: &str = "6ba93f8a8d2e";
+
+/// 稳定会话头(服务端 KV 缓存路由用)，开关关 → 不发。将来若做通用头表，
+/// 在此常量处扩成循环注入(会话头优先，避免被覆盖)。
+pub const SESSION_HEADER: &str = "x-opencode-session";
+
+/// 向导探针头值前缀(验证阶段尚无正式 Session，用一次性探针值走通缓存路由；
+/// 正式建会话后一律换成真实 session_id)。
+pub fn probe_session_value() -> String {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("wizard-{ms:x}")
+}
 
 /// 模型单次回复(非流式或流式累积后的完整结果)
 #[derive(Debug, Clone)]
@@ -41,7 +61,11 @@ pub enum StreamEvent {
 /// 从响应 JSON 顶层提取 usage(容错:缺字段/非数值一律归 0)
 fn extract_usage(parsed: &serde_json::Value) -> Usage {
     let u = parsed.get("usage");
-    let n = |k: &str| u.and_then(|v| v.get(k)).and_then(|v| v.as_u64()).unwrap_or(0);
+    let n = |k: &str| {
+        u.and_then(|v| v.get(k))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    };
     Usage {
         prompt_tokens: n("prompt_tokens"),
         completion_tokens: n("completion_tokens"),
@@ -210,17 +234,20 @@ impl ToolCallAccumulator {
 
 impl OpenAiClient {
     pub fn new(cfg: &Resolved) -> anyhow::Result<Self> {
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(600))
-            // 连接阶段单独限时(DNS/拒连/半开黑洞 10s 内报错),
-            // 而不是干等 600s 总超时才失败
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .build()?;
+        let http = new_http_client_with_proxy(cfg.proxy.url())?;
         Ok(Self {
             http,
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
             api_key: cfg.api_key.clone(),
             model: cfg.model.clone(),
+            // 开但真实会话 ID 未到(Session 建好后经 set_session_header 回填);
+            // 空串占位时 auth() 不发头
+            session_header: if cfg.session_header_enabled {
+                Some(String::new())
+            } else {
+                None
+            },
+            proxy: cfg.proxy.clone(),
         })
     }
 
@@ -228,11 +255,37 @@ impl OpenAiClient {
         &self.model
     }
 
-    /// 运行时换端点/key/模型(不动 http client,连接池留着复用)
+    /// 运行时换端点/key/模型/代理(代理是 Builder 期 baked，换出口必须重建 http，连接池不复用)
     pub fn reconfigure(&mut self, cfg: &Resolved) {
         self.base_url = cfg.base_url.trim_end_matches('/').to_string();
         self.model = cfg.model.clone();
         self.api_key = cfg.api_key.clone();
+        // 开关关 → 清掉旧值(任何路径不得残留);开但已有值 → 保留;开且无值 → 占位等回填
+        match (cfg.session_header_enabled, self.session_header.take()) {
+            (false, _) => self.session_header = None,
+            (true, Some(v)) if !v.is_empty() => self.session_header = Some(v),
+            (true, _) => self.session_header = Some(String::new()),
+        }
+        if self.proxy != cfg.proxy {
+            // 代理是 Builder 期 baked，换出口必须重建 client（连接池不复用）；
+            // 重建失败（非法 URL 漏网）保留旧 client 安全降级
+            match new_http_client_with_proxy(cfg.proxy.url()) {
+                Ok(http) => {
+                    self.http = http;
+                    self.proxy = cfg.proxy.clone();
+                }
+                Err(e) => eprintln!("⚠ 代理切换时重建客户端失败({e:#})，仍用旧代理继续"),
+            }
+        }
+    }
+
+    /// Session 建好/恢复/重配后调用:值 = session_id;关 → 清掉。
+    pub fn set_session_header(&mut self, enabled: bool, session_id: &str) {
+        self.session_header = if enabled {
+            Some(session_id.to_string())
+        } else {
+            None
+        };
     }
 
     fn url(&self) -> String {
@@ -276,10 +329,22 @@ impl OpenAiClient {
         Ok(())
     }
 
+    /// 鉴权 + 稳定会话头:唯一注头点。list_models/chat/chat_stream/validate(经 chat)
+    /// 全经此发出，改一处即全生效；禁止裸 `self.http.post()` 绕过。
     fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match &self.api_key {
+        let req = match &self.api_key {
             Some(k) => req.bearer_auth(k),
             None => req,
+        };
+        match &self.session_header {
+            Some(v) if !v.is_empty() => match reqwest::header::HeaderValue::from_str(v) {
+                Ok(hv) => req.header(SESSION_HEADER, hv),
+                Err(_) => {
+                    eprintln!("⚠ 会话头值非法，已跳过（不影响本次请求）");
+                    req
+                }
+            },
+            _ => req,
         }
     }
 
@@ -313,11 +378,15 @@ impl OpenAiClient {
         tools: Option<&[ToolDef]>,
     ) -> anyhow::Result<AssistantReply> {
         let body = self.build_body(messages, tools, false)?;
-        let resp = self.auth(self.http.post(self.url())).json(&body).send().await?;
+        let resp = self
+            .auth(self.http.post(self.url()))
+            .json(&body)
+            .send()
+            .await?;
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
-            anyhow::bail!("模型端点返回 {status}: {}", truncate(&text, 500));
+            return Err(http_error(status, &text));
         }
         parse_chat_response(&text)
     }
@@ -343,7 +412,7 @@ impl OpenAiClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await?;
-            anyhow::bail!("模型端点返回 {status}: {}", truncate(&text, 500));
+            return Err(http_error(status, &text));
         }
 
         let mut content = String::new();
@@ -356,21 +425,43 @@ impl OpenAiClient {
         'stream: while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             for line in sse.push(&chunk) {
-                if apply_stream_line(&line, &mut content, &mut reasoning, &mut usage, &mut acc, &mut on_event)? {
+                if apply_stream_line(
+                    &line,
+                    &mut content,
+                    &mut reasoning,
+                    &mut usage,
+                    &mut acc,
+                    &mut on_event,
+                )? {
                     break 'stream; // [DONE]
                 }
             }
         }
         // 流结束:冲刷残余(个别服务端不补最后的空行)
         for line in sse.finish() {
-            if apply_stream_line(&line, &mut content, &mut reasoning, &mut usage, &mut acc, &mut on_event)? {
+            if apply_stream_line(
+                &line,
+                &mut content,
+                &mut reasoning,
+                &mut usage,
+                &mut acc,
+                &mut on_event,
+            )? {
                 break;
             }
         }
 
         Ok(AssistantReply {
-            content: if content.is_empty() { None } else { Some(content) },
-            reasoning_content: if reasoning.is_empty() { None } else { Some(reasoning) },
+            content: if content.is_empty() {
+                None
+            } else {
+                Some(content)
+            },
+            reasoning_content: if reasoning.is_empty() {
+                None
+            } else {
+                Some(reasoning)
+            },
             tool_calls: acc.finish(),
             usage,
         })
@@ -441,73 +532,98 @@ fn apply_stream_line(
     Ok(false)
 }
 
-/// SSE 增量解析器。关键点:一条事件(`data: ...` 行)可能被拆在多个 HTTP chunk 里,
-/// 必须跨 chunk 缓冲,否则后半段(没有 `data:` 前缀)会被丢掉 → 工具 arguments 被截断。
-struct SseParser {
-    buf: String,
+/// `LlmClient` 薄转发:方法体调同名 inherent 方法(方法调用优先 inherent,无递归)。
+/// chat 协议行为与抽取前逐行一致。
+impl LlmClient for OpenAiClient {
+    fn model(&self) -> &str {
+        OpenAiClient::model(self)
+    }
+
+    fn reconfigure(&mut self, cfg: &Resolved) {
+        OpenAiClient::reconfigure(self, cfg)
+    }
+
+    fn set_session_header(&mut self, enabled: bool, session_id: &str) {
+        OpenAiClient::set_session_header(self, enabled, session_id)
+    }
+
+    fn effective_proxy(&self) -> crate::config::EffectiveProxy {
+        self.proxy.clone()
+    }
+
+    fn chat<'a>(
+        &'a self,
+        messages: &'a [ChatMessage],
+        tools: Option<&'a [ToolDef]>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<AssistantReply>> + Send + 'a>,
+    > {
+        Box::pin(OpenAiClient::chat(self, messages, tools))
+    }
+
+    fn chat_stream<'a>(
+        &'a self,
+        messages: &'a [ChatMessage],
+        tools: Option<&'a [ToolDef]>,
+        on_event: &'a mut (dyn FnMut(StreamEvent) + Send),
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<AssistantReply>> + Send + 'a>,
+    > {
+        // `&mut dyn FnMut` 自身实现 `FnMut`,可直接填 inherent 的泛型 `F`
+        Box::pin(OpenAiClient::chat_stream(self, messages, tools, on_event))
+    }
+
+    fn validate<'a>(
+        &'a self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+        Box::pin(OpenAiClient::validate(self))
+    }
+
+    fn list_models<'a>(
+        &'a self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<String>>> + Send + 'a>>
+    {
+        Box::pin(OpenAiClient::list_models(self))
+    }
 }
 
-impl SseParser {
-    fn new() -> Self {
-        Self { buf: String::new() }
-    }
-
-    /// 送入一块网络数据,返回其中完整事件的 `data:` 负载(已去前缀)。
-    /// 事件以空行分隔;兼容 \n 与 \r\n。未闭合的部分留到下次。
-    fn push(&mut self, chunk: &[u8]) -> Vec<String> {
-        // 先把换行统一成 \n(兼容 \r\n / \r),跨 chunk 的 \r\n 也能被下次拼上
-        let text = String::from_utf8_lossy(chunk).replace("\r\n", "\n").replace('\r', "\n");
-        self.buf.push_str(&text);
-        let mut out = Vec::new();
-        while let Some(pos) = self.buf.find("\n\n") {
-            let event = self.buf[..pos].to_string();
-            self.buf.drain(..pos + 2);
-            for line in event.lines() {
-                if let Some(rest) = line.strip_prefix("data:") {
-                    out.push(rest.trim().to_string());
-                }
-            }
-        }
-        out
-    }
-
-    /// 流结束时的残余数据(服务端可能不补最后一个空行)
-    fn finish(&mut self) -> Vec<String> {
-        if self.buf.trim().is_empty() {
-            return Vec::new();
-        }
-        let event = std::mem::take(&mut self.buf);
-        let mut out = Vec::new();
-        for line in event.lines() {
-            if let Some(rest) = line.strip_prefix("data:") {
-                out.push(rest.trim().to_string());
-            }
-        }
-        out
-    }
-}
-
-/// 向导用:拿临时端点/key 探测模型列表,不碰全局状态
-pub async fn probe_models(base_url: &str, api_key: Option<&str>) -> anyhow::Result<Vec<String>> {
+/// 向导用:拿临时端点/key 探测模型列表,不碰全局状态。
+/// 开关开时按开关带一次性探针头(验证阶段尚无正式 Session，仅走通缓存路由)。
+/// proxy = 待存代理快照（验证阶段的模型列表查询同样走待存代理）。
+pub async fn probe_models(
+    base_url: &str,
+    api_key: Option<&str>,
+    session_header: Option<&str>,
+    proxy: &crate::config::EffectiveProxy,
+) -> anyhow::Result<Vec<String>> {
     let cfg = crate::config::Resolved {
         model: "probe".into(),
         base_url: base_url.to_string(),
         api_key: api_key.map(|s| s.to_string()),
         provider_name: "probe".into(),
         context_window: None,
+        // GET /models 与协议无关,随便填 Chat
+        protocol: crate::config::ProtocolKind::Chat,
+        session_header_enabled: session_header.is_some(),
+        retry: crate::config::RetryConfig::disabled(),
+        proxy: proxy.clone(),
     };
-    let client = OpenAiClient::new(&cfg)?;
+    let mut client = OpenAiClient::new(&cfg)?;
+    if let Some(v) = session_header {
+        client.set_session_header(true, v);
+    }
     client.list_models().await
 }
 
-/// 向导用:按给定配置发一条最小请求,验证连通/鉴权/模型可用
+/// 向导用:按给定配置发一条最小请求,验证连通/鉴权/模型可用。
+/// 按 `probe.protocol` 自动选 chat / Responses 客户端。
+/// 开关开但尚无真实会话 ID 时，用一次性探针值发头(与正式对话同路由)。
 pub async fn probe_chat(probe: &crate::config::Resolved) -> anyhow::Result<()> {
-    let client = OpenAiClient::new(probe)?;
+    let mut client = crate::llm::client::build_llm_client(probe)?;
+    if probe.session_header_enabled {
+        client.set_session_header(true, &probe_session_value());
+    }
     client.validate().await
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    crate::util::truncate_chars(s, max, "…(截断)")
 }
 
 #[cfg(test)]
@@ -603,7 +719,10 @@ mod tests {
         let calls = acc.finish();
         assert_eq!(calls.len(), 1);
         assert!(
-            calls[0].function.arguments.contains("\"command\":\"ls -la\""),
+            calls[0]
+                .function
+                .arguments
+                .contains("\"command\":\"ls -la\""),
             "got: {}",
             calls[0].function.arguments
         );
@@ -635,7 +754,10 @@ mod tests {
         let reply = parse_chat_response(text).unwrap();
         assert_eq!(reply.content.as_deref(), Some("好的,马上办"));
         assert_eq!(reply.tool_calls.len(), 1);
-        assert!(reply.tool_calls[0].function.arguments.contains("\"path\":\"a.txt\""));
+        assert!(reply.tool_calls[0]
+            .function
+            .arguments
+            .contains("\"path\":\"a.txt\""));
         assert_eq!(reply.tool_calls[0].id, "c1");
     }
 
@@ -710,5 +832,55 @@ mod tests {
         // usage chunk 不产生任何增量事件
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], StreamEvent::TextDelta(_)));
+    }
+
+    fn test_cfg(enabled: bool) -> Resolved {
+        Resolved {
+            model: "m".into(),
+            base_url: "http://localhost:11434/v1".into(),
+            api_key: None,
+            provider_name: "t".into(),
+            context_window: None,
+            protocol: crate::config::ProtocolKind::Chat,
+            session_header_enabled: enabled,
+            retry: crate::config::RetryConfig::disabled(),
+            proxy: crate::config::EffectiveProxy::Direct,
+        }
+    }
+
+    fn built_headers(c: &OpenAiClient) -> reqwest::header::HeaderMap {
+        c.auth(c.http.get("http://localhost:11434/v1/models"))
+            .build()
+            .unwrap()
+            .headers()
+            .clone()
+    }
+
+    #[test]
+    fn auth_session_header_off_placeholder_and_on() {
+        // 关 → 无头
+        let c = OpenAiClient::new(&test_cfg(false)).unwrap();
+        assert!(built_headers(&c).get(SESSION_HEADER).is_none());
+        // 开但占位(空串，值未到) → 不发
+        let c = OpenAiClient::new(&test_cfg(true)).unwrap();
+        assert!(built_headers(&c).get(SESSION_HEADER).is_none());
+        // 开 + 回填 → 发头且值相等
+        let mut c = OpenAiClient::new(&test_cfg(true)).unwrap();
+        c.set_session_header(true, "abc123");
+        assert_eq!(built_headers(&c).get(SESSION_HEADER).unwrap(), "abc123");
+        // reconfigure 关 → 清掉旧值，不残留
+        c.reconfigure(&test_cfg(false));
+        assert!(built_headers(&c).get(SESSION_HEADER).is_none());
+        // reconfigure 开(已有值) → 保留旧值
+        c.set_session_header(true, "keep");
+        c.reconfigure(&test_cfg(true));
+        assert_eq!(built_headers(&c).get(SESSION_HEADER).unwrap(), "keep");
+        // 非法值(含换行) → 跳过头发请求不断
+        let mut c2 = OpenAiClient::new(&test_cfg(true)).unwrap();
+        c2.set_session_header(true, "bad\nvalue");
+        assert!(built_headers(&c2).get(SESSION_HEADER).is_none());
+        // 探针值形态：wizard- 前缀 + hex
+        let p = probe_session_value();
+        assert!(p.starts_with("wizard-"), "got: {p}");
     }
 }
