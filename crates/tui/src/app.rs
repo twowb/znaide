@@ -269,6 +269,20 @@ fn effective_max_turns(cli_override: Option<usize>) -> usize {
     })
 }
 
+/// 弱网重试的追加尝试次数:命令行 `--retry`/`--no-retry` > config `retry` > 0(关)。
+/// 与 `effective_max_turns` 同一套路:启动与 `/config` 重配处都调一次。
+fn effective_retry(cli_retry: Option<usize>, no_retry: bool) -> usize {
+    if no_retry {
+        return 0;
+    }
+    if let Some(n) = cli_retry {
+        return n.min(znaide_core::config::MAX_RETRY);
+    }
+    znaide_core::config::Config::load()
+        .map(|c| c.effective_retry())
+        .unwrap_or(0)
+}
+
 /// 交互主循环。resume = `--resume` 指定的历史会话文件;
 /// persona = 启动时注入的全局人格(空 = 不注入)。
 /// max_turns = 命令行 `--max-turns` 覆盖(None = 用 config/默认)。
@@ -281,6 +295,8 @@ pub async fn run(
     resume: Option<PathBuf>,
     persona: String,
     max_turns: Option<usize>,
+    retry: Option<usize>,
+    no_retry: bool,
 ) -> anyhow::Result<ExitStats> {
     enable_raw_mode()?;
     let mut stdout = stdout();
@@ -355,6 +371,8 @@ pub async fn run(
         // 轮数上限:--max-turns > config 的 max_turns(0 = 不限)> 默认。
         // 以前这里只读 config,`znaide --max-turns N` 在交互模式下被静默忽略。
         session.set_max_turns(effective_max_turns(max_turns));
+        // 弱网重试:--retry / --no-retry > config 的 retry > 0(关,旧行为)
+        session.set_retry(effective_retry(retry, no_retry));
         // 运行中插话:引擎在每个轮边界从这个投递箱取一条插进对话(见 InputQueue)
         session.set_inbox(inbox_agent);
         if !persona.is_empty() {
@@ -397,6 +415,8 @@ pub async fn run(
                         // 命令行给了 --max-turns 的话仍然它优先)。
                         // 状态栏的 round_limit 由宿主在保存配置处同步(这里在 agent 任务里,拿不到 UI 变量)
                         session.set_max_turns(effective_max_turns(max_turns));
+                        // 重试次数也跟着重读(/config 改了 retry 立即生效;命令行仍优先)
+                        session.set_retry(effective_retry(retry, no_retry));
                         session.notify(format!(
                             "✔ 配置已切换: {} / {}",
                             r.provider_name, r.model
@@ -1886,6 +1906,22 @@ fn handle_session_event(
                 Some(MsgItem::AssistantStream(s)) => s.push_str(&t),
                 _ => items.push(MsgItem::AssistantStream(t)),
             }
+        }
+        SessionEvent::LlmRetrying { attempt, max, reason } => {
+            // 弱网重试:把本轮已吐出的半截流式输出从屏幕上撤掉 —— 流式是边到边渲染的,
+            // 不撤就会变成"半截 + 完整"拼接的鬼影。只从尾部向前清连续的
+            // AssistantStream/Reasoning(本次尝试的输出),停在第一张非流式卡片,
+            // 前面已落定的工具卡片与历史一概不动。
+            while matches!(
+                items.last(),
+                Some(MsgItem::AssistantStream(_) | MsgItem::Reasoning(_))
+            ) {
+                items.pop();
+            }
+            stats.round_est = 0;
+            items.push(MsgItem::Notice(format!(
+                "↻ 弱网重试 {attempt}/{max}({reason}),已丢弃这次的部分输出…"
+            )));
         }
         SessionEvent::Usage { prompt, completion } => {
             // 该轮真实用量到账:输入/输出分别累计,进行中估算清零(已按真实记账)
@@ -3813,6 +3849,50 @@ mod slash_tests {
             Some(ConfirmAction::ClearSession) => {}
             other => panic!("确认动作应为 ClearSession,got {other:?}"),
         }
+    }
+
+    /// 弱网重试:把本轮已渲染的半截流式输出从屏幕上撤掉,并留一条提示;
+    /// 前面已落定的内容不受影响,忙态也不被打断。
+    #[test]
+    fn llm_retrying_rolls_back_partial_stream() {
+        let mut items: Vec<MsgItem> = vec![MsgItem::User("前面的内容".into())];
+        let mut busy = true;
+        let mut kind = BusyKind::Work;
+        let mut perm = None;
+        let mut sid = String::new();
+        let mut persona = String::new();
+        let mut st = TokenStats::default();
+
+        // 失败那次的半截输出:先思考后正文(流式是边到边渲染的)
+        handle_session_event(
+            SessionEvent::ReasoningDelta("想了想".into()),
+            &mut items, &mut busy, &mut kind, &mut perm, &mut sid, &mut persona, &mut st,
+        );
+        handle_session_event(
+            SessionEvent::TextDelta("半截回复".into()),
+            &mut items, &mut busy, &mut kind, &mut perm, &mut sid, &mut persona, &mut st,
+        );
+        assert_eq!(items.len(), 3);
+        assert!(st.round_est > 0);
+
+        handle_session_event(
+            SessionEvent::LlmRetrying { attempt: 1, max: 3, reason: "服务端错误(500)".into() },
+            &mut items, &mut busy, &mut kind, &mut perm, &mut sid, &mut persona, &mut st,
+        );
+
+        // 半截被撤掉(只剩"前面的内容" + 一条提示),估算清零,忙态保持
+        assert_eq!(items.len(), 2, "半截没被撤干净");
+        assert!(matches!(&items[0], MsgItem::User(t) if t == "前面的内容"));
+        assert!(matches!(&items[1], MsgItem::Notice(t) if t.contains("1/3") && t.contains("500")));
+        assert_eq!(st.round_est, 0, "作废的估算不能继续算进 token");
+        assert!(busy, "重试期间这一轮还在跑,不该退出忙态");
+
+        // 最终成功那次正常追加
+        handle_session_event(
+            SessionEvent::TextDelta("完整成功".into()),
+            &mut items, &mut busy, &mut kind, &mut perm, &mut sid, &mut persona, &mut st,
+        );
+        assert!(matches!(items.last(), Some(MsgItem::AssistantStream(s)) if s == "完整成功"));
     }
 }
 

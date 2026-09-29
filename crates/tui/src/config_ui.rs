@@ -1001,6 +1001,7 @@ mod tests {
             build_tag: None,
             providers: Default::default(),
             proxy: Default::default(),
+            retry: None,
         };
         w.apply_config(&cfg);
         assert_eq!(w.provider, "deepseek");
@@ -1046,6 +1047,7 @@ mod tests {
             build_tag: None,
             providers,
             proxy: Default::default(),
+            retry: None,
         };
         let mut w = SetupWizard::new();
         w.apply_config(&cfg);

@@ -69,6 +69,16 @@ pub enum SessionEvent {
     /// 轮次预算用尽、任务还没完(交互模式):问 UI 要不要再放一批。
     /// tx 回 true = 再放一批(默认 200 轮),false / Esc / 通道关闭 = 就此收尾
     RoundsExhausted { used: usize, tx: oneshot::Sender<bool> },
+    /// 弱网重试:单次模型调用失败(或空回复)后又试了一次。UI 据此把本轮已吐出的
+    /// 半截流式输出撤掉 —— 不撤就成了"半截 + 完整"拼接的鬼影。忙态不变。
+    LlmRetrying {
+        /// 第几次追加尝试(从 1 起)
+        attempt: usize,
+        /// 配置的追加尝试总数
+        max: usize,
+        /// 人读原因(空回复 / HTTP 500 / 连接中断…)
+        reason: String,
+    },
     /// 通知/提示(如危险命令拦截)
     Notice(String),
     /// 一次模型调用的真实 token 用量(端点不提供 usage 就不发)
@@ -136,6 +146,8 @@ pub struct Session {
     persona: String,
     /// 运行中插话投递箱(交互宿主用;无头模式为 None,零开销)
     inbox: Option<SharedInbox>,
+    /// 弱网重试的追加尝试次数(0 = 关,见 config 的 `retry`)
+    retry: usize,
 }
 
 impl Session {
@@ -184,6 +196,7 @@ impl Session {
             mcp: mcp.unwrap_or_else(crate::mcp::McpManager::start_empty),
             persona: persona.to_string(),
             inbox: None,
+            retry: 0,
         };
         s.push_system_prompt();
         s.emit(SessionEvent::SessionInfo {
@@ -215,6 +228,22 @@ impl Session {
     /// `max_turns` 都从这里进来;/config 改动后由宿主重新调用即可即时生效。
     pub fn set_max_turns(&mut self, n: usize) {
         self.max_turns = n;
+    }
+
+    /// 设置弱网重试的追加尝试次数(0 = 关)。CLI `--retry`/`--no-retry` 与 config
+    /// 的 `retry` 都从这里进来(宿主用 `Config::effective_retry` 夹上限)。
+    pub fn set_retry(&mut self, n: usize) {
+        self.retry = n;
+    }
+
+    /// 重试前的退避等待;返回 true = 等待期间被取消(Esc)。
+    /// 取消槽的语义是"这一回合随时可中断",退避阶段同样要能打断,不然那个洞就漏在这儿。
+    async fn wait_retry_backoff(&self, attempt: usize) -> bool {
+        let wait = std::time::Duration::from_millis(retry_backoff_ms(attempt));
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => false,
+            _ = self.cancel.cancelled() => true,
+        }
     }
 
     /// 设置运行中插话的投递箱(交互宿主专用)。引擎在**每个轮边界**取一条插进历史,
@@ -323,7 +352,27 @@ impl Session {
             ),
             ChatMessage::user(body),
         ];
-        let reply = self.llm.chat(&sum_msgs, None).await;
+        // 摘要也是一次模型调用,同样吃弱网重试(非流式,没有半截输出要撤)
+        let reply = {
+            let mut attempt = 0usize;
+            loop {
+                let single = self.llm.chat(&sum_msgs, None).await;
+                let reason = match &single {
+                    Err(e) => retry_reason(e),
+                    Ok(r) if is_empty_reply(r) => Some("空回复(压缩模型没返回内容)".to_string()),
+                    Ok(_) => None,
+                };
+                let Some(reason) = reason.filter(|_| attempt < self.retry) else {
+                    break single;
+                };
+                attempt += 1;
+                self.emit(SessionEvent::LlmRetrying { attempt, max: self.retry, reason });
+                if self.wait_retry_backoff(attempt).await {
+                    self.emit(SessionEvent::TurnFinished { text: String::new(), truncated: false });
+                    anyhow::bail!("压缩已中断");
+                }
+            }
+        };
         let reply = match reply {
             Ok(r) => r,
             Err(e) => {
@@ -722,39 +771,64 @@ impl Session {
                 used,
                 limit: if budget == usize::MAX { 0 } else { budget },
             });
-            let reply = if self.events.is_some() {
-                let ev = self.events.clone();
-                let cancel = self.cancel.clone();
-                let mut content_buf = String::new();
-                let mut reasoning_buf = String::new();
-                let result = tokio::select! {
-                    r = self.llm.chat_stream(&self.messages, Some(&defs), |evt| {
-                        match evt {
-                            StreamEvent::TextDelta(t) => {
-                                content_buf.push_str(&t);
-                                if let Some(tx) = &ev { let _ = tx.send(SessionEvent::TextDelta(t)); }
+            let reply = {
+                // 弱网重试:循环**只包住这一次模型调用** —— 工具在它外面,
+                // 所以永远不会重复执行工具;失败尝试也不落历史、不计 usage、不占轮预算。
+                let mut attempt = 0usize;
+                let outcome = loop {
+                    let single: anyhow::Result<AssistantReply> = if self.events.is_some() {
+                        let ev = self.events.clone();
+                        let cancel = self.cancel.clone();
+                        let mut content_buf = String::new();
+                        let mut reasoning_buf = String::new();
+                        let result = tokio::select! {
+                            r = self.llm.chat_stream(&self.messages, Some(&defs), |evt| {
+                                match evt {
+                                    StreamEvent::TextDelta(t) => {
+                                        content_buf.push_str(&t);
+                                        if let Some(tx) = &ev { let _ = tx.send(SessionEvent::TextDelta(t)); }
+                                    }
+                                    StreamEvent::ReasoningDelta(t) => {
+                                        reasoning_buf.push_str(&t);
+                                        if let Some(tx) = &ev { let _ = tx.send(SessionEvent::ReasoningDelta(t)); }
+                                    }
+                                }
+                            }) => r,
+                            _ = cancel.cancelled() => {
+                                let text = if content_buf.is_empty() { None } else { Some(content_buf.clone()) };
+                                let r = AssistantReply { content: text, reasoning_content: None, tool_calls: vec![], usage: Default::default() };
+                                self.record(&finalize_assistant(r, true));
+                                let text = format!(
+                                    "⏹ 生成已中断{}",
+                                    if reasoning_buf.is_empty() { "" } else { "(已有部分思考,未输出正文)" }
+                                );
+                                self.emit(SessionEvent::TurnFinished { text: text.clone(), truncated: true });
+                                return Ok(TurnResult { text, tool_calls, truncated: true, input_tokens: usage_in, output_tokens: usage_out });
                             }
-                            StreamEvent::ReasoningDelta(t) => {
-                                reasoning_buf.push_str(&t);
-                                if let Some(tx) = &ev { let _ = tx.send(SessionEvent::ReasoningDelta(t)); }
-                            }
-                        }
-                    }) => r,
-                    _ = cancel.cancelled() => {
-                        let text = if content_buf.is_empty() { None } else { Some(content_buf.clone()) };
-                        let r = AssistantReply { content: text, reasoning_content: None, tool_calls: vec![], usage: Default::default() };
-                        self.record(&finalize_assistant(r, true));
-                        let text = format!(
-                            "⏹ 生成已中断{}",
-                            if reasoning_buf.is_empty() { "" } else { "(已有部分思考,未输出正文)" }
-                        );
+                        };
+                        result
+                    } else {
+                        self.llm.chat(&self.messages, Some(&defs)).await
+                    };
+                    let reason = match &single {
+                        Err(e) => retry_reason(e),
+                        Ok(r) if is_empty_reply(r) => Some("空回复(模型没吐任何内容)".to_string()),
+                        Ok(_) => None,
+                    };
+                    let Some(reason) = reason.filter(|_| attempt < self.retry) else {
+                        break single;
+                    };
+                    attempt += 1;
+                    self.emit(SessionEvent::LlmRetrying { attempt, max: self.retry, reason });
+                    if self.wait_retry_backoff(attempt).await {
+                        // 退避期间按了 Esc:与"生成中断"同一语义收尾
+                        let text = "⏹ 生成已中断".to_string();
                         self.emit(SessionEvent::TurnFinished { text: text.clone(), truncated: true });
                         return Ok(TurnResult { text, tool_calls, truncated: true, input_tokens: usage_in, output_tokens: usage_out });
                     }
                 };
-                result?
-            } else {
-                self.llm.chat(&self.messages, Some(&defs)).await?
+                // 重试用尽(或这次失败不值得重试):错误在这里上抛,与旧行为一致
+                outcome?
             };
 
             let has_tools = !reply.tool_calls.is_empty();
@@ -1089,6 +1163,62 @@ impl Session {
 enum PermissionResult {
     Allowed,
     Denied(String),
+}
+
+/// 弱网重试的退避基数与单次封顶(毫秒):800ms × 2^(n-1),封顶 8s,另加 0~200ms 抖动
+const RETRY_BACKOFF_BASE_MS: u64 = 800;
+const RETRY_BACKOFF_CAP_MS: u64 = 8_000;
+
+/// 这次失败值不值得重试?返回 Some(人读原因) 表示值得。
+///
+/// 判定**全部结构化**(错误类型 + 状态码),不看错误文本:文本里恰好出现 "5000"
+/// 的 400 不该被当成 500 去重试 —— 那种误判会白等几秒再失败,反而更难查。
+///
+/// 重试:连接失败/超时/响应中断、429、500、502、503、504。
+/// 不重试:400/401/403/404/422(参数与鉴权问题,重试无意义)、截断、用户取消。
+pub fn retry_reason(err: &anyhow::Error) -> Option<String> {
+    if let Some(re) = err.chain().find_map(|c| c.downcast_ref::<reqwest::Error>()) {
+        if re.is_connect() {
+            return Some("连接失败".to_string());
+        }
+        if re.is_timeout() {
+            return Some("超时".to_string());
+        }
+        if re.is_body() {
+            return Some("响应中断".to_string());
+        }
+    }
+    match crate::llm::openai::endpoint_status(err) {
+        Some(429) => Some("服务端限流(429)".to_string()),
+        Some(500) => Some("服务端错误(500)".to_string()),
+        Some(502) => Some("网关错误(502)".to_string()),
+        Some(503) => Some("服务不可用(503)".to_string()),
+        Some(504) => Some("网关超时(504)".to_string()),
+        _ => None,
+    }
+}
+
+/// 空回复判定:没有工具调用、正文与思考都是空白。
+/// **纯工具调用(无正文)是合法回复**,不能算空 —— 否则每个工具轮都要白重试几次。
+fn is_empty_reply(reply: &AssistantReply) -> bool {
+    if !reply.tool_calls.is_empty() {
+        return false;
+    }
+    let c = reply.content.as_deref().unwrap_or("").trim();
+    let r = reply.reasoning_content.as_deref().unwrap_or("").trim();
+    c.is_empty() && r.is_empty()
+}
+
+/// 退避时长:800ms × 2^(n-1)(n 从 1 起,指数封顶后钳到 8s)+ 0~200ms 抖动。
+/// 抖动不引随机依赖:取当前时间亚秒纳秒数,够打散同时重试的多个请求。
+fn retry_backoff_ms(attempt: usize) -> u64 {
+    let exp = attempt.saturating_sub(1).min(4);
+    let base = RETRY_BACKOFF_BASE_MS.saturating_mul(1u64 << exp);
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos() % 200))
+        .unwrap_or(0);
+    base.min(RETRY_BACKOFF_CAP_MS).saturating_add(jitter)
 }
 
 /// 把请求错误翻成一句给人看的提示:网络层错误给可操作的中文,
@@ -1548,8 +1678,85 @@ pub fn prune_empty_sessions() -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_tool_args;
+    use super::{is_empty_reply, parse_tool_args, retry_backoff_ms, retry_reason, AssistantReply};
     use serde_json::json;
+
+    /// 重试判定必须**结构化**:状态码该认的认,不该认的一个都不认,
+    /// 尤其不能因为错误文本里出现 "500" 就把 400 也当成可重试。
+    #[test]
+    fn retry_classification_is_structural() {
+        use crate::llm::openai::EndpointStatus;
+        for code in [429u16, 500, 502, 503, 504] {
+            let e = anyhow::Error::new(EndpointStatus {
+                status: code,
+                body: "boom".into(),
+            });
+            assert!(retry_reason(&e).is_some(), "{code} 应当可重试");
+        }
+        for code in [400u16, 401, 403, 404, 422] {
+            let e = anyhow::Error::new(EndpointStatus {
+                status: code,
+                body: "boom".into(),
+            });
+            assert!(retry_reason(&e).is_none(), "{code} 不该重试");
+        }
+        // 正文里出现 500/5000 的 400:仍然不重试(这条专锁"别翻文本")
+        let e = anyhow::Error::new(EndpointStatus {
+            status: 400,
+            body: "max 5000 tokens, upstream saw 502".into(),
+        });
+        assert!(retry_reason(&e).is_none(), "不能拿正文里的数字当状态码");
+    }
+
+    /// 空回复判定:**纯工具调用(无正文)是合法回复**,不能当空回复去重试,
+    /// 否则每个工具轮都要白重试几次。
+    #[test]
+    fn empty_reply_requires_no_tool_calls() {
+        let mut r = AssistantReply {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![],
+            usage: Default::default(),
+        };
+        assert!(is_empty_reply(&r), "什么都没有 = 空回复");
+        r.content = Some("  \n ".into());
+        assert!(is_empty_reply(&r), "纯空白也算空");
+
+        r.tool_calls = vec![crate::llm::types::ToolCall {
+            id: "call_1".into(),
+            call_type: "function".into(),
+            function: crate::llm::types::FunctionCall {
+                name: "list_directory".into(),
+                arguments: "{}".into(),
+            },
+        }];
+        r.content = None;
+        assert!(!is_empty_reply(&r), "纯工具调用是合法回复");
+
+        r.tool_calls.clear();
+        r.reasoning_content = Some("想了半天".into());
+        assert!(!is_empty_reply(&r), "只有思考也算有内容");
+    }
+
+    /// 退避:800ms × 2^(n-1) 增长并封顶 8s,另加 0~200ms 抖动
+    #[test]
+    fn retry_backoff_grows_and_caps() {
+        for (attempt, base) in [
+            (1usize, 800u64),
+            (2, 1_600),
+            (3, 3_200),
+            (4, 6_400),
+            (5, 8_000),
+            (9, 8_000),
+        ] {
+            let ms = retry_backoff_ms(attempt);
+            assert!(
+                ms >= base && ms < base + 200,
+                "attempt={attempt} 得到 {ms}ms,期望 [{base}, {})",
+                base + 200
+            );
+        }
+    }
 
     #[test]
     fn empty_args_become_empty_object() {

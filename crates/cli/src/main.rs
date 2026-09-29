@@ -61,6 +61,15 @@ struct Cli {
     #[arg(long)]
     no_proxy: bool,
 
+    /// 弱网重试:一次模型调用失败(空回复/限流/5xx/连接中断)后最多再试几次(0..=8)。
+    /// 只重试这一次调用,不会重跑工具。当次生效、不写盘;缺省取 config 的 retry(默认关)
+    #[arg(long, value_name = "N")]
+    retry: Option<usize>,
+
+    /// 关闭弱网重试(与 --retry 同时传时以本项为准)
+    #[arg(long)]
+    no_retry: bool,
+
     /// 检查并安装 GitHub 最新版本(见 --version 查看当前版本)
     #[arg(long)]
     update: bool,
@@ -158,7 +167,17 @@ async fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
             let resolved = resolved?;
-            run_headless(&resolved, mode, &cwd, prompt, &persona, cli.max_turns).await?;
+            run_headless(
+                &resolved,
+                mode,
+                &cwd,
+                prompt,
+                &persona,
+                cli.max_turns,
+                cli.retry,
+                cli.no_retry,
+            )
+            .await?;
         }
         None => {
             // 首次运行(无任何配置来源)自动进配置引导
@@ -202,6 +221,8 @@ async fn main() -> anyhow::Result<()> {
                 resume,
                 persona.clone(),
                 cli.max_turns,
+                cli.retry,
+                cli.no_retry,
             )
             .await?;
             print_session_stats(&stats);
@@ -302,6 +323,8 @@ async fn run_headless(
     prompt: &str,
     persona: &str,
     max_turns: Option<usize>,
+    retry: Option<usize>,
+    no_retry: bool,
 ) -> anyhow::Result<()> {
     let llm = OpenAiClient::new(resolved)?;
 
@@ -339,6 +362,8 @@ async fn run_headless(
     } else if let Ok(cfg) = znaide_core::config::Config::load() {
         session.set_max_turns(cfg.effective_max_turns());
     }
+    // 弱网重试:命令行(--no-retry 优先)> config > 0(关)
+    session.set_retry(effective_retry(retry, no_retry));
     let result = session
         .run_turn(prompt)
         .await
@@ -371,12 +396,31 @@ async fn run_interactive(
     resume: Option<PathBuf>,
     persona: String,
     max_turns: Option<usize>,
+    retry: Option<usize>,
+    no_retry: bool,
 ) -> anyhow::Result<znaide_tui::ExitStats> {
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         anyhow::bail!("交互模式需要终端。请在终端中运行 znaide,或用 -p \"指令\" 使用无头模式。");
     }
-    let stats = znaide_tui::run(resolved, mode, cwd, first_run, resume, persona, max_turns).await?;
+    let stats = znaide_tui::run(
+        resolved, mode, cwd, first_run, resume, persona, max_turns, retry, no_retry,
+    )
+    .await?;
     Ok(stats)
+}
+
+/// 弱网重试的追加尝试次数:`--no-retry` > `--retry N` > config > 0(关)。
+/// 与 max_turns 同一口径:命令行优先,缺省看配置。
+fn effective_retry(cli_retry: Option<usize>, no_retry: bool) -> usize {
+    if no_retry {
+        return 0;
+    }
+    if let Some(n) = cli_retry {
+        return n.min(znaide_core::config::MAX_RETRY);
+    }
+    znaide_core::config::Config::load()
+        .map(|c| c.effective_retry())
+        .unwrap_or(0)
 }
 
 /// 是否已经有可用的配置来源(配置文件 / 命令行覆盖 / 环境变量)。

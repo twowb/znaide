@@ -44,12 +44,20 @@ pub struct Config {
     /// 的 config.json 不会平白多出这个键。
     #[serde(skip_serializing_if = "ProxyConfig::is_default")]
     pub proxy: ProxyConfig,
+    /// 弱网重试:一次模型调用失败后**追加**的尝试次数(不设 = 0 = 关闭)。
+    /// 只重试这一次调用,**不会重跑工具**(有副作用的工具只执行一次)。
+    /// 命令行 `--retry` / `--no-retry` 优先于这里。
+    pub retry: Option<usize>,
 }
 
 /// 当前配置格式版本(写入 config.json 的 build_tag)。
 /// v2:顶层 model/base_url/api_key/context_window 不再由面板写入,改为搬进对应
 /// provider 条目(顶层只作手动临时覆盖),因此换一次标记触发一次性自愈迁移。
 const CONFIG_TAG: &str = "c6ee35b45916";
+
+/// 弱网重试上限(追加尝试次数)。退避是指数增长的,再多就不是"弱网重试"、
+/// 而是"卡在那儿等"了。
+pub const MAX_RETRY: usize = 8;
 
 /// provider 预设:端点 + 默认模型 + key(环境变量名或明文)
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -561,6 +569,12 @@ impl Config {
         self.max_turns.unwrap_or(crate::session::DEFAULT_MAX_TURNS)
     }
 
+    /// 弱网重试的追加尝试次数:配置值夹到 0..=MAX_RETRY;不设 = 0(关)。
+    /// 退避按指数增长,次数越多等待越久,所以有上限而不只是"用户说了算"。
+    pub fn effective_retry(&self) -> usize {
+        self.retry.unwrap_or(0).min(MAX_RETRY)
+    }
+
     /// provider 清单(名字/base_url/模型),给 UI 列表用
     pub fn list_providers(&self) -> Vec<(String, String, String)> {
         let providers = self.all_providers();
@@ -782,6 +796,7 @@ mod tests {
             build_tag: None,
             providers: Default::default(),
             proxy: Default::default(),
+            retry: None,
         };
         let r = cfg
             .resolve(Some("cli-model".into()), None, None, None)
@@ -825,6 +840,7 @@ mod tests {
             build_tag: None,
             providers,
             proxy: Default::default(),
+            retry: None,
         };
         let r = cfg.resolve(None, None, None, None).unwrap();
         assert_eq!(r.base_url, "http://127.0.0.1:8080/v1");
@@ -1400,5 +1416,17 @@ mod tests {
         let back: Config = serde_json::from_str(&text).unwrap();
         assert_eq!(back.proxy.mode, ProxyMode::Manual);
         assert_eq!(back.proxy.url.as_deref(), Some("http://127.0.0.1:7897"));
+    }
+
+    /// 弱网重试:默认关;配置值夹到 0..=MAX_RETRY
+    #[test]
+    fn effective_retry_defaults_off_and_clamps() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.effective_retry(), 0, "不设 = 关(与旧行为一致)");
+        assert_eq!(cfg.retry, None);
+        cfg.retry = Some(3);
+        assert_eq!(cfg.effective_retry(), 3);
+        cfg.retry = Some(99);
+        assert_eq!(cfg.effective_retry(), MAX_RETRY, "超上限要夹住");
     }
 }

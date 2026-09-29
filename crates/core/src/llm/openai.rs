@@ -17,6 +17,37 @@ pub struct OpenAiClient {
 /// 请求 user 标识:chat 请求顶层 user 字段(遥测/实例区分用)
 const REQ_USER: &str = "6ba93f8a8d2e";
 
+/// 端点返回非 2xx。**结构化**带上状态码,好让重试判定据此决定 ——
+/// 而不是去翻错误文本(`contains("500")` 会把 "max 5000 tokens" 也判成 500,
+/// 那种误判会白等几秒再失败,正是本项目要避开的坑)。
+#[derive(Debug)]
+pub struct EndpointStatus {
+    pub status: u16,
+    pub body: String,
+}
+
+impl std::fmt::Display for EndpointStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "模型端点返回 {}: {}", self.status, truncate(&self.body, 500))
+    }
+}
+
+impl std::error::Error for EndpointStatus {}
+
+/// 从错误链里取出端点状态码(重试判定用)
+pub fn endpoint_status(err: &anyhow::Error) -> Option<u16> {
+    err.chain()
+        .find_map(|c| c.downcast_ref::<EndpointStatus>())
+        .map(|e| e.status)
+}
+
+fn endpoint_error(status: reqwest::StatusCode, body: String) -> anyhow::Error {
+    anyhow::Error::new(EndpointStatus {
+        status: status.as_u16(),
+        body,
+    })
+}
+
 /// 模型单次回复(非流式或流式累积后的完整结果)
 #[derive(Debug, Clone)]
 pub struct AssistantReply {
@@ -334,7 +365,7 @@ impl OpenAiClient {
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
-            anyhow::bail!("模型端点返回 {status}: {}", truncate(&text, 500));
+            return Err(endpoint_error(status, text));
         }
         parse_chat_response(&text)
     }
@@ -360,7 +391,7 @@ impl OpenAiClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await?;
-            anyhow::bail!("模型端点返回 {status}: {}", truncate(&text, 500));
+            return Err(endpoint_error(status, text));
         }
 
         let mut content = String::new();
