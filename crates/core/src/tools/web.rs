@@ -17,10 +17,12 @@ pub async fn web_fetch(ctx: &ToolContext<'_>, args: &Value) -> Result<ToolOutput
         return Err(ToolError("url 必须以 http:// 或 https:// 开头".into()));
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .user_agent("znaide/0.1 (terminal AI assistant)")
-        .build()
+    let client = crate::net::client_builder(ctx.proxy)
+        .and_then(|b| {
+            Ok(b.timeout(std::time::Duration::from_secs(30))
+                .user_agent("znaide/0.1 (terminal AI assistant)")
+                .build()?)
+        })
         .map_err(|e| ToolError(format!("HTTP 客户端初始化失败: {e}")))?;
 
     let resp = client

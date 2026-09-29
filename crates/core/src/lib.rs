@@ -1,6 +1,7 @@
 pub mod config;
 pub mod llm;
 pub mod mcp;
+pub mod net;
 pub mod permissions;
 pub mod persona;
 pub mod refs;

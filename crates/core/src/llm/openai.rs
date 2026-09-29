@@ -1,4 +1,4 @@
-use crate::config::Resolved;
+use crate::config::{EffectiveProxy, Resolved};
 use crate::llm::types::{ChatMessage, FunctionCall, ToolCall, ToolDef, Usage};
 use futures_util::StreamExt;
 use serde_json::json;
@@ -10,6 +10,8 @@ pub struct OpenAiClient {
     base_url: String,
     api_key: Option<String>,
     model: String,
+    /// 当前生效代理(reqwest 客户端已按它建好;留一份用于"变了才重建"和错误文案)
+    proxy: EffectiveProxy,
 }
 
 /// 请求 user 标识:chat 请求顶层 user 字段(遥测/实例区分用)
@@ -210,29 +212,44 @@ impl ToolCallAccumulator {
 
 impl OpenAiClient {
     pub fn new(cfg: &Resolved) -> anyhow::Result<Self> {
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(600))
-            // 连接阶段单独限时(DNS/拒连/半开黑洞 10s 内报错),
-            // 而不是干等 600s 总超时才失败
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .build()?;
         Ok(Self {
-            http,
+            http: Self::build_http(&cfg.proxy)?,
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
             api_key: cfg.api_key.clone(),
             model: cfg.model.clone(),
+            proxy: cfg.proxy.clone(),
         })
+    }
+
+    /// 建请求客户端:总超时 600s(模型可能很久才吐第一个字),连接阶段单独 10s
+    /// (DNS/拒连/半开黑洞要及时报错,而不是干等总超时);代理走 `net` 的唯一出口。
+    fn build_http(proxy: &EffectiveProxy) -> anyhow::Result<reqwest::Client> {
+        Ok(crate::net::client_builder(proxy)?
+            .timeout(std::time::Duration::from_secs(600))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()?)
+    }
+
+    /// 当前生效代理(工具执行上下文与错误文案要用)
+    pub fn proxy(&self) -> &EffectiveProxy {
+        &self.proxy
     }
 
     pub fn model(&self) -> &str {
         &self.model
     }
 
-    /// 运行时换端点/key/模型(不动 http client,连接池留着复用)
-    pub fn reconfigure(&mut self, cfg: &Resolved) {
+    /// 运行时换端点/key/模型。端点/key/模型不动 http client(连接池留着复用),
+    /// 但**代理换了必须重建**:连接池是绑在旧代理上的,继续复用等于还走老出口。
+    pub fn reconfigure(&mut self, cfg: &Resolved) -> anyhow::Result<()> {
+        if cfg.proxy != self.proxy {
+            self.http = Self::build_http(&cfg.proxy)?;
+            self.proxy = cfg.proxy.clone();
+        }
         self.base_url = cfg.base_url.trim_end_matches('/').to_string();
         self.model = cfg.model.clone();
         self.api_key = cfg.api_key.clone();
+        Ok(())
     }
 
     fn url(&self) -> String {
@@ -487,14 +504,20 @@ impl SseParser {
     }
 }
 
-/// 向导用:拿临时端点/key 探测模型列表,不碰全局状态
-pub async fn probe_models(base_url: &str, api_key: Option<&str>) -> anyhow::Result<Vec<String>> {
+/// 向导用:拿临时端点/key 探测模型列表,不碰全局状态。
+/// 代理必须与真实请求同一个生效出口,否则会出现"验证通过但实际连不上"。
+pub async fn probe_models(
+    base_url: &str,
+    api_key: Option<&str>,
+    proxy: &EffectiveProxy,
+) -> anyhow::Result<Vec<String>> {
     let cfg = crate::config::Resolved {
         model: "probe".into(),
         base_url: base_url.to_string(),
         api_key: api_key.map(|s| s.to_string()),
         provider_name: "probe".into(),
         context_window: None,
+        proxy: proxy.clone(),
     };
     let client = OpenAiClient::new(&cfg)?;
     client.list_models().await

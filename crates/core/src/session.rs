@@ -200,9 +200,15 @@ impl Session {
         &self.session_id
     }
 
-    /// 换模型/端点/key,立即生效,不打断会话
-    pub fn reconfigure(&mut self, resolved: &crate::config::Resolved) {
-        self.llm.reconfigure(resolved);
+    /// 换模型/端点/key,立即生效,不打断会话。
+    /// 代理换了会重建 HTTP 客户端,失败时返回错误(调用方负责提示)
+    pub fn reconfigure(&mut self, resolved: &crate::config::Resolved) -> anyhow::Result<()> {
+        self.llm.reconfigure(resolved)
+    }
+
+    /// 当前生效代理(宿主做探测、提示时用;与真实请求同一个出口)
+    pub fn proxy(&self) -> &crate::config::EffectiveProxy {
+        self.llm.proxy()
     }
 
     /// 设置单条消息的轮数上限(0 = 不限)。CLI `--max-turns` 与 config 的
@@ -649,7 +655,7 @@ impl Session {
             if self.events.is_some() {
                 self.emit(SessionEvent::Notice(format!(
                     "⚠ 请求失败: {}",
-                    describe_request_error(e)
+                    describe_request_error(e, Some(self.llm.proxy()))
                 )));
                 self.emit(SessionEvent::TurnFinished {
                     text: String::new(),
@@ -978,6 +984,7 @@ impl Session {
                     session_id: &self.session_id,
                     cancel: Some(self.cancel.clone()),
                     events: self.events.as_ref(),
+                    proxy: self.llm.proxy(),
                 };
                 match tools::execute(&name, args, &ctx).await {
                     Ok(out) => {
@@ -1044,6 +1051,7 @@ impl Session {
                                 session_id: &self.session_id,
                                 cancel: Some(self.cancel.clone()),
                                 events: self.events.as_ref(),
+                                proxy: self.llm.proxy(),
                             };
                             match tools::execute("run_shell_command", run_args, &ctx).await {
                                 Ok(o) => {
@@ -1085,17 +1093,30 @@ enum PermissionResult {
 
 /// 把请求错误翻成一句给人看的提示:网络层错误给可操作的中文,
 /// 其余错误(端点业务错误、参数解析等)回原始错误链(err:# 含全部原因)。
-pub fn describe_request_error(err: &anyhow::Error) -> String {
+///
+/// 连接类失败会把**当前生效代理**附在后面:`代理没起` 与 `端点不对` 是两回事,
+/// 只给一句"检查 base_url、网络和代理设置"等于让人瞎猜。
+pub fn describe_request_error(err: &anyhow::Error, proxy: Option<&crate::config::EffectiveProxy>) -> String {
     let re = err.chain().find_map(|c| c.downcast_ref::<reqwest::Error>());
+    let hint = || match proxy {
+        Some(p) => format!("\n{}", crate::net::describe_proxy(p)),
+        None => String::new(),
+    };
     match re {
         Some(re) if re.is_connect() && re.is_timeout() => {
-            "连模型端点超时了(10s 内没建立连接):多半是网络不通或代理问题,查下 base_url 通不通".into()
+            format!(
+                "连模型端点超时了(10s 内没建立连接):多半是网络不通或代理问题,查下 base_url 通不通{}",
+                hint()
+            )
         }
         Some(re) if re.is_timeout() => {
             "请求模型端点超时(模型半天没响应):稍后再试,或看看模型服务负载".into()
         }
         Some(re) if re.is_connect() => {
-            "无法连接模型端点(连接/DNS 失败):检查 base_url、网络和代理设置".into()
+            format!(
+                "无法连接模型端点(连接/DNS 失败):检查 base_url、网络和代理设置{}",
+                hint()
+            )
         }
         Some(re) if re.is_body() => {
             "读模型响应读到一半断了(连接被关或网络抖动):可重试一次".into()

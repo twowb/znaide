@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::{timeout, Duration};
-use znaide_core::config::Resolved;
+use znaide_core::config::{EffectiveProxy, Resolved};
 use znaide_core::llm::openai::StreamEvent;
 use znaide_core::llm::{ChatMessage, OpenAiClient, Usage};
 use znaide_core::permissions::Mode;
@@ -132,6 +132,8 @@ async fn sse_stream_accumulates_text() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
+        proxy: EffectiveProxy::Direct,
     };
     let client = OpenAiClient::new(&cfg).unwrap();
     let mut deltas: Vec<String> = Vec::new();
@@ -172,6 +174,8 @@ async fn sse_stream_accumulates_tool_calls() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
+        proxy: EffectiveProxy::Direct,
     };
     let client = OpenAiClient::new(&cfg).unwrap();
     let reply = client
@@ -219,6 +223,8 @@ async fn session_run_turn_executes_tools() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
+        proxy: EffectiveProxy::Direct,
     };
     let llm = OpenAiClient::new(&cfg).unwrap();
     let mut session = Session::new(
@@ -287,6 +293,8 @@ async fn queued_message_is_injected_at_round_boundary() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
+        proxy: EffectiveProxy::Direct,
     };
     let llm = OpenAiClient::new(&cfg).unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -377,6 +385,8 @@ async fn session_clear_context_wipes_messages_and_history() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
+        proxy: EffectiveProxy::Direct,
     };
     let llm = OpenAiClient::new(&cfg).unwrap();
     let sid = format!("clear_test_{}", std::process::id());
@@ -436,6 +446,8 @@ async fn headless_session_lazy_file_meta_and_resume() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
+        proxy: EffectiveProxy::Direct,
     };
     let sid = format!("meta_test_{}", std::process::id());
     let hp = znaide_core::config::data_dir()
@@ -509,6 +521,8 @@ async fn interactive_session_writes_schema_meta() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
+        proxy: EffectiveProxy::Direct,
     };
     let sid = format!("imeta_test_{}", std::process::id());
     let hp = znaide_core::config::data_dir()
@@ -565,6 +579,8 @@ async fn load_history_takes_over_session_identity() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
+        proxy: EffectiveProxy::Direct,
     };
     let llm = OpenAiClient::new(&cfg).unwrap();
 
@@ -654,6 +670,8 @@ async fn foreign_schema_in_history_emits_notice() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
+        proxy: EffectiveProxy::Direct,
     };
     let hp = znaide_core::config::data_dir()
         .join("sessions")
@@ -804,6 +822,8 @@ async fn tool_call_survives_sse_line_split_across_network_chunks() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
+        proxy: EffectiveProxy::Direct,
     };
     let client = OpenAiClient::new(&cfg).unwrap();
     let reply = client
@@ -862,6 +882,8 @@ async fn empty_and_null_tool_arguments_keep_loop_alive() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
+        proxy: EffectiveProxy::Direct,
     };
     let llm = OpenAiClient::new(&cfg).unwrap();
     let mut session = Session::new(
@@ -955,6 +977,8 @@ async fn model_invokes_skill_with_entry_script() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
+        proxy: EffectiveProxy::Direct,
     };
     let llm = OpenAiClient::new(&cfg).unwrap();
     let mut session = Session::new(
@@ -1001,6 +1025,8 @@ async fn manual_skill_unknown_name_fails_gracefully() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
+        proxy: EffectiveProxy::Direct,
     };
     let llm = OpenAiClient::new(&cfg).unwrap();
     let mut session = Session::new(
@@ -1065,6 +1091,8 @@ async fn compact_context_shrinks_next_request() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
+        proxy: EffectiveProxy::Direct,
     };
     let llm = OpenAiClient::new(&cfg).unwrap();
     let mut session = Session::new(
@@ -1112,6 +1140,8 @@ async fn session_turn_error_notifies_and_finishes() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
+        proxy: EffectiveProxy::Direct,
     };
     let llm = OpenAiClient::new(&cfg).unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1134,7 +1164,7 @@ async fn session_turn_error_notifies_and_finishes() {
         Err(e) => e,
         Ok(_) => panic!("指向不可达端点的回合应报错"),
     };
-    let desc = describe_request_error(&err);
+    let desc = describe_request_error(&err, Some(&EffectiveProxy::Direct));
     assert!(
         desc.contains("无法连接") || desc.contains("超时"),
         "desc 应归类为连接类错误,got: {desc}"
@@ -1173,6 +1203,8 @@ async fn round_budget_exhausted_reports_headless() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
+        proxy: EffectiveProxy::Direct,
     };
     let llm = OpenAiClient::new(&cfg).unwrap();
     let mut session = Session::new(
@@ -1232,6 +1264,8 @@ async fn max_turns_zero_means_unlimited() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
+        proxy: EffectiveProxy::Direct,
     };
     let llm = OpenAiClient::new(&cfg).unwrap();
     let mut session = Session::new(
@@ -1294,6 +1328,8 @@ async fn round_started_events_report_progress() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
+        proxy: EffectiveProxy::Direct,
     };
     let llm = OpenAiClient::new(&cfg).unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1354,6 +1390,8 @@ async fn repeated_identical_call_is_stopped() {
         api_key: None,
         provider_name: "mock".into(),
         context_window: None,
+        // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
+        proxy: EffectiveProxy::Direct,
     };
     let llm = OpenAiClient::new(&cfg).unwrap();
     let mut session = Session::new(

@@ -51,17 +51,34 @@ struct Cli {
     #[arg(long, value_name = "N")]
     max_turns: Option<usize>,
 
+    /// 网络代理(如 http://127.0.0.1:7897):模型请求、网页抓取、更新下载统一走它。
+    /// 当次生效、不写盘;覆盖配置文件与 ZNAIDE_PROXY
+    #[arg(long, value_name = "URL")]
+    proxy: Option<String>,
+
+    /// 强制直连:无视配置文件与环境变量里的代理(排查用)。当次生效、不写盘;
+    /// 与 --proxy 同时传时以本项为准
+    #[arg(long)]
+    no_proxy: bool,
+
     /// 检查并安装 GitHub 最新版本(见 --version 查看当前版本)
     #[arg(long)]
     update: bool,
 }
 
-/// 执行更新(--update):探测最新版 → 下载 → 自检 → 安装
-async fn run_update() -> anyhow::Result<()> {
+/// 执行更新(--update):探测最新版 → 下载 → 自检 → 安装。
+/// 代理现算(配置文件 + 专用环境变量 + 本次命令行),没有会话快照可用。
+async fn run_update(proxy_ov: &znaide_core::config::ProxyOverride) -> anyhow::Result<()> {
     use znaide_core::update::UpdateResult;
     let cur = znaide_core::update::current_version();
     println!("当前版本: v{cur}");
-    let r = znaide_core::update::perform_update().await;
+    // 这里读配置只为拿代理:读坏了也不能拦着更新(更新本身可能就是来救场的)
+    let cfg = Config::load().unwrap_or_default();
+    let (proxy, notes) = cfg.resolve_proxy(proxy_ov);
+    for n in &notes {
+        eprintln!("⚠ {n}");
+    }
+    let r = znaide_core::update::perform_update(&proxy).await;
     let msg = r.describe(&cur);
     // 失败进 stderr(脚本里能分辨),成功/无更新走 stdout
     match r {
@@ -76,10 +93,15 @@ async fn run_update() -> anyhow::Result<()> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    // 代理覆盖:命令行那层,当次生效、不写盘
+    let proxy_ov = znaide_core::config::ProxyOverride {
+        url: cli.proxy.clone(),
+        no_proxy: cli.no_proxy,
+    };
 
     // --update 与其它参数独立:不需要任何配置/会话
     if cli.update {
-        return run_update().await;
+        return run_update(&proxy_ov).await;
     }
 
     let mode = Mode::parse(&cli.permission)?;
@@ -106,12 +128,20 @@ async fn main() -> anyhow::Result<()> {
     }
     // 全局人格(空 = 不注入),随配置持久
     let persona = cfg.persona.clone().unwrap_or_default();
-    let resolved = cfg.resolve(
+    // 代理:配置文件 → 专用环境变量 → 本次命令行(命令行那层最高);有话说就提示
+    let (proxy, proxy_notes) = cfg.resolve_proxy(&proxy_ov);
+    for n in &proxy_notes {
+        eprintln!("⚠ {n}");
+    }
+    let mut resolved = cfg.resolve(
         cli.model.clone(),
         cli.base_url.clone(),
         cli.api_key.clone(),
         cli.provider.clone(),
     );
+    if let Ok(r) = resolved.as_mut() {
+        r.proxy = proxy.clone();
+    }
     let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
     if !cwd.is_dir() {
         anyhow::bail!("工作目录不存在: {}", cwd.display());
@@ -142,6 +172,7 @@ async fn main() -> anyhow::Result<()> {
                     api_key: None,
                     provider_name: "ollama".into(),
                     context_window: None,
+                    proxy: proxy.clone(),
                 }
             });
             // --resume:按 ID/文件名片段定位历史文件,启动即恢复
@@ -311,7 +342,12 @@ async fn run_headless(
     let result = session
         .run_turn(prompt)
         .await
-        .map_err(|e| anyhow::anyhow!("{}", znaide_core::session::describe_request_error(&e)))?;
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "{}",
+                znaide_core::session::describe_request_error(&e, Some(&resolved.proxy))
+            )
+        })?;
 
     println!("\n{}", result.text);
     if result.tool_calls > 0 || result.input_tokens > 0 || result.output_tokens > 0 {

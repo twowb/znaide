@@ -247,6 +247,9 @@ impl SetupWizard {
             },
             // 面板里填的固定窗口(空 = 交给内置表/未知);验证不需要它,但保存要
             context_window: self.context_window,
+            // 代理不归这个面板管(这一轮没有代理入口):调用方按"当前生效代理"覆盖,
+            // 这里给 Default(auto)只是占位
+            proxy: Default::default(),
         }
     }
 
@@ -997,6 +1000,7 @@ mod tests {
             persona: None,
             build_tag: None,
             providers: Default::default(),
+            proxy: Default::default(),
         };
         w.apply_config(&cfg);
         assert_eq!(w.provider, "deepseek");
@@ -1041,6 +1045,7 @@ mod tests {
             persona: None,
             build_tag: None,
             providers,
+            proxy: Default::default(),
         };
         let mut w = SetupWizard::new();
         w.apply_config(&cfg);

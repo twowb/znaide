@@ -385,7 +385,14 @@ pub async fn run(
                         *shared_cancel_agent.lock().unwrap() = None;
                     }
                     Some(AgentCmd::Reconfigure(r)) => {
-                        session.reconfigure(&r);
+                        // 代理不跟着模型重配走:界面这一轮不提供代理入口,拿当前生效那份
+                        // 顶上,免得一次 /config 就把 --proxy 或配置文件里的代理冲掉。
+                        // (将来 GUI 在设置页给出代理入口时,这里改成用 r.proxy)
+                        let mut r = r;
+                        r.proxy = session.proxy().clone();
+                        if let Err(e) = session.reconfigure(&r) {
+                            session.notify(format!("⚠ 重配失败(仍用原连接):{e}"));
+                        }
                         // 轮数上限也跟着重读(/config 改了 max_turns 立即生效;
                         // 命令行给了 --max-turns 的话仍然它优先)。
                         // 状态栏的 round_limit 由宿主在保存配置处同步(这里在 agent 任务里,拿不到 UI 变量)
@@ -521,9 +528,11 @@ pub async fn run(
     // 任一源连通即用(Gitee 优先,国内直连无需代理)。
     {
         let update_tx = update_tx.clone();
+        // 代理取启动时那份生效配置(更新检查也是网络出口之一,别绕过统一出口)
+        let proxy = current_resolved.proxy.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            let Ok(client) = znaide_core::update::http_client() else { return };
+            let Ok(client) = znaide_core::update::http_client(&proxy) else { return };
             let Ok((src, latest)) = znaide_core::update::probe_latest(&client).await else {
                 return;
             };
@@ -961,19 +970,27 @@ pub async fn run(
                         ));
                     }
                     WizardAction::FetchModels { base_url, api_key } => {
-                        // 保留向导(Querying 状态),后台查询模型
+                        // 保留向导(Querying 状态),后台查询模型。
+                        // 探测走当前生效代理,否则会出现"这里验证通过、实际连不上"
                         config_wizard = Some(wizard);
                         let tx = wiz_tx.clone();
+                        let proxy = current_resolved.proxy.clone();
                         tokio::spawn(async move {
-                            let r =
-                                znaide_core::llm::openai::probe_models(&base_url, api_key.as_deref()).await;
+                            let r = znaide_core::llm::openai::probe_models(
+                                &base_url,
+                                api_key.as_deref(),
+                                &proxy,
+                            )
+                            .await;
                             let _ = tx.send(WizardReply::Models(r.map_err(|e| format!("{e:#}"))));
                         });
                     }
                     WizardAction::Verify(draft) => {
                         config_wizard = Some(wizard);
                         let tx = wiz_tx.clone();
-                        let probe = draft.clone();
+                        let mut probe = draft.clone();
+                        // 同上:验证用当前生效代理(界面这一轮不提供代理入口)
+                        probe.proxy = current_resolved.proxy.clone();
                         tokio::spawn(async move {
                             let r = znaide_core::llm::openai::probe_chat(&probe).await;
                             let _ = tx.send(WizardReply::Verify(r.map_err(|e| format!("{e:#}"))));
@@ -1053,6 +1070,7 @@ pub async fn run(
                             &mut items,
                             &cwd,
                             &mut confirm,
+                            &current_resolved.proxy,
                         ) {
                             Some(SlashOutcome::Task(prompt)) => {
                                 if !configured_ok {
@@ -1461,6 +1479,8 @@ fn handle_command(
     items: &mut Vec<MsgItem>,
     cwd: &Path,
     confirm: &mut Option<ConfirmBox>,
+    // 当前生效代理(/update 也走统一出口)
+    proxy: &znaide_core::config::EffectiveProxy,
 ) -> Option<SlashOutcome> {
     let parts: Vec<&str> = cmd.split_whitespace().collect();
     let name = parts.first().copied().unwrap_or("");
@@ -1597,9 +1617,10 @@ fn handle_command(
                 "正在检查更新…(Gitee 优先,不通自动切 GitHub)".into(),
             ));
             let tx = update_tx.clone();
+            let proxy = proxy.clone();
             tokio::spawn(async move {
                 let cur = znaide_core::update::current_version();
-                let msg = znaide_core::update::perform_update().await.describe(&cur);
+                let msg = znaide_core::update::perform_update(&proxy).await.describe(&cur);
                 let _ = tx.send(msg);
             });
         }
@@ -3776,7 +3797,13 @@ mod slash_tests {
         let mut confirm: Option<ConfirmBox> = None;
         let cwd = std::env::temp_dir();
         let r = handle_command(
-            "/clear", &cmd_tx, &update_tx, &mut items, &cwd, &mut confirm,
+            "/clear",
+            &cmd_tx,
+            &update_tx,
+            &mut items,
+            &cwd,
+            &mut confirm,
+            &znaide_core::config::EffectiveProxy::Direct,
         );
         assert!(r.is_none());
         // 展示未被直接清空,而是挂起一个确认

@@ -14,6 +14,7 @@
 //!   批处理,由 cmd 脱离进程执行(轮询等到 exe 解锁再换)。
 //! - 无签名体系:安装前会运行下载产物并核对 `--version` 输出,防下载损坏。
 
+use crate::config::EffectiveProxy;
 use std::path::{Path, PathBuf};
 
 /// GitHub 发布仓库
@@ -161,31 +162,16 @@ pub fn version_gt(a: &str, b: &str) -> bool {
     false
 }
 
-/// 组装发布下载用 HTTP 客户端(尊重代理环境变量)
-pub fn http_client() -> anyhow::Result<reqwest::Client> {
-    let mut b = reqwest::Client::builder()
+/// 组装发布下载用 HTTP 客户端。代理走 `net` 的唯一出口:`auto` 交给 reqwest 读
+/// 标准环境变量(旧行为)、`direct` 一律直连、`manual` 走指定代理并尊重 `NO_PROXY`。
+/// (以前这里自己手写了一段 env 探测,且地址解析失败时静默跳过 —— 那等于"代理配错了
+///  就悄悄直连",最难排查的一种。)
+pub fn http_client(proxy: &EffectiveProxy) -> anyhow::Result<reqwest::Client> {
+    Ok(crate::net::client_builder(proxy)?
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(240))
-        .user_agent(concat!("znaide-updater/", env!("CARGO_PKG_VERSION")));
-    for var in [
-        "HTTPS_PROXY",
-        "https_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-        "HTTP_PROXY",
-        "http_proxy",
-    ] {
-        if let Ok(v) = std::env::var(var) {
-            let v = v.trim().to_string();
-            if !v.is_empty() {
-                if let Ok(p) = reqwest::Proxy::all(&v) {
-                    b = b.proxy(p);
-                }
-                break;
-            }
-        }
-    }
-    Ok(b.build()?)
+        .user_agent(concat!("znaide-updater/", env!("CARGO_PKG_VERSION")))
+        .build()?)
 }
 
 /// 依次探测各源,返回**第一个连通源**的最新版本。
@@ -349,9 +335,9 @@ impl UpdateResult {
 ///   有新版就从该源下载,下载失败自动尝试其它源(同版本资产)。
 /// - 全部源探测失败 → CheckFailed,按源列出原因(GitHub 失败附 HTTPS_PROXY 提示)。
 /// 不发网络请求的前提错误(代理构造失败)也并入 CheckFailed。
-pub async fn perform_update() -> UpdateResult {
+pub async fn perform_update(proxy: &EffectiveProxy) -> UpdateResult {
     let cur = current_version();
-    let client = match http_client() {
+    let client = match http_client(proxy) {
         Ok(c) => c,
         Err(e) => return UpdateResult::CheckFailed(format!("客户端构造失败: {e:#}")),
     };

@@ -39,6 +39,11 @@ pub struct Config {
     /// 配置格式版本(内部键):保存时缺失自动补齐,供将来迁移判断。
     #[serde(default)]
     pub build_tag: Option<String>,
+    /// 网络代理(顶层:代理是**网络环境**属性,不随服务商走)。
+    /// 缺省 = `auto`(跟随环境变量);`skip_serializing_if` 保证"没配代理的人"
+    /// 的 config.json 不会平白多出这个键。
+    #[serde(skip_serializing_if = "ProxyConfig::is_default")]
+    pub proxy: ProxyConfig,
 }
 
 /// 当前配置格式版本(写入 config.json 的 build_tag)。
@@ -62,6 +67,169 @@ pub struct ProviderDef {
     pub context_window: Option<usize>,
 }
 
+/// 网络代理档位(顶层配置,不随服务商走)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProxyMode {
+    /// 跟随环境变量(HTTPS_PROXY/ALL_PROXY/HTTP_PROXY + NO_PROXY)= 默认,与旧行为一致
+    #[default]
+    Auto,
+    /// 强制直连:环境变量与配置里的 URL 一起无视(排查/内网)
+    Direct,
+    /// 手动:所有请求走这个代理(仍尊重 NO_PROXY 豁免)
+    Manual,
+}
+
+impl ProxyMode {
+    /// 读配置/命令行用;认不出的返回 None(调用方回落 auto 并提示一次)
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" | "" => Some(Self::Auto),
+            "direct" | "off" | "none" => Some(Self::Direct),
+            "manual" => Some(Self::Manual),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Direct => "direct",
+            Self::Manual => "manual",
+        }
+    }
+
+    /// 中文标签(展示用)
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Auto => "跟随环境变量",
+            Self::Direct => "强制直连",
+            Self::Manual => "手动代理",
+        }
+    }
+}
+
+/// 解析好的代理快照:随 `Resolved` 走全链路,HTTP 客户端只认它。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum EffectiveProxy {
+    /// 跟随环境变量(reqwest 默认行为,= 旧版行为)
+    #[default]
+    Auto,
+    /// 强制直连
+    Direct,
+    /// 手动代理(已校验的 http/https 地址)
+    Manual(String),
+}
+
+impl EffectiveProxy {
+    pub fn url(&self) -> Option<&str> {
+        match self {
+            Self::Manual(u) => Some(u),
+            _ => None,
+        }
+    }
+}
+
+/// 命令行的代理覆盖(`--proxy` / `--no-proxy`):当次生效,不写盘
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProxyOverride {
+    pub url: Option<String>,
+    pub no_proxy: bool,
+}
+
+/// 顶层 `proxy` 配置项
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProxyConfig {
+    pub mode: ProxyMode,
+    /// 手动档的代理地址(http/https)
+    pub url: Option<String>,
+    /// 读盘时发现写法有问题(档位不认识 / 手动档地址非法)就在这里留一句,供宿主提示
+    /// 一次 —— 不提示的话会悄悄按 auto 走,人却以为代理生效了。**不写盘**。
+    pub warning: Option<String>,
+}
+
+impl ProxyConfig {
+    /// 没设过代理(`skip_serializing_if` 用):让"没配代理的人"的 config.json 保持干净
+    pub fn is_default(&self) -> bool {
+        self.mode == ProxyMode::Auto && self.url.is_none()
+    }
+}
+
+impl<'de> Deserialize<'de> for ProxyConfig {
+    /// 手写反序列化:档位写错、手动档没给地址,都**回落 auto 并留一句提示**,
+    /// 而不是让一个拼写错误把整份配置读成 Err(那会连带触发"拒绝保存",更难救)。
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            mode: Option<String>,
+            url: Option<String>,
+        }
+        let raw = Raw::deserialize(d)?;
+        let url = raw
+            .url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let mut out = ProxyConfig::default();
+        match raw.mode.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            // 没写档位:给了合法 url 就当手动,否则跟随环境
+            None => match url {
+                Some(u) if crate::net::valid_proxy_url(&u) => {
+                    out.mode = ProxyMode::Manual;
+                    out.url = Some(u);
+                }
+                Some(u) => {
+                    out.warning = Some(format!(
+                        "proxy.url 不是合法的 http/https 地址,已按 auto(跟随环境变量)处理:{u}"
+                    ))
+                }
+                None => {}
+            },
+            Some(m) => match ProxyMode::parse(m) {
+                Some(ProxyMode::Manual) => match url {
+                    Some(u) if crate::net::valid_proxy_url(&u) => {
+                        out.mode = ProxyMode::Manual;
+                        out.url = Some(u);
+                    }
+                    Some(u) => {
+                        out.warning = Some(format!(
+                            "proxy.mode = \"manual\" 但 url 不是合法的 http/https 地址,已按 auto 处理:{u}"
+                        ))
+                    }
+                    None => {
+                        out.warning =
+                            Some("proxy.mode = \"manual\" 但没写 url,已按 auto(跟随环境变量)处理".into())
+                    }
+                },
+                Some(m) => {
+                    out.mode = m;
+                    out.url = url;
+                }
+                None => {
+                    out.warning = Some(format!(
+                        "proxy.mode 不认识:{m}(应为 auto/direct/manual),已按 auto 处理"
+                    ))
+                }
+            },
+        }
+        Ok(out)
+    }
+}
+
+impl Serialize for ProxyConfig {
+    /// 只写 `mode`(手动档再写 `url`);`warning` 绝不写盘。
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let with_url = self.mode == ProxyMode::Manual && self.url.is_some();
+        let mut st = s.serialize_struct("ProxyConfig", if with_url { 2 } else { 1 })?;
+        st.serialize_field("mode", self.mode.as_str())?;
+        if with_url {
+            st.serialize_field("url", self.url.as_deref().unwrap_or_default())?;
+        }
+        st.end()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Resolved {
     pub model: String,
@@ -71,6 +239,9 @@ pub struct Resolved {
     pub provider_name: String,
     /// 上下文窗口(None = 查内置表)
     pub context_window: Option<usize>,
+    /// 生效的网络代理(三处 HTTP 出口共用这一个快照;命令行 `--proxy`/`--no-proxy`
+    /// 由宿主用 [`Config::resolve_proxy`] 叠上)
+    pub proxy: EffectiveProxy,
 }
 
 /// 模型窗口内置表(没配 context_window 时按名字匹配)。
@@ -298,7 +469,77 @@ impl Config {
             provider_name,
             // 窗口按 provider 走(各服务商各配各的);顶层那个是历史遗留兜底
             context_window: pdef.context_window.or(self.context_window),
+            // 代理:先按"配置文件 + 专用环境变量"落定;CLI 覆盖由宿主调
+            // `resolve_proxy` 再叠一层(命令行当次生效,不该被写进这里持久化)
+            proxy: self.resolve_proxy(&ProxyOverride::default()).0,
         })
+    }
+
+    /// 算出生效代理。优先级(高 → 低):
+    ///
+    /// ① CLI `--proxy` / `--no-proxy`
+    /// ② 专用环境变量 `ZNAIDE_PROXY` / `ZNAIDE_NO_PROXY`
+    /// ③ 配置文件 `proxy.mode`
+    /// ④ 兜底:标准 `HTTPS_PROXY`/`ALL_PROXY`/`HTTP_PROXY` —— **只有 `auto` 档才读**
+    ///
+    /// ③ 压过 ④ 是有意的:文件里显式写了 direct/manual,就不该被 shell 里飘着的
+    /// `HTTPS_PROXY` 盖掉 —— 否则"我明明配了直连排查,怎么还在走代理"没法查
+    /// (那个坑的另一种形态是:按文档以为 env 生效,实际被文件里的 off 静默直连)。
+    ///
+    /// 返回 (生效代理, 要提示给用户的话)。
+    pub fn resolve_proxy(&self, ov: &ProxyOverride) -> (EffectiveProxy, Vec<String>) {
+        let mut notes: Vec<String> = Vec::new();
+        if let Some(w) = &self.proxy.warning {
+            notes.push(w.clone());
+        }
+        // ① CLI
+        if ov.no_proxy {
+            return (EffectiveProxy::Direct, notes);
+        }
+        if let Some(raw) = ov.url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if crate::net::valid_proxy_url(raw) {
+                return (EffectiveProxy::Manual(raw.to_string()), notes);
+            }
+            notes.push(format!(
+                "--proxy 不是合法的 http/https 地址,已忽略:{raw}(要写成 http://主机:端口)"
+            ));
+        }
+        // ② 专用环境变量(ZNAIDE_NO_PROXY 认 1/true/yes;0/false/空 = 没设)
+        if env_first(&["ZNAIDE_NO_PROXY"])
+            .map(|v| {
+                !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "" | "0" | "false" | "no"
+                )
+            })
+            .unwrap_or(false)
+        {
+            return (EffectiveProxy::Direct, notes);
+        }
+        if let Some(raw) = env_first(&["ZNAIDE_PROXY"]).filter(|v| !v.trim().is_empty()) {
+            if crate::net::valid_proxy_url(&raw) {
+                return (EffectiveProxy::Manual(raw), notes);
+            }
+            notes.push(format!(
+                "ZNAIDE_PROXY 不是合法的 http/https 地址,已忽略:{raw}"
+            ));
+        }
+        // ③ 配置文件
+        match self.proxy.mode {
+            ProxyMode::Direct => (EffectiveProxy::Direct, notes),
+            ProxyMode::Manual => match self
+                .proxy
+                .url
+                .as_deref()
+                .filter(|u| crate::net::valid_proxy_url(u))
+            {
+                Some(u) => (EffectiveProxy::Manual(u.to_string()), notes),
+                // 读盘时已校验并留了提示,这里只兜底
+                None => (EffectiveProxy::Auto, notes),
+            },
+            // ④ 交给 reqwest 读标准环境变量
+            ProxyMode::Auto => (EffectiveProxy::Auto, notes),
+        }
     }
 
 }
@@ -540,6 +781,7 @@ mod tests {
             persona: None,
             build_tag: None,
             providers: Default::default(),
+            proxy: Default::default(),
         };
         let r = cfg
             .resolve(Some("cli-model".into()), None, None, None)
@@ -582,6 +824,7 @@ mod tests {
             persona: None,
             build_tag: None,
             providers,
+            proxy: Default::default(),
         };
         let r = cfg.resolve(None, None, None, None).unwrap();
         assert_eq!(r.base_url, "http://127.0.0.1:8080/v1");
@@ -984,5 +1227,178 @@ mod tests {
 
         std::env::remove_var("ZNAIDE_DATA_DIR");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- 代理:优先级矩阵 ----
+    // 这些用例会动 ZNAIDE_* / HTTPS_PROXY 环境变量,自己串行一把(同一二进制内并行)
+    static PROXY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn clear_proxy_env() {
+        for v in [
+            "ZNAIDE_PROXY",
+            "ZNAIDE_NO_PROXY",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+        ] {
+            std::env::remove_var(v);
+        }
+    }
+
+    /// 优先级:命令行 > ZNAIDE_PROXY > 配置文件(mode) > 标准 env(交给 reqwest)
+    #[test]
+    fn proxy_priority_cli_then_dedicated_env_then_config() {
+        let _g = PROXY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_proxy_env();
+
+        let mut cfg = Config::default();
+        cfg.proxy = ProxyConfig {
+            mode: ProxyMode::Manual,
+            url: Some("http://cfg:1".into()),
+            warning: None,
+        };
+        // ① 只有配置文件
+        let (p, notes) = cfg.resolve_proxy(&ProxyOverride::default());
+        assert_eq!(p, EffectiveProxy::Manual("http://cfg:1".into()));
+        assert!(notes.is_empty(), "正常配置不该有提示:{notes:?}");
+
+        // ② 专用环境变量压过配置文件
+        std::env::set_var("ZNAIDE_PROXY", "http://env:2");
+        let (p, _) = cfg.resolve_proxy(&ProxyOverride::default());
+        assert_eq!(p, EffectiveProxy::Manual("http://env:2".into()));
+
+        // ③ 命令行压过专用环境变量
+        let (p, _) = cfg.resolve_proxy(&ProxyOverride {
+            url: Some("http://cli:3".into()),
+            no_proxy: false,
+        });
+        assert_eq!(p, EffectiveProxy::Manual("http://cli:3".into()));
+
+        // ④ --no-proxy 最高,无视其余一切
+        let (p, _) = cfg.resolve_proxy(&ProxyOverride {
+            url: Some("http://cli:3".into()),
+            no_proxy: true,
+        });
+        assert_eq!(p, EffectiveProxy::Direct);
+
+        // ⑤ ZNAIDE_NO_PROXY 也算"专用 env",压过配置文件
+        let (p, _) = cfg.resolve_proxy(&ProxyOverride::default());
+        assert_eq!(p, EffectiveProxy::Manual("http://env:2".into()));
+        std::env::remove_var("ZNAIDE_PROXY");
+        std::env::set_var("ZNAIDE_NO_PROXY", "1");
+        let (p, _) = cfg.resolve_proxy(&ProxyOverride::default());
+        assert_eq!(p, EffectiveProxy::Direct);
+
+        clear_proxy_env();
+    }
+
+    /// 配置文件里的 direct/manual **压过标准环境变量**(有意为之):
+    /// shell 里飘着的 HTTPS_PROXY 不该盖住配置文件里显式写的选择,
+    /// 否则"我配了直连排查,怎么还在走代理"没法查。
+    #[test]
+    fn proxy_config_beats_standard_env() {
+        let _g = PROXY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_proxy_env();
+        std::env::set_var("HTTPS_PROXY", "http://shell-proxy:7897");
+
+        let mut cfg = Config::default();
+        assert_eq!(
+            cfg.resolve_proxy(&ProxyOverride::default()).0,
+            EffectiveProxy::Auto,
+            "auto 档才交给标准环境变量兜底"
+        );
+
+        cfg.proxy = ProxyConfig {
+            mode: ProxyMode::Direct,
+            url: None,
+            warning: None,
+        };
+        assert_eq!(
+            cfg.resolve_proxy(&ProxyOverride::default()).0,
+            EffectiveProxy::Direct,
+            "配置文件说直连,就必须直连"
+        );
+
+        clear_proxy_env();
+    }
+
+    /// 档位写错 / 手动档没给地址:回落 auto,并留一句提示(不静默、也不让整份配置读失败)
+    #[test]
+    fn proxy_bad_writes_fall_back_to_auto_with_warning() {
+        let bad_mode: Config = serde_json::from_str(r#"{"proxy":{"mode":"manualy"}}"#).unwrap();
+        assert_eq!(bad_mode.proxy.mode, ProxyMode::Auto);
+        assert!(bad_mode
+            .proxy
+            .warning
+            .as_deref()
+            .unwrap_or_default()
+            .contains("不认识"));
+
+        let no_url: Config = serde_json::from_str(r#"{"proxy":{"mode":"manual"}}"#).unwrap();
+        assert_eq!(no_url.proxy.mode, ProxyMode::Auto);
+        assert!(no_url.proxy.warning.is_some());
+
+        let bad_url: Config =
+            serde_json::from_str(r#"{"proxy":{"mode":"manual","url":"socks5://x:1"}}"#).unwrap();
+        assert_eq!(bad_url.proxy.mode, ProxyMode::Auto);
+        assert!(bad_url.proxy.warning.is_some());
+
+        // 没写档位但给了合法 url → 当手动(手写配置时的便利)
+        let url_only: Config =
+            serde_json::from_str(r#"{"proxy":{"url":"http://127.0.0.1:7897"}}"#).unwrap();
+        assert_eq!(url_only.proxy.mode, ProxyMode::Manual);
+        assert_eq!(url_only.proxy.url.as_deref(), Some("http://127.0.0.1:7897"));
+
+        // 提示要能带到 resolve 的返回值里(宿主负责说给用户)
+        let (_, notes) = no_url.resolve_proxy(&ProxyOverride::default());
+        assert_eq!(notes.len(), 1, "配置里的问题要提示一次:{notes:?}");
+    }
+
+    /// 非法命令行/环境变量地址:警告 + 当没给(继续按下面几档走),不是整条链死掉
+    #[test]
+    fn proxy_invalid_values_are_ignored_with_note() {
+        let _g = PROXY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_proxy_env();
+
+        let cfg = Config::default();
+        let (p, notes) = cfg.resolve_proxy(&ProxyOverride {
+            url: Some("7897".into()),
+            no_proxy: false,
+        });
+        assert_eq!(p, EffectiveProxy::Auto, "非法地址当没给,继续往下兜底");
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("--proxy"), "{}", notes[0]);
+
+        std::env::set_var("ZNAIDE_PROXY", "http://127.0.0.1:7897");
+        let (p, notes) = cfg.resolve_proxy(&ProxyOverride::default());
+        assert_eq!(p, EffectiveProxy::Manual("http://127.0.0.1:7897".into()));
+        assert!(notes.is_empty());
+
+        clear_proxy_env();
+    }
+
+    /// 没配代理的人:config.json 不该平白多出 proxy 键;配了就正常往返
+    #[test]
+    fn proxy_key_is_skipped_when_default() {
+        let plain = serde_json::to_string(&Config::default()).unwrap();
+        assert!(!plain.contains("proxy"), "默认配置不该写 proxy:{plain}");
+
+        let mut cfg = Config::default();
+        cfg.proxy = ProxyConfig {
+            mode: ProxyMode::Manual,
+            url: Some("http://127.0.0.1:7897".into()),
+            warning: Some("不该写盘".into()),
+        };
+        let text = serde_json::to_string(&cfg).unwrap();
+        assert!(text.contains("\"manual\""), "{text}");
+        assert!(text.contains("127.0.0.1:7897"), "{text}");
+        assert!(!text.contains("不该写盘"), "warning 不该落盘:{text}");
+
+        let back: Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.proxy.mode, ProxyMode::Manual);
+        assert_eq!(back.proxy.url.as_deref(), Some("http://127.0.0.1:7897"));
     }
 }
