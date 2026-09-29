@@ -198,6 +198,13 @@ znaide -p "你好" --model qwen3:8b --base-url http://localhost:11434/v1
 
 # 大任务跑更久(默认单条消息最多 200 轮模型往返;0 = 不限)
 znaide -p "把整个仓库的 TODO 过一遍" --permission bypassPermissions --max-turns 0
+
+# 本次运行走代理 / 强制直连(当次生效,不改配置文件;模型、抓网页、更新都走它)
+znaide -p "查一下资料" --proxy http://127.0.0.1:7897
+znaide -p "排查连接问题" --no-proxy
+
+# 弱网重试:空回复 / 限流 / 5xx / 断连时自动重发同样的请求(默认关)
+znaide -p "高峰期跑个任务" --retry 3
 ```
 
 ## 配置
@@ -235,6 +242,8 @@ znaide -p "把整个仓库的 TODO 过一遍" --permission bypassPermissions --m
 - 顶层 `model` / `base_url` / `api_key`(可选):**手动临时覆盖**,优先级高于预设;**面板保存不会写这里**。老配置里已有的顶层值会在启动时**自动搬进当前 provider 条目并清空顶层**(一次性自愈迁移),之后切换 `provider` 才真正生效
 - `context_window`(可选):该项**建议写在 provider 条目里**(各服务商各配各的);顶层那个是历史遗留兜底。不设置时按模型名匹配内置表(2026-09 检索:qwen3→40k、qwen-plus / qwen3.x-max→1M、deepseek-v4 / deepseek-flash→1M、gpt-5→400k、claude→200k 等);**表里认不出来就按"未知"处理**——状态栏只报绝对量(`ctx ~21.4k 窗口未知`),不给百分比、也不提示 /compact,不拿默认值假装知道(模型 ID 迭代很快,猜小了会把百万级模型算成快满了,劝你做没必要的压缩)。要百分比就把窗口填准(面板第 4 步或这个字段);本地模型(ollama)请与运行时的 `num_ctx` 保持一致
 - `max_turns`(可选):**单条消息**最多允许的模型往返轮数(一轮可含多次工具调用),默认 200;**0 = 不限**。用完不再静默停——交互模式弹"继续执行"确认框,无头模式说明已达几轮与怎么调大;另有"同一调用重复 3 次提醒、6 次判原地打转中止"的刹车
+- `proxy`(可选):网络代理,**三档** —— 不写 / `{"mode":"auto"}` = 跟随环境变量(`HTTPS_PROXY` 等,与旧版一致);`{"mode":"direct"}` = 强制直连;`{"mode":"manual","url":"http://127.0.0.1:7897"}` = 所有请求走它。模型请求、网页抓取、更新下载三处**统一走这一份**;优先级:**命令行 `--proxy`/`--no-proxy` > `ZNAIDE_PROXY`/`ZNAIDE_NO_PROXY` > 配置文件 > 标准环境变量**(标准环境变量只在 auto 档生效);手动档仍尊重 `NO_PROXY`,所以"国内服务商直连 + 国外走代理"配上 `NO_PROXY` 即可
+- `retry`(可选):弱网重试的**追加尝试次数**(0..=8,**默认关**)。只重试**一次模型调用**——不会重复执行工具,不占轮数预算,失败那次的输出不写历史也不计 token;空回复 / 429 / 5xx / 连接中断按 800ms 起指数退避重发,退避期间按 Esc 可中断。命令行 `--retry N` / `--no-retry` 优先于它
 
 API Key 也可以完全不进配置文件,用环境变量提供:`DASHSCOPE_API_KEY`、`DEEPSEEK_API_KEY`、`ZAI_API_KEY`、`OPENROUTER_API_KEY` 等,向导会自动读取。
 
@@ -248,6 +257,7 @@ API Key 也可以完全不进配置文件,用环境变量提供:`DASHSCOPE_API_K
 | `ZNAIDE_MODEL` / `OPENAI_MODEL` | 模型名 |
 | `ZNAIDE_BASE_URL` / `OPENAI_BASE_URL` | OpenAI 兼容端点 |
 | `ZNAIDE_API_KEY` / `OPENAI_API_KEY` | API Key |
+| `ZNAIDE_PROXY` / `ZNAIDE_NO_PROXY` | 代理(优先于配置文件里的 `proxy`;`ZNAIDE_NO_PROXY=1` 强制直连) |
 | `ZNAIDE_DATA_DIR` | 覆盖数据目录(默认 `~/.znaide`,测试/多实例用) |
 
 ### 数据目录结构 `~/.znaide/`

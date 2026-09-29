@@ -168,6 +168,13 @@ znaide -p "hi" --model qwen3:8b --base-url http://localhost:11434/v1
 
 # let a big task run longer (default cap: 200 model round trips per message; 0 = unlimited)
 znaide -p "go through every TODO in the repo" --permission bypassPermissions --max-turns 0
+
+# use a proxy / force a direct connection for this run (models, web fetch and updates all obey it)
+znaide -p "look something up" --proxy http://127.0.0.1:7897
+znaide -p "debug connectivity" --no-proxy
+
+# weak-network retry: resend the same model call on an empty reply / 429 / 5xx / dropped connection
+znaide -p "run this at peak hours" --retry 3
 ```
 
 ## Configuration
@@ -199,6 +206,8 @@ znaide -p "go through every TODO in the repo" --permission bypassPermissions --m
 - top-level `model` / `base_url` / `api_key` (optional): a **manual temporary override**, higher priority than the preset; **the setup panel never writes these**. Existing top-level values in an old config are **migrated into the active provider entry and cleared on startup** (one-off self-healing), after which switching `provider` really takes effect
 - `context_window` (optional): best set **per provider entry**; the top-level one is a legacy fallback. When unset, an internal table matches the model name (2026-09 data: qwen3→40k, qwen-plus / qwen3.x-max→1M, deepseek-v4 / deepseek-flash→1M, gpt-5→400k, claude→200k…). **If the table can't recognize the model it reports "unknown"** — the status bar then shows only the real absolute count (`ctx ~21.4k 窗口未知`), with no percentage and no /compact hint, instead of pretending a default; for ollama keep it in sync with `num_ctx`
 - `max_turns` (optional): max model round trips **per message** (one round may carry several tool calls); default 200, **0 = unlimited**. When the budget runs out it no longer stops silently — interactive mode asks "continue?" and headless mode reports the round count and how to raise it; a repeated identical call is warned at 3 and aborted as "going in circles" at 6
+- `proxy` (optional): network proxy in three modes — omitted / `{"mode":"auto"}` follows the environment (`HTTPS_PROXY` etc., the previous behaviour); `{"mode":"direct"}` forces a direct connection; `{"mode":"manual","url":"http://127.0.0.1:7897"}` sends everything through it. Model requests, web fetch and update downloads all share this single egress; precedence: **CLI `--proxy`/`--no-proxy` > `ZNAIDE_PROXY`/`ZNAIDE_NO_PROXY` > config file > standard env vars**, and those env vars only apply in `auto` mode. `manual` still honours `NO_PROXY`, so "domestic providers direct, GitHub through the proxy" is just a `NO_PROXY` list
+- `retry` (optional): extra attempts for a **single model call** (0..=8, **off by default**). It never re-runs tools, spends no round budget, and a failed attempt is neither recorded nor billed. Empty replies / 429 / 5xx / dropped connections are retried with exponential backoff from 800ms (capped at 8s), and Esc still interrupts during the wait. CLI `--retry N` / `--no-retry` wins over it
 
 Keys can live purely in environment variables: `DASHSCOPE_API_KEY`, `DEEPSEEK_API_KEY`, `ZAI_API_KEY`, `OPENROUTER_API_KEY`, etc.
 
@@ -212,6 +221,7 @@ Precedence: **CLI args > env vars > config.json > built-in presets**.
 | `ZNAIDE_MODEL` / `OPENAI_MODEL` | Model name |
 | `ZNAIDE_BASE_URL` / `OPENAI_BASE_URL` | OpenAI-compatible endpoint |
 | `ZNAIDE_API_KEY` / `OPENAI_API_KEY` | API key |
+| `ZNAIDE_PROXY` / `ZNAIDE_NO_PROXY` | Proxy (beats the config file's `proxy`; `ZNAIDE_NO_PROXY=1` forces direct) |
 | `ZNAIDE_DATA_DIR` | Override data dir (default `~/.znaide`; testing/multi-instance) |
 
 ### Data layout `~/.znaide/`
