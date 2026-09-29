@@ -1186,44 +1186,59 @@ pub async fn run(
                     if let Some(w) = &mut config_wizard {
                         match r {
                             Ok(()) => {
-                                // 验证通过 → 保存并解锁
+                                // 验证通过 → 保存并解锁。落盘前先按"写入口"读全量:
+                                // 读不懂就拒绝保存(拿默认值顶上会把用户原有配置整份清空)
                                 let draft = w.draft();
-                                let mut cfg = znaide_core::config::Config::load().unwrap_or_default();
-                                // 面板里填的轮数上限一起落盘(空 = 清除,回到默认 200)
-                                cfg.max_turns = w.max_turns;
-                                // Key 来自环境变量时不写明文(留空即保持环境变量那条路)
-                                let key_arg = if w.key_from_env {
-                                    None
-                                } else {
-                                    draft.api_key.as_deref()
-                                };
-                                let save_result = cfg.save(
-                                    &draft.provider_name,
-                                    Some(&draft.model),
-                                    Some(&draft.base_url),
-                                    key_arg,
-                                    w.context_window,
-                                );
-                                // 状态栏立即跟上新的轮数上限(命令行 --max-turns 仍优先)
-                                round_limit = effective_max_turns(max_turns);
-                                let _ = cmd_tx.send(AgentCmd::Reconfigure(draft.clone()));
-                                current_resolved = draft.clone();
-                                // 配置变了,窗口跟着刷新(状态栏 ctx 条用的就是它)
-                                ctx_window = current_resolved.effective_context_window();
-                                configured_ok = save_result.is_ok();
-                                w.inject_verify(true, format!(
-                                    " {} / {} 已保存并生效。",
-                                    draft.provider_name, draft.model
-                                ));
-                                items.push(MsgItem::Notice(match save_result {
-                                    Ok(()) => format!(
-                                        "✔ 配置完成并已生效: {} / {}。可以开始用了。",
-                                        draft.provider_name, draft.model
-                                    ),
-                                    Err(e) => format!("⚠ 配置已生效但没存上: {e}"),
-                                }));
-                                // 验证通过后自动关掉向导回到对话
-                                config_wizard = None;
+                                match znaide_core::config::Config::load_for_write() {
+                                    Err(e) => {
+                                        let msg = format!("{e}");
+                                        w.inject_verify(false, msg.clone());
+                                        items.push(MsgItem::Notice(format!("⚠ {msg}")));
+                                    }
+                                    Ok(mut cfg) => {
+                                        // 面板里填的轮数上限一起落盘(空 = 清除,回到默认 200)
+                                        cfg.max_turns = w.max_turns;
+                                        // Key 来自环境变量时不写明文(留空即保持环境变量那条路)
+                                        let key_arg = if w.key_from_env {
+                                            None
+                                        } else {
+                                            draft.api_key.as_deref()
+                                        };
+                                        match cfg.save(
+                                            &draft.provider_name,
+                                            Some(&draft.model),
+                                            Some(&draft.base_url),
+                                            key_arg,
+                                            w.context_window,
+                                        ) {
+                                            // 没存上就别声称"已保存并生效":留在向导里让他重试
+                                            Err(e) => {
+                                                let msg = format!("配置没能存上:{e}");
+                                                w.inject_verify(false, msg.clone());
+                                                items.push(MsgItem::Notice(format!("⚠ {msg}")));
+                                            }
+                                            Ok(()) => {
+                                                // 状态栏立即跟上新的轮数上限(命令行 --max-turns 仍优先)
+                                                round_limit = effective_max_turns(max_turns);
+                                                let _ = cmd_tx.send(AgentCmd::Reconfigure(draft.clone()));
+                                                current_resolved = draft.clone();
+                                                // 配置变了,窗口跟着刷新(状态栏 ctx 条用的就是它)
+                                                ctx_window = current_resolved.effective_context_window();
+                                                configured_ok = true;
+                                                w.inject_verify(true, format!(
+                                                    " {} / {} 已保存并生效。",
+                                                    draft.provider_name, draft.model
+                                                ));
+                                                items.push(MsgItem::Notice(format!(
+                                                    "✔ 配置完成并已生效: {} / {}。可以开始用了。",
+                                                    draft.provider_name, draft.model
+                                                )));
+                                                // 验证通过后自动关掉向导回到对话
+                                                config_wizard = None;
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             Err(e) => {
                                 if let Some(w) = &mut config_wizard {

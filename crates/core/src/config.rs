@@ -229,6 +229,20 @@ impl Config {
         Ok(cfg)
     }
 
+    /// 读配置**用于写入**:向导、按需改项这类"读全量 → 改一项 → 整份写回"的落盘前专用。
+    ///
+    /// 与 `load()` 的唯一区别是**绝不容错**。落盘是整份写回,所以拿默认值顶上等于把
+    /// 用户原有的 provider 条目、key、人格、轮数一起清空 —— 不可逆。宁可拒绝保存,
+    /// 让他先去修文件(或备份后重来)。
+    pub fn load_for_write() -> anyhow::Result<Self> {
+        Self::load().map_err(|e| {
+            anyhow::anyhow!(
+                "配置文件解析失败,已中止保存以免覆盖原文({}):{e}",
+                config_path().display()
+            )
+        })
+    }
+
     /// 算最终运行参数,来源优先级:CLI > 环境变量 > config > 内置预设
     pub fn resolve(
         &self,
@@ -385,13 +399,33 @@ impl Config {
     }
 
     /// 落盘(整份序列化写入)
+    ///
+    /// **原子替换**:先写同目录的临时文件并 `sync_all`,再 `rename` 覆盖目标。
+    /// 以前是 `fs::write`(先截断再写):写到一半崩溃、或另一实例此刻来读,就会看到
+    /// 半截 JSON;再叠上"读不懂就退化成默认值"那条路(见 `load_for_write`),
+    /// 一份好配置会被整份清空。临时文件名带 pid,两个实例各写各的,不会互相写花。
     fn persist(&self) -> anyhow::Result<()> {
         let path = config_path();
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let text = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, text + "\n")?;
+        let text = format!("{}\n", serde_json::to_string_pretty(self)?);
+        // 与目标同目录(rename 不跨文件系统才是原子的)
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        let write = |tmp: &std::path::Path| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut f = std::fs::File::create(tmp)?;
+            f.write_all(text.as_bytes())?;
+            f.sync_all()
+        };
+        if let Err(e) = write(&tmp) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         Ok(())
     }
 
@@ -882,5 +916,73 @@ mod tests {
             Some("sk-top"),
             "搬完生效 key 不变"
         );
+    }
+
+    /// 写入口的守卫:config.json 读不懂时必须**失败**,而不是退化成默认值。
+    /// 退化 + 整份写回 = 把用户原有 provider/key/人格清空,不可逆。
+    #[test]
+    fn load_for_write_rejects_broken_config() {
+        let _g = crate::test_util::DATA_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("znaide_cfg_guard_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("ZNAIDE_DATA_DIR", &dir);
+
+        let path = dir.join("config.json");
+        let broken = r#"{"provider": "deepseek", "providers": {"#;
+        std::fs::write(&path, broken).unwrap();
+
+        assert!(Config::load().is_err(), "读路径:损坏文件应当报错");
+        let err = Config::load_for_write().unwrap_err().to_string();
+        assert!(
+            err.contains("已中止保存"),
+            "写入口报错要说清没有落盘,实际:{err}"
+        );
+        // 守卫生效时调用方不会走到 persist —— 原文件必须一字未动
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+
+        std::env::remove_var("ZNAIDE_DATA_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 落盘走"临时文件 + rename":写完不留临时文件,目标始终可完整解析
+    #[test]
+    fn persist_leaves_no_tmp_behind() {
+        let _g = crate::test_util::DATA_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("znaide_cfg_atomic_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("ZNAIDE_DATA_DIR", &dir);
+
+        let mut cfg = Config::default();
+        cfg.save("ollama", Some("qwen3:8b"), None, None, None)
+            .unwrap();
+
+        // 目标文件完整可解析(内容以换行结尾,与旧实现一致)
+        let text = std::fs::read_to_string(dir.join("config.json")).unwrap();
+        assert!(text.ends_with('\n'));
+        assert_eq!(
+            Config::load()
+                .unwrap()
+                .providers
+                .get("ollama")
+                .and_then(|d| d.model.as_deref()),
+            Some("qwen3:8b")
+        );
+        // 临时文件已被 rename 掉,不留残渣
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "不该残留临时文件:{leftovers:?}");
+
+        std::env::remove_var("ZNAIDE_DATA_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
