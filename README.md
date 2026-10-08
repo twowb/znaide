@@ -21,7 +21,7 @@
 - **工具集**:文件读写/编辑(写前自动快照)、目录列举、glob、正则搜索、shell 命令(带超时)、网页抓取、长期记忆
 - **安全四档**:**询问** ask(默认,写文件/命令先确认)/ **编辑放行** acceptEdits(文件修改自动放行)/ **全自动** bypassPermissions / **超级** yolo(一切放行含危险命令,后果自负),`Shift+Tab` 随时循环切换;危险命令走**启发式高危判定**(按解析出的目标路径判,不是匹配原文):目标是根目录/家目录/工作目录或其上级/块设备,或目标无法判定时,交互模式弹**红色确认框**、只允许单次放行,无头模式直接拒绝;超级 yolo 跳过判定。`rm  -rf /`(多打空格)照样命中,`rm -rf /tmp/123`(具体路径)正常放行——但这是**启发式提示,不是安全边界**
 - **undo 回滚**:每次改文件前自动快照,`/undo` 一键回滚,不依赖 git
-- **长期记忆**:跨会话记住你的环境与偏好,会话启动自动注入记忆摘要
+- **长期记忆(两级)**:全局(随用户,记个人偏好/机器环境)+ 项目级(随当前仓库,记本仓库的约定/架构/待办,可提交也可 `.gitignore`);会话启动自动注入两级摘要,同名互不覆盖,删除按作用域走
 - **MCP 支持**:配置 `~/.znaide/mcp.json` 即可接入任意 MCP server 的工具
 - **会话历史**:每轮消息落盘 JSONL,`/resume` 随时恢复继续
 - **技能(Skills)**:可被模型自主调用、也可 `/技能名` 手动触发的能力包(说明书 + 可选入口脚本),三层存放随时热扩展
@@ -205,6 +205,11 @@ znaide -p "排查连接问题" --no-proxy
 
 # 弱网重试:空回复 / 限流 / 5xx / 断连时自动重发同样的请求(默认关)
 znaide -p "高峰期跑个任务" --retry 3
+
+# 给模型请求加一个自定义头(网关/计费/审计用;当次生效,不改配置文件)
+znaide -p "你好" --extra-header X-Tenant-Id=t1
+# 排查网关 4xx:这次一个预设头都不发
+znaide -p "你好" --no-extra-headers
 ```
 
 ## 配置
@@ -244,6 +249,7 @@ znaide -p "高峰期跑个任务" --retry 3
 - `max_turns`(可选):**单条消息**最多允许的模型往返轮数(一轮可含多次工具调用),默认 200;**0 = 不限**。用完不再静默停——交互模式弹"继续执行"确认框,无头模式说明已达几轮与怎么调大;另有"同一调用重复 3 次提醒、6 次判原地打转中止"的刹车
 - `proxy`(可选):网络代理,**三档** —— 不写 / `{"mode":"auto"}` = 跟随环境变量(`HTTPS_PROXY` 等,与旧版一致);`{"mode":"direct"}` = 强制直连;`{"mode":"manual","url":"http://127.0.0.1:7897"}` = 所有请求走它。模型请求、网页抓取、更新下载三处**统一走这一份**;优先级:**命令行 `--proxy`/`--no-proxy` > `ZNAIDE_PROXY`/`ZNAIDE_NO_PROXY` > 配置文件 > 标准环境变量**(标准环境变量只在 auto 档生效);手动档仍尊重 `NO_PROXY`,所以"国内服务商直连 + 国外走代理"配上 `NO_PROXY` 即可
 - `retry`(可选):弱网重试的**追加尝试次数**(0..=8,**默认关**)。只重试**一次模型调用**——不会重复执行工具,不占轮数预算,失败那次的输出不写历史也不计 token;空回复 / 429 / 5xx / 连接中断按 800ms 起指数退避重发,退避期间按 Esc 可中断。命令行 `--retry N` / `--no-retry` 优先于它
+- `extra_headers` / `extra_headers_enabled`(可选):**用户预设的 HTTP 请求头**,给"网关要自定义头才放行 / 按头计费 / 内网审计"用(如 OpenRouter 的 `HTTP-Referer`、`X-Title`,网关的 `X-Tenant-Id`)。**只作用于模型请求**——网页抓取与更新下载不带,免得把内部标识泄漏给第三方 URL。生效头 = 顶层表 ⊕ 当前 provider 表(同名 provider 覆盖;provider 里值为**空串** = 删掉顶层来的那条);`extra_headers_enabled` 是总闸,顶层或某个 provider 设 `false` 就一条都不发。值支持 `${VAR}` / `$VAR` 展开(没读到就原样发送并提示),敏感值走环境变量、不落盘明文;`Authorization` / `Host` / `Content-Type` 等保留头会被忽略并提示。命令行 `--extra-header K=V`(可重复)/ `--no-extra-headers` 与 `ZNAIDE_EXTRA_HEADERS` 优先于配置
 
 API Key 也可以完全不进配置文件,用环境变量提供:`DASHSCOPE_API_KEY`、`DEEPSEEK_API_KEY`、`ZAI_API_KEY`、`OPENROUTER_API_KEY` 等,向导会自动读取。
 
@@ -258,6 +264,7 @@ API Key 也可以完全不进配置文件,用环境变量提供:`DASHSCOPE_API_K
 | `ZNAIDE_BASE_URL` / `OPENAI_BASE_URL` | OpenAI 兼容端点 |
 | `ZNAIDE_API_KEY` / `OPENAI_API_KEY` | API Key |
 | `ZNAIDE_PROXY` / `ZNAIDE_NO_PROXY` | 代理(优先于配置文件里的 `proxy`;`ZNAIDE_NO_PROXY=1` 强制直连) |
+| `ZNAIDE_EXTRA_HEADERS` / `ZNAIDE_NO_EXTRA_HEADERS` | 预设请求头:`{"X-Tenant-Id":"t1"}` 这样的 JSON 对象 / `1` = 关闭全部(都优先于配置文件) |
 | `ZNAIDE_DATA_DIR` | 覆盖数据目录(默认 `~/.znaide`,测试/多实例用) |
 
 ### 数据目录结构 `~/.znaide/`
@@ -268,7 +275,7 @@ API Key 也可以完全不进配置文件,用环境变量提供:`DASHSCOPE_API_K
 ├─ mcp.json         MCP server 配置(可选)
 ├─ skills/          技能(skills/<名字>/SKILL.md,可带 scripts/)
 ├─ sessions/        会话历史 *.jsonl(可有同名 *.meta.json 备注)
-├─ memories/        长期记忆(*.md + MEMORY.md 索引)
+├─ memories/        长期记忆·全局级(*.md + MEMORY.md 索引)
 └─ undo/            写文件前快照(manifest.jsonl + files/)
 ```
 

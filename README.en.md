@@ -19,7 +19,7 @@ Tell it what to do in plain language and it gets it done — edit files, run com
 - **Toolbox**: file read/write/edit (auto-snapshot before writes), directory listing, glob, regex search, shell commands (with timeouts), web fetch, long-term memory
 - **Four permission tiers**: **ask** (default; confirm file writes/commands) / **acceptEdits** (file edits auto-approved) / **bypassPermissions** (fully automatic) / **yolo** (everything allowed, dangerous commands included — on you); cycle with `Shift+Tab`. Dangerous commands go through a **heuristic risk check** that resolves target paths instead of matching raw text: a high-risk target (root / home / an ancestor of the working directory / a block device) or an undeterminable one brings up a **red confirm dialog** that only allows a single approval, and is denied outright in headless mode; **yolo** skips the check. `rm  -rf /` (extra space) is still caught while `rm -rf /tmp/123` (a concrete path) passes — but note this is a **heuristic guardrail, not a security boundary**
 - **undo**: auto-snapshot before every file change; `/undo` rolls back — no git needed
-- **Long-term memory**: remembers your environment and preferences across sessions; injected into context at startup
+- **Long-term memory (two scopes)**: Global (per-user: preferences, machine environment) + Project (per-repo: this repo's conventions / architecture / TODOs, committable or `.gitignore`d); both digests are injected at startup, same-name entries coexist, and deletion is scope-aware
 - **MCP support**: drop a `~/.znaide/mcp.json` and any MCP server's tools join the toolbox
 - **Session history**: every turn persisted as JSONL; `/resume` picks up where you left off
 - **Skills**: capability packs (a Markdown manual + optional entry script) the model can call on its own or you can trigger with `/skill-name`; hot-pluggable across three layers
@@ -175,6 +175,11 @@ znaide -p "debug connectivity" --no-proxy
 
 # weak-network retry: resend the same model call on an empty reply / 429 / 5xx / dropped connection
 znaide -p "run this at peak hours" --retry 3
+
+# attach a custom header to model requests (gateways / billing / audit; this run only, nothing persisted)
+znaide -p "hello" --extra-header X-Tenant-Id=t1
+# debugging a gateway 4xx: send none of the preset headers this time
+znaide -p "hello" --no-extra-headers
 ```
 
 ## Configuration
@@ -208,6 +213,7 @@ znaide -p "run this at peak hours" --retry 3
 - `max_turns` (optional): max model round trips **per message** (one round may carry several tool calls); default 200, **0 = unlimited**. When the budget runs out it no longer stops silently — interactive mode asks "continue?" and headless mode reports the round count and how to raise it; a repeated identical call is warned at 3 and aborted as "going in circles" at 6
 - `proxy` (optional): network proxy in three modes — omitted / `{"mode":"auto"}` follows the environment (`HTTPS_PROXY` etc., the previous behaviour); `{"mode":"direct"}` forces a direct connection; `{"mode":"manual","url":"http://127.0.0.1:7897"}` sends everything through it. Model requests, web fetch and update downloads all share this single egress; precedence: **CLI `--proxy`/`--no-proxy` > `ZNAIDE_PROXY`/`ZNAIDE_NO_PROXY` > config file > standard env vars**, and those env vars only apply in `auto` mode. `manual` still honours `NO_PROXY`, so "domestic providers direct, GitHub through the proxy" is just a `NO_PROXY` list
 - `retry` (optional): extra attempts for a **single model call** (0..=8, **off by default**). It never re-runs tools, spends no round budget, and a failed attempt is neither recorded nor billed. Empty replies / 429 / 5xx / dropped connections are retried with exponential backoff from 800ms (capped at 8s), and Esc still interrupts during the wait. CLI `--retry N` / `--no-retry` wins over it
+- `extra_headers` / `extra_headers_enabled` (optional): **user-supplied HTTP request headers** for gateways that require them, per-header billing, or internal audit (e.g. OpenRouter's `HTTP-Referer` / `X-Title`, a gateway's `X-Tenant-Id`). They apply to **model requests only** — web fetch and update downloads never carry them, so internal identifiers don't leak to arbitrary third-party URLs. Effective set = top-level table ⊕ current provider table (provider wins on the same name; an **empty string** in a provider entry deletes the inherited one); `extra_headers_enabled` is the master switch — `false` at top level or on one provider sends nothing. Values support `${VAR}` / `$VAR` expansion (an unset variable is sent verbatim and reported), so secrets stay out of the file; reserved headers (`Authorization`, `Host`, `Content-Type`, …) are ignored with a notice. CLI `--extra-header K=V` (repeatable) / `--no-extra-headers` and the `ZNAIDE_EXTRA_HEADERS` env var beat the config file
 
 Keys can live purely in environment variables: `DASHSCOPE_API_KEY`, `DEEPSEEK_API_KEY`, `ZAI_API_KEY`, `OPENROUTER_API_KEY`, etc.
 
@@ -222,6 +228,7 @@ Precedence: **CLI args > env vars > config.json > built-in presets**.
 | `ZNAIDE_BASE_URL` / `OPENAI_BASE_URL` | OpenAI-compatible endpoint |
 | `ZNAIDE_API_KEY` / `OPENAI_API_KEY` | API key |
 | `ZNAIDE_PROXY` / `ZNAIDE_NO_PROXY` | Proxy (beats the config file's `proxy`; `ZNAIDE_NO_PROXY=1` forces direct) |
+| `ZNAIDE_EXTRA_HEADERS` / `ZNAIDE_NO_EXTRA_HEADERS` | Preset headers: a JSON object like `{"X-Tenant-Id":"t1"}` / `1` to disable them all (both beat the config file) |
 | `ZNAIDE_DATA_DIR` | Override data dir (default `~/.znaide`; testing/multi-instance) |
 
 ### Data layout `~/.znaide/`
@@ -234,7 +241,7 @@ Precedence: **CLI args > env vars > config.json > built-in presets**.
 ├─ builtin-skills/  hydrated built-in samples (archive-downloads / clean-junk / weekly-report)
 ├─ personas/        persona files (<name>.md, body = persona description)
 ├─ sessions/        session history *.jsonl (may carry a sibling *.meta.json note)
-├─ memories/        long-term memory (*.md + MEMORY.md index)
+├─ memories/        long-term memory, global scope (*.md + MEMORY.md index)
 └─ undo/            pre-write snapshots (manifest.jsonl + files/)
 ```
 
