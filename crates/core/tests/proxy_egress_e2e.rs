@@ -13,17 +13,30 @@ use znaide_core::config::{EffectiveProxy, Resolved};
 
 /// 起一个记账服务:读完请求头记下第一行,回一个合法的 chat 响应(任何请求都回)
 async fn recorder() -> (String, Arc<Mutex<Vec<String>>>, Arc<AtomicUsize>) {
+    let (base, lines, hits, _hdrs) = recorder_with_headers().await;
+    (base, lines, hits)
+}
+
+/// 同上,但额外把每次请求的请求头也记下来(小写名)。
+/// 用来锁住一条承诺:**预设请求头只走模型请求**,不会跟着网页抓取跑到第三方 URL 上。
+async fn recorder_with_headers() -> (
+    String,
+    Arc<Mutex<Vec<String>>>,
+    Arc<AtomicUsize>,
+    Arc<Mutex<Vec<Vec<(String, String)>>>>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let lines: Arc<Mutex<Vec<String>>> = Arc::default();
     let hits = Arc::new(AtomicUsize::new(0));
-    let (l, h) = (lines.clone(), hits.clone());
+    let hdrs: Arc<Mutex<Vec<Vec<(String, String)>>>> = Arc::default();
+    let (l, h, hh) = (lines.clone(), hits.clone(), hdrs.clone());
     tokio::spawn(async move {
         loop {
             let Ok((mut sock, _)) = listener.accept().await else {
                 return;
             };
-            let (l, h) = (l.clone(), h.clone());
+            let (l, h, hh) = (l.clone(), h.clone(), hh.clone());
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 8192];
                 let n = match sock.read(&mut buf).await {
@@ -34,6 +47,14 @@ async fn recorder() -> (String, Arc<Mutex<Vec<String>>>, Arc<AtomicUsize>) {
                 l.lock()
                     .unwrap()
                     .push(head.lines().next().unwrap_or("").to_string());
+                hh.lock().unwrap().push(
+                    head.lines()
+                        .skip(1)
+                        .take_while(|l| !l.trim().is_empty())
+                        .filter_map(|l| l.split_once(':'))
+                        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+                        .collect(),
+                );
                 h.fetch_add(1, Ordering::SeqCst);
                 let body = r#"{"choices":[{"message":{"role":"assistant","content":"pong"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
                 let resp = format!(
@@ -46,7 +67,7 @@ async fn recorder() -> (String, Arc<Mutex<Vec<String>>>, Arc<AtomicUsize>) {
             });
         }
     });
-    (format!("http://{addr}"), lines, hits)
+    (format!("http://{addr}"), lines, hits, hdrs)
 }
 
 fn resolved(base_url: &str, proxy: EffectiveProxy) -> Resolved {
@@ -57,6 +78,7 @@ fn resolved(base_url: &str, proxy: EffectiveProxy) -> Resolved {
         provider_name: "mock".into(),
         context_window: None,
         proxy,
+        headers: Default::default(),
     }
 }
 
@@ -202,4 +224,47 @@ async fn update_client_honours_the_proxy() {
         r.err().map(|e| e.to_string())
     );
     assert!(hits.load(Ordering::SeqCst) >= 1);
+}
+
+/// 预设请求头只走模型请求:网页抓取**不带**这些头(F4 的承诺)。
+/// 故意在环境里放一条头 —— 万一以后有人把它挪进 net 的客户端工厂,
+/// 抓取请求上就会冒出来,这条会红。
+#[tokio::test]
+async fn web_fetch_never_carries_extra_headers() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_proxy_env();
+    std::env::set_var("ZNAIDE_EXTRA_HEADERS", r#"{"X-Leak-Test":"1"}"#);
+
+    let (proxy, _lines, _hits, hdrs) = recorder_with_headers().await;
+    let eff = EffectiveProxy::Manual(proxy.clone());
+    let perm =
+        znaide_core::permissions::Permission::new(znaide_core::permissions::Mode::BypassPermissions);
+    let ctx = znaide_core::tools::ToolContext {
+        cwd: std::path::Path::new("/tmp"),
+        permission: &perm,
+        session_id: "hdr-e2e",
+        cancel: None,
+        events: None,
+        proxy: &eff,
+    };
+
+    let out = znaide_core::tools::execute(
+        "web_fetch",
+        serde_json::json!({ "url": "http://example.invalid/x" }),
+        &ctx,
+    )
+    .await;
+    assert!(out.is_ok(), "抓取应成功(由代理回包):{out:?}");
+
+    let got = hdrs.lock().unwrap();
+    assert!(!got.is_empty(), "抓取至少发了一个请求,不然这条断言是空转");
+    for h in got.iter() {
+        assert!(
+            !h.iter().any(|(k, _)| k == "x-leak-test"),
+            "网页抓取不该带预设头:{h:?}"
+        );
+    }
+
+    std::env::remove_var("ZNAIDE_EXTRA_HEADERS");
+    clear_proxy_env();
 }

@@ -70,6 +70,15 @@ struct Cli {
     #[arg(long)]
     no_retry: bool,
 
+    /// 本次运行追加一个预设请求头(模型请求专用,可重复传;格式 `名字=值`)。
+    /// 当次生效、不写盘;追加在配置里那些头之上,同名的以本项为准
+    #[arg(long = "extra-header", value_name = "K=V")]
+    extra_header: Vec<String>,
+
+    /// 关闭全部预设请求头(含配置文件里的)。当次生效、不写盘;排查网关 4xx 时用
+    #[arg(long)]
+    no_extra_headers: bool,
+
     /// 检查并安装 GitHub 最新版本(见 --version 查看当前版本)
     #[arg(long)]
     update: bool,
@@ -107,6 +116,20 @@ async fn main() -> anyhow::Result<()> {
         url: cli.proxy.clone(),
         no_proxy: cli.no_proxy,
     };
+    // 预设请求头覆盖:同样是命令行那层。`名字=值` 解析失败当没给(提示一次),
+    // 不因为一个手滑的头让整次运行起不来
+    let mut header_ov = znaide_core::config::HeaderOverride {
+        add: Vec::new(),
+        no_headers: cli.no_extra_headers,
+    };
+    for raw in &cli.extra_header {
+        match raw.split_once('=') {
+            Some((k, v)) if !k.trim().is_empty() => {
+                header_ov.add.push((k.trim().to_string(), v.to_string()));
+            }
+            _ => eprintln!("⚠ --extra-header 要写成 名字=值,已忽略:{raw}"),
+        }
+    }
 
     // --update 与其它参数独立:不需要任何配置/会话
     if cli.update {
@@ -150,6 +173,13 @@ async fn main() -> anyhow::Result<()> {
     );
     if let Ok(r) = resolved.as_mut() {
         r.proxy = proxy.clone();
+        // 预设请求头:配置 + 专用环境变量在 `resolve` 里已落定,这里叠命令行那层
+        // (保留头/非法项/读不到的环境变量都在这个返回值里提示一次)
+        let (headers, header_notes) = cfg.resolve_headers(&r.provider_name, &header_ov);
+        for n in &header_notes {
+            eprintln!("⚠ {n}");
+        }
+        r.headers = headers;
     }
     let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
     if !cwd.is_dir() {
@@ -192,6 +222,7 @@ async fn main() -> anyhow::Result<()> {
                     provider_name: "ollama".into(),
                     context_window: None,
                     proxy: proxy.clone(),
+                    headers: Default::default(),
                 }
             });
             // --resume:按 ID/文件名片段定位历史文件,启动即恢复

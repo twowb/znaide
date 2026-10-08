@@ -995,11 +995,13 @@ pub async fn run(
                         config_wizard = Some(wizard);
                         let tx = wiz_tx.clone();
                         let proxy = current_resolved.proxy.clone();
+                        let headers = current_resolved.headers.clone();
                         tokio::spawn(async move {
                             let r = znaide_core::llm::openai::probe_models(
                                 &base_url,
                                 api_key.as_deref(),
                                 &proxy,
+                                &headers,
                             )
                             .await;
                             let _ = tx.send(WizardReply::Models(r.map_err(|e| format!("{e:#}"))));
@@ -1011,9 +1013,21 @@ pub async fn run(
                         let mut probe = draft.clone();
                         // 同上:验证用当前生效代理(界面这一轮不提供代理入口)
                         probe.proxy = current_resolved.proxy.clone();
+                        // 预设头由面板那份 draft 带着(总开关关掉时它已经是空的);
+                        // 失败时把"发过哪些头"说清楚,配上网关 4xx 才有得查
+                        let sent = draft.headers.keys_line();
                         tokio::spawn(async move {
                             let r = znaide_core::llm::openai::probe_chat(&probe).await;
-                            let _ = tx.send(WizardReply::Verify(r.map_err(|e| format!("{e:#}"))));
+                            let msg = r.map_err(|e| {
+                                if sent.is_empty() {
+                                    format!("{e:#}")
+                                } else {
+                                    format!(
+                                        "{e:#}\n(已发送预设头:{sent}(值已脱敏);可加 --no-extra-headers 对照排查)"
+                                    )
+                                }
+                            });
+                            let _ = tx.send(WizardReply::Verify(msg));
                         });
                     }
                 }

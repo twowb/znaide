@@ -1,4 +1,4 @@
-use crate::config::{EffectiveProxy, Resolved};
+use crate::config::{EffectiveHeaders, EffectiveProxy, Resolved};
 use crate::llm::types::{ChatMessage, FunctionCall, ToolCall, ToolDef, Usage};
 use futures_util::StreamExt;
 use serde_json::json;
@@ -12,6 +12,9 @@ pub struct OpenAiClient {
     model: String,
     /// 当前生效代理(reqwest 客户端已按它建好;留一份用于"变了才重建"和错误文案)
     proxy: EffectiveProxy,
+    /// 用户预设的请求头(网关/计费/审计用)。**只挂在这三条模型请求路径上**:
+    /// 网页抓取与更新下载走 `net` 的客户端工厂,不经过这里。
+    headers: EffectiveHeaders,
 }
 
 /// 请求 user 标识:chat 请求顶层 user 字段(遥测/实例区分用)
@@ -249,6 +252,7 @@ impl OpenAiClient {
             api_key: cfg.api_key.clone(),
             model: cfg.model.clone(),
             proxy: cfg.proxy.clone(),
+            headers: cfg.headers.clone(),
         })
     }
 
@@ -270,8 +274,9 @@ impl OpenAiClient {
         &self.model
     }
 
-    /// 运行时换端点/key/模型。端点/key/模型不动 http client(连接池留着复用),
+    /// 运行时换端点/key/模型/预设头。端点/key/模型不动 http client(连接池留着复用),
     /// 但**代理换了必须重建**:连接池是绑在旧代理上的,继续复用等于还走老出口。
+    /// 预设头是逐请求挂上去的,所以只更新这份快照、不必重建。
     pub fn reconfigure(&mut self, cfg: &Resolved) -> anyhow::Result<()> {
         if cfg.proxy != self.proxy {
             self.http = Self::build_http(&cfg.proxy)?;
@@ -280,6 +285,7 @@ impl OpenAiClient {
         self.base_url = cfg.base_url.trim_end_matches('/').to_string();
         self.model = cfg.model.clone();
         self.api_key = cfg.api_key.clone();
+        self.headers = cfg.headers.clone();
         Ok(())
     }
 
@@ -293,7 +299,7 @@ impl OpenAiClient {
 
     /// 查该端点可用模型列表(GET /models,配置向导里自动补全模型名用)
     pub async fn list_models(&self) -> anyhow::Result<Vec<String>> {
-        let resp = self.auth(self.http.get(self.models_url())).send().await?;
+        let resp = self.prepare(self.http.get(self.models_url())).send().await?;
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
@@ -324,11 +330,18 @@ impl OpenAiClient {
         Ok(())
     }
 
-    fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match &self.api_key {
-            Some(k) => req.bearer_auth(k),
-            None => req,
+    /// 给模型请求挂上鉴权与用户预设头。`list_models` / `chat` / `chat_stream`
+    /// 三条路径都从这里过 —— 只有一个插点,以后加请求路径也不会漏。
+    /// 预设头的名单/值在 `Config::resolve_headers` 已经校验过(保留头与非法项
+    /// 都被剔掉了),所以这里的 `header()` 不会撞上 panic。
+    fn prepare(&self, mut req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if let Some(k) = &self.api_key {
+            req = req.bearer_auth(k);
         }
+        for (name, value) in self.headers.iter() {
+            req = req.header(name, value);
+        }
+        req
     }
 
     /// 组装请求体:流式与非流式只差 `stream` / `stream_options`,其余字段共用一份,
@@ -361,7 +374,7 @@ impl OpenAiClient {
         tools: Option<&[ToolDef]>,
     ) -> anyhow::Result<AssistantReply> {
         let body = self.build_body(messages, tools, false)?;
-        let resp = self.auth(self.http.post(self.url())).json(&body).send().await?;
+        let resp = self.prepare(self.http.post(self.url())).json(&body).send().await?;
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
@@ -384,7 +397,7 @@ impl OpenAiClient {
         let body = self.build_body(messages, tools, true)?;
 
         let resp = self
-            .auth(self.http.post(self.url()))
+            .prepare(self.http.post(self.url()))
             .json(&body)
             .send()
             .await?;
@@ -541,6 +554,7 @@ pub async fn probe_models(
     base_url: &str,
     api_key: Option<&str>,
     proxy: &EffectiveProxy,
+    headers: &EffectiveHeaders,
 ) -> anyhow::Result<Vec<String>> {
     let cfg = crate::config::Resolved {
         model: "probe".into(),
@@ -549,6 +563,7 @@ pub async fn probe_models(
         provider_name: "probe".into(),
         context_window: None,
         proxy: proxy.clone(),
+        headers: headers.clone(),
     };
     let client = OpenAiClient::new(&cfg)?;
     client.list_models().await

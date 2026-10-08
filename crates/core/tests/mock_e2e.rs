@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::{timeout, Duration};
-use znaide_core::config::{EffectiveProxy, Resolved};
+use znaide_core::config::{EffectiveHeaders, EffectiveProxy, Resolved};
 use znaide_core::llm::openai::StreamEvent;
 use znaide_core::llm::{ChatMessage, OpenAiClient, Usage};
 use znaide_core::permissions::Mode;
@@ -19,15 +19,30 @@ async fn spawn_mock<F>(handler: F) -> String
 where
     F: FnMut(u32, serde_json::Value) -> Vec<u8> + Send + 'static,
 {
+    spawn_mock_logging(handler).await.0
+}
+
+/// 每次请求的请求头(名字已小写)。给"预设请求头到底发出去了没有"这类断言用 ——
+/// 原来的 handler 只看得到 body,头和路径一概看不见(端点写错也测不出来)。
+type HeaderLog = Arc<std::sync::Mutex<Vec<Vec<(String, String)>>>>;
+
+/// 与 `spawn_mock` 同一个 mock,额外把每次请求的请求头记下来
+async fn spawn_mock_logging<F>(handler: F) -> (String, HeaderLog)
+where
+    F: FnMut(u32, serde_json::Value) -> Vec<u8> + Send + 'static,
+{
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let counter = Arc::new(AtomicUsize::new(0));
     let handler = Arc::new(tokio::sync::Mutex::new(handler));
+    let log: HeaderLog = Arc::default();
+    let log_server = log.clone();
     tokio::spawn(async move {
         loop {
             let Ok((mut sock, _)) = listener.accept().await else { break };
             let counter = counter.clone();
             let handler = handler.clone();
+            let log = log_server.clone();
             tokio::spawn(async move {
                 let _ = timeout(Duration::from_secs(10), async {
                     // 读 header(直到 \r\n\r\n)
@@ -44,6 +59,16 @@ where
                     }
                     let he = header_end.unwrap();
                     let head_str = String::from_utf8_lossy(&head[..he]);
+                    // 记请求头(跳过请求行;小写名,便于大小写不敏感地断言)
+                    log.lock().unwrap().push(
+                        head_str
+                            .lines()
+                            .skip(1)
+                            .take_while(|l| !l.trim().is_empty())
+                            .filter_map(|l| l.split_once(':'))
+                            .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+                            .collect(),
+                    );
                     // 解析 content-length
                     let content_length: usize = head_str
                         .lines()
@@ -81,7 +106,7 @@ where
             });
         }
     });
-    format!("http://{addr}/v1")
+    (format!("http://{addr}/v1"), log)
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
@@ -134,6 +159,7 @@ async fn sse_stream_accumulates_text() {
         context_window: None,
         // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
         proxy: EffectiveProxy::Direct,
+        headers: Default::default(),
     };
     let client = OpenAiClient::new(&cfg).unwrap();
     let mut deltas: Vec<String> = Vec::new();
@@ -156,6 +182,66 @@ async fn sse_stream_accumulates_text() {
     );
 }
 
+/// 预设请求头:真的挂到了模型请求上 —— 流式(UI 实际走的那条)与非流式两条路径
+/// 共用一个插点,而且不会把 Authorization 顶掉。断言放在 mock 收到的请求头上,
+/// 而不是"配置里写了"这种间接证据。
+#[tokio::test]
+async fn extra_headers_ride_along_on_model_requests() {
+    let (base, log) = spawn_mock_logging(move |n, _body| {
+        if n == 0 {
+            // 流式对话(第 1 个请求)
+            sse_resp(&[
+                r#"{"choices":[{"delta":{"content":"好"},"finish_reason":null}]}"#,
+                r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+                "[DONE]",
+            ])
+        } else {
+            // GET /models(第 2 个请求)
+            http_json_resp(r#"{"data":[{"id":"m"}]}"#)
+        }
+    })
+    .await;
+
+    let cfg = Resolved {
+        model: "m".into(),
+        base_url: base,
+        api_key: Some("sk-test".into()),
+        provider_name: "mock".into(),
+        context_window: None,
+        proxy: EffectiveProxy::Direct,
+        headers: EffectiveHeaders::from_pairs(vec![
+            ("X-Tenant-Id".into(), "t1".into()),
+            ("X-Title".into(), "znaide".into()),
+        ]),
+    };
+    let client = OpenAiClient::new(&cfg).unwrap();
+
+    let reply = client
+        .chat_stream(&[ChatMessage::user("hi")], None, |_| {})
+        .await
+        .unwrap();
+    assert_eq!(reply.content.as_deref(), Some("好"));
+    assert_eq!(client.list_models().await.unwrap(), vec!["m".to_string()]);
+
+    let reqs = log.lock().unwrap();
+    assert_eq!(reqs.len(), 2, "两次请求各记一份头");
+    for h in reqs.iter() {
+        assert!(
+            h.iter().any(|(k, v)| k == "x-tenant-id" && v == "t1"),
+            "预设头要带上:{h:?}"
+        );
+        assert!(
+            h.iter().any(|(k, v)| k == "x-title" && v == "znaide"),
+            "预设头要带上:{h:?}"
+        );
+        assert!(
+            h.iter()
+                .any(|(k, v)| k == "authorization" && v == "Bearer sk-test"),
+            "鉴权头不能被预设头顶掉:{h:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn sse_stream_accumulates_tool_calls() {
     let base = spawn_mock(|_n, _body| {
@@ -176,6 +262,7 @@ async fn sse_stream_accumulates_tool_calls() {
         context_window: None,
         // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
         proxy: EffectiveProxy::Direct,
+        headers: Default::default(),
     };
     let client = OpenAiClient::new(&cfg).unwrap();
     let reply = client
@@ -225,6 +312,7 @@ async fn session_run_turn_executes_tools() {
         context_window: None,
         // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
         proxy: EffectiveProxy::Direct,
+        headers: Default::default(),
     };
     let llm = OpenAiClient::new(&cfg).unwrap();
     let mut session = Session::new(
@@ -295,6 +383,7 @@ async fn queued_message_is_injected_at_round_boundary() {
         context_window: None,
         // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
         proxy: EffectiveProxy::Direct,
+        headers: Default::default(),
     };
     let llm = OpenAiClient::new(&cfg).unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -387,6 +476,7 @@ async fn session_clear_context_wipes_messages_and_history() {
         context_window: None,
         // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
         proxy: EffectiveProxy::Direct,
+        headers: Default::default(),
     };
     let llm = OpenAiClient::new(&cfg).unwrap();
     let sid = format!("clear_test_{}", std::process::id());
@@ -448,6 +538,7 @@ async fn headless_session_lazy_file_meta_and_resume() {
         context_window: None,
         // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
         proxy: EffectiveProxy::Direct,
+        headers: Default::default(),
     };
     let sid = format!("meta_test_{}", std::process::id());
     let hp = znaide_core::config::data_dir()
@@ -523,6 +614,7 @@ async fn interactive_session_writes_schema_meta() {
         context_window: None,
         // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
         proxy: EffectiveProxy::Direct,
+        headers: Default::default(),
     };
     let sid = format!("imeta_test_{}", std::process::id());
     let hp = znaide_core::config::data_dir()
@@ -581,6 +673,7 @@ async fn load_history_takes_over_session_identity() {
         context_window: None,
         // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
         proxy: EffectiveProxy::Direct,
+        headers: Default::default(),
     };
     let llm = OpenAiClient::new(&cfg).unwrap();
 
@@ -672,6 +765,7 @@ async fn foreign_schema_in_history_emits_notice() {
         context_window: None,
         // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
         proxy: EffectiveProxy::Direct,
+        headers: Default::default(),
     };
     let hp = znaide_core::config::data_dir()
         .join("sessions")
@@ -824,6 +918,7 @@ async fn tool_call_survives_sse_line_split_across_network_chunks() {
         context_window: None,
         // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
         proxy: EffectiveProxy::Direct,
+        headers: Default::default(),
     };
     let client = OpenAiClient::new(&cfg).unwrap();
     let reply = client
@@ -884,6 +979,7 @@ async fn empty_and_null_tool_arguments_keep_loop_alive() {
         context_window: None,
         // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
         proxy: EffectiveProxy::Direct,
+        headers: Default::default(),
     };
     let llm = OpenAiClient::new(&cfg).unwrap();
     let mut session = Session::new(
@@ -979,6 +1075,7 @@ async fn model_invokes_skill_with_entry_script() {
         context_window: None,
         // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
         proxy: EffectiveProxy::Direct,
+        headers: Default::default(),
     };
     let llm = OpenAiClient::new(&cfg).unwrap();
     let mut session = Session::new(
@@ -1027,6 +1124,7 @@ async fn manual_skill_unknown_name_fails_gracefully() {
         context_window: None,
         // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
         proxy: EffectiveProxy::Direct,
+        headers: Default::default(),
     };
     let llm = OpenAiClient::new(&cfg).unwrap();
     let mut session = Session::new(
@@ -1093,6 +1191,7 @@ async fn compact_context_shrinks_next_request() {
         context_window: None,
         // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
         proxy: EffectiveProxy::Direct,
+        headers: Default::default(),
     };
     let llm = OpenAiClient::new(&cfg).unwrap();
     let mut session = Session::new(
@@ -1142,6 +1241,7 @@ async fn session_turn_error_notifies_and_finishes() {
         context_window: None,
         // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
         proxy: EffectiveProxy::Direct,
+        headers: Default::default(),
     };
     let llm = OpenAiClient::new(&cfg).unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1205,6 +1305,7 @@ async fn round_budget_exhausted_reports_headless() {
         context_window: None,
         // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
         proxy: EffectiveProxy::Direct,
+        headers: Default::default(),
     };
     let llm = OpenAiClient::new(&cfg).unwrap();
     let mut session = Session::new(
@@ -1266,6 +1367,7 @@ async fn max_turns_zero_means_unlimited() {
         context_window: None,
         // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
         proxy: EffectiveProxy::Direct,
+        headers: Default::default(),
     };
     let llm = OpenAiClient::new(&cfg).unwrap();
     let mut session = Session::new(
@@ -1330,6 +1432,7 @@ async fn round_started_events_report_progress() {
         context_window: None,
         // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
         proxy: EffectiveProxy::Direct,
+        headers: Default::default(),
     };
     let llm = OpenAiClient::new(&cfg).unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1392,6 +1495,7 @@ async fn repeated_identical_call_is_stopped() {
         context_window: None,
         // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
         proxy: EffectiveProxy::Direct,
+        headers: Default::default(),
     };
     let llm = OpenAiClient::new(&cfg).unwrap();
     let mut session = Session::new(

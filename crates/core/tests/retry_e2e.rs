@@ -84,6 +84,7 @@ async fn session_at(base_url: &str, events: bool, retry: usize) -> (Session, tok
         context_window: None,
         // 测试自己就是端点:显式直连,免得开发机上的 HTTPS_PROXY 把请求带跑偏
         proxy: EffectiveProxy::Direct,
+        headers: Default::default(),
     };
     let llm = OpenAiClient::new(&cfg).unwrap();
     let cwd = std::env::temp_dir().join(format!("znaide_retry_{}_{}", std::process::id(), retry));

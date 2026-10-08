@@ -7,6 +7,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use znaide_core::config::Config;
+use znaide_core::config::EffectiveHeaders;
+use znaide_core::config::HeaderOverride;
 use znaide_core::config::ProviderDef;
 use znaide_core::config::Resolved;
 
@@ -25,6 +27,8 @@ pub enum Step {
     ContextWindow,
     /// 轮数上限(单条消息最多几轮模型往返;0 = 不限)
     MaxTurns,
+    /// 预设请求头(只读展示生效的头名 + 切换总开关;增删改在 config.json 里做)
+    Headers,
     /// 正在验证(等待宿主回调)
     Verifying,
 }
@@ -79,6 +83,12 @@ pub struct SetupWizard {
     pub typing_context_window: bool,
     /// Key 来自环境变量(api_key_env):面板里显示为空但实际可用
     pub key_from_env: bool,
+    /// 预设请求头:按当前 provider 算好的生效那份(含专用环境变量那层),
+    /// 只读展示头名(值可能带租户密钥)。**必须带着走** —— 否则重跑一次向导
+    /// 就会把配置里的头静默丢掉(和当初代理被 reconfigure 洗掉是同一类坑)。
+    pub headers: EffectiveHeaders,
+    /// 顶层"预设请求头"总开关(空格切换,即时落盘)
+    pub headers_enabled: bool,
     /// 打开面板时快照的合并后 provider 表:切服务商时按名字取"它自己"的
     /// 模型/端点/Key(避免沿用上一家的模型或把上一家的 Key 带过去)
     pub provider_defs: std::collections::HashMap<String, ProviderDef>,
@@ -106,6 +116,8 @@ impl SetupWizard {
             typing_max_turns: false,
             typing_context_window: false,
             key_from_env: false,
+            headers: Default::default(),
+            headers_enabled: true,
             provider_defs: std::collections::HashMap::new(),
         }
     }
@@ -195,6 +207,12 @@ impl SetupWizard {
         self.max_turns = cfg.max_turns;
         // 窗口:当前 provider 条目里的固定值(没写 = None,界面显示"按模型名自动")
         self.context_window = def.as_ref().and_then(|d| d.context_window);
+        // 预设请求头:按"当前 provider"解析出实际会发的那份(含专用环境变量),
+        // 面板只读展示;开关取配置里的总闸
+        self.headers_enabled = cfg.extra_headers_enabled != Some(false);
+        self.headers = cfg
+            .resolve_headers(&self.provider, &HeaderOverride::default())
+            .0;
     }
 
     /// 是否已有配置可展示(首次运行全空 → 不显示摘要行)
@@ -250,6 +268,8 @@ impl SetupWizard {
             // 代理不归这个面板管(这一轮没有代理入口):调用方按"当前生效代理"覆盖,
             // 这里给 Default(auto)只是占位
             proxy: Default::default(),
+            // 预设头带着走:调用方不必再解析一次,也保证重跑向导不会把它们丢掉
+            headers: self.headers.clone(),
         }
     }
 
@@ -499,10 +519,10 @@ impl SetupWizard {
                     WizardAction::None
                 }
                 KeyCode::Enter | KeyCode::Char('s') | KeyCode::Char('S') => {
-                    // 完成:验证(用当前轮数上限)
-                    self.step = Step::Verifying;
-                    self.progress = format!("正在验证 {} / {} …", self.provider, self.model);
-                    WizardAction::Verify(self.draft())
+                    // 完成:下一步(预设请求头那页按 Enter 才验证)
+                    self.step = Step::Headers;
+                    self.notice.clear();
+                    WizardAction::None
                 }
                 KeyCode::Esc => {
                     self.step = Step::ContextWindow;
@@ -510,10 +530,47 @@ impl SetupWizard {
                 }
                 _ => WizardAction::None,
             },
-            Step::Verifying => {
-                // 等待宿主;按 Esc 回到上一步(轮数上限)
-                if matches!(key.code, KeyCode::Esc) {
+            Step::Headers => match key.code {
+                // 空格:切换总开关并**即时落盘**(存不上就提示,不声称成功)
+                KeyCode::Char(' ') => {
+                    let next = !self.headers_enabled;
+                    match Config::load_for_write()
+                        .and_then(|mut c| c.save_extra_headers_enabled(next).map(|_| c))
+                    {
+                        Ok(cfg) => {
+                            self.headers_enabled = next;
+                            // 关掉时这份表就别继续发了(展示也跟着变"无",免得
+                            // 界面说"生效头 3 条"、实际一个都没发)
+                            self.headers = if next {
+                                cfg.resolve_headers(&self.provider, &HeaderOverride::default()).0
+                            } else {
+                                EffectiveHeaders::default()
+                            };
+                            self.notice = if next {
+                                "预设请求头:已开启".into()
+                            } else {
+                                "预设请求头:已关闭(这次请求不会再带这些头)".into()
+                            };
+                        }
+                        Err(e) => self.notice = format!("开关没能存上:{e}"),
+                    }
+                    WizardAction::None
+                }
+                KeyCode::Enter => {
+                    self.step = Step::Verifying;
+                    self.progress = format!("正在验证 {} / {} …", self.provider, self.model);
+                    WizardAction::Verify(self.draft())
+                }
+                KeyCode::Esc => {
                     self.step = Step::MaxTurns;
+                    WizardAction::None
+                }
+                _ => WizardAction::None,
+            },
+            Step::Verifying => {
+                // 等待宿主;按 Esc 回到上一步(预设请求头)
+                if matches!(key.code, KeyCode::Esc) {
+                    self.step = Step::Headers;
                 }
                 WizardAction::None
             }
@@ -633,7 +690,8 @@ impl SetupWizard {
             "3 API Key",
             "4 上下文窗口",
             "5 轮数上限",
-            "6 验证",
+            "6 预设请求头",
+            "7 验证",
         ];
         let current = match self.step {
             Step::Provider => 0,
@@ -641,7 +699,8 @@ impl SetupWizard {
             Step::ApiKey => 2,
             Step::ContextWindow => 3,
             Step::MaxTurns => 4,
-            Step::Verifying => 5,
+            Step::Headers => 5,
+            Step::Verifying => 6,
         };
         let mut bar: Vec<Span> = Vec::new();
         for (i, s) in steps.iter().enumerate() {
@@ -840,6 +899,43 @@ impl SetupWizard {
                     Style::default().fg(Color::Cyan),
                 )));
             }
+            Step::Headers => {
+                lines.push(Line::from(Span::styled(
+                    format!("服务商: {} | 模型: {}", self.provider, self.model),
+                    Style::default().fg(Color::Green),
+                )));
+                let (label, color) = if self.headers_enabled {
+                    ("开", Color::Green)
+                } else {
+                    ("关", Color::Red)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("预设请求头总开关: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(label, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                ]));
+                if self.headers.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        "生效头:(无)。要加就把 extra_headers 写进 config.json(见使用说明 §13.1)",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                } else {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("生效头 {} 条(值已脱敏):", self.headers.len()),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        Span::styled(self.headers.keys_line(), Style::default().fg(Color::White)),
+                    ]));
+                    lines.push(Line::from(Span::styled(
+                        "只作用于模型请求(网页抓取与更新下载不带);增删改请编辑 config.json",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+                lines.push(Line::from(Span::styled(
+                    "空格 开/关 | Enter 验证并完成 | Esc 返回改轮数上限",
+                    Style::default().fg(Color::Cyan),
+                )));
+            }
             Step::Verifying => {
                 lines.push(Line::from(Span::styled(
                     format!("⏳ {}", self.progress),
@@ -972,15 +1068,24 @@ mod tests {
         assert!(!w.typing && !w.typing_max_turns);
         assert_eq!(w.step, Step::MaxTurns, "Esc 只退输入,不退步骤");
 
-        // 本步按 Enter → 验证(带上当前轮数上限)
+        // 本步按 Enter → 预设请求头页(还在这一轮向导里,不直接验证)
         w.max_turns = Some(300);
+        assert!(matches!(
+            w.on_key(key(KeyCode::Enter)),
+            WizardAction::None
+        ));
+        assert_eq!(w.step, Step::Headers);
+
+        // 那一页按 Enter → 验证(带上当前轮数上限)
         match w.on_key(key(KeyCode::Enter)) {
             WizardAction::Verify(r) => assert_eq!(r.model, "qwen3:8b"),
-            _ => panic!("Enter 应触发验证"),
+            _ => panic!("预设请求头页 Enter 应触发验证"),
         }
         assert_eq!(w.step, Step::Verifying);
 
-        // Esc 从验证回退到本步
+        // Esc 链:验证 → 预设请求头 → 轮数上限
+        w.on_key(key(KeyCode::Esc));
+        assert_eq!(w.step, Step::Headers);
         w.on_key(key(KeyCode::Esc));
         assert_eq!(w.step, Step::MaxTurns);
     }
@@ -1002,6 +1107,8 @@ mod tests {
             providers: Default::default(),
             proxy: Default::default(),
             retry: None,
+            extra_headers_enabled: None,
+            extra_headers: Default::default(),
         };
         w.apply_config(&cfg);
         assert_eq!(w.provider, "deepseek");
@@ -1034,6 +1141,8 @@ mod tests {
                 api_key_env: Some(VAR.into()),
                 api_key: None,
                 context_window: None,
+                extra_headers_enabled: None,
+                extra_headers: Default::default(),
             },
         );
         let cfg = Config {
@@ -1048,6 +1157,8 @@ mod tests {
             providers,
             proxy: Default::default(),
             retry: None,
+            extra_headers_enabled: None,
+            extra_headers: Default::default(),
         };
         let mut w = SetupWizard::new();
         w.apply_config(&cfg);
@@ -1395,11 +1506,51 @@ mod tests {
         assert_eq!(w.step, Step::MaxTurns);
         assert_eq!(w.draft().context_window, Some(131_072));
 
-        // Esc 链:验证 → 轮数上限 → 上下文窗口
+        // Esc 链:验证 → 预设请求头 → 轮数上限 → 上下文窗口
         w.step = Step::Verifying;
+        w.on_key(key(KeyCode::Esc));
+        assert_eq!(w.step, Step::Headers);
         w.on_key(key(KeyCode::Esc));
         assert_eq!(w.step, Step::MaxTurns);
         w.on_key(key(KeyCode::Esc));
         assert_eq!(w.step, Step::ContextWindow);
+    }
+
+    /// 预设请求头页:展示生效头、空格切总开关(即时落盘)、draft 必须带着头走
+    /// (不带就会像当初代理那样:重跑一次向导把配置里的头静默丢掉)
+    #[test]
+    fn headers_step_toggles_and_draft_carries_them() {
+        // 这一步会真的写 config.json(开关即时落盘):换到临时数据目录,
+        // 别碰开发机上真实的 ~/.znaide(锁与其它动 ZNAIDE_DATA_DIR 的用例共用)
+        let _g = crate::test_util::DATA_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("znaide_wiz_hdr_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("ZNAIDE_DATA_DIR", &dir);
+
+        let mut w = SetupWizard::new();
+        w.provider = "openrouter".into();
+        w.model = "m".into();
+        w.headers = EffectiveHeaders::from_pairs(vec![("X-Title".into(), "znaide".into())]);
+        w.step = Step::Headers;
+        assert!(w.headers_enabled);
+        assert_eq!(w.draft().headers.keys_line(), "X-Title");
+
+        // 空格 → 关闭:落盘 + 本页不再显示生效头(界面与实际一致)
+        w.on_key(key(KeyCode::Char(' ')));
+        assert!(!w.headers_enabled);
+        assert!(w.headers.is_empty());
+        assert!(w.draft().headers.is_empty());
+        assert_eq!(Config::load().unwrap().extra_headers_enabled, Some(false));
+
+        // 再空格 → 开回来(回到缺省,不写键)
+        w.on_key(key(KeyCode::Char(' ')));
+        assert!(w.headers_enabled);
+        assert_eq!(Config::load().unwrap().extra_headers_enabled, None);
+
+        std::env::remove_var("ZNAIDE_DATA_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

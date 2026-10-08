@@ -48,6 +48,17 @@ pub struct Config {
     /// 只重试这一次调用,**不会重跑工具**(有副作用的工具只执行一次)。
     /// 命令行 `--retry` / `--no-retry` 优先于这里。
     pub retry: Option<usize>,
+    /// 用户预设的 HTTP 请求头总开关:`false` = 一条都不发。缺省 = 开 ——
+    /// 空表本来就等于"没有头",把默认设成关只会制造"我配了怎么没生效"。
+    /// 只作用于**模型请求**;网页抓取与更新下载不带这些头。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra_headers_enabled: Option<bool>,
+    /// 用户预设的 HTTP 请求头:键 = 头名,值 = 头值(支持 `${VAR}` / `$VAR` 展开)。
+    /// 当前 provider 条目里的同名表叠加在这份之上(同名覆盖;条目里值为空串 =
+    /// 删掉这里继承来的那条)。保留了 Authorization / Content-Type 等保留头,
+    /// 配了会被忽略并提示(见 `resolve_headers`)。
+    #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub extra_headers: std::collections::HashMap<String, String>,
 }
 
 /// 当前配置格式版本(写入 config.json 的 build_tag)。
@@ -58,6 +69,18 @@ const CONFIG_TAG: &str = "c6ee35b45916";
 /// 弱网重试上限(追加尝试次数)。退避是指数增长的,再多就不是"弱网重试"、
 /// 而是"卡在那儿等"了。
 pub const MAX_RETRY: usize = 8;
+
+/// 预设请求头里**不允许**覆盖的头:这些改了会破坏请求本身(鉴权/长度/编码),
+/// 配了直接忽略并提示一次,不阻断启动。
+const RESERVED_HEADERS: &[&str] = &[
+    "authorization",
+    "host",
+    "content-type",
+    "content-length",
+    "content-encoding",
+    "transfer-encoding",
+    "connection",
+];
 
 /// provider 预设:端点 + 默认模型 + key(环境变量名或明文)
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -73,6 +96,15 @@ pub struct ProviderDef {
     /// 该服务商对应模型的上下文窗口(可选)。多 provider 各配各的,
     /// 避免在 40k 的 ollama 与 1M 的云端模型之间切换时占用条算错。
     pub context_window: Option<usize>,
+    /// 这家服务商的预设请求头开关:`false` = 这家一条都不发(**连顶层继承来的
+    /// 也不发**,比如内网网关不接受额外头时单独关一家)。缺省 = 继承顶层总开关。
+    /// 值给 `true` 与不写等价:顶层关了就是关了,这是总闸。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra_headers_enabled: Option<bool>,
+    /// 这家服务商额外要带的请求头,叠加在顶层表之上(同名覆盖;值为空串 =
+    /// 删掉顶层来的那条)。网关/计费/审计要求各家不同的头时用。
+    #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub extra_headers: std::collections::HashMap<String, String>,
 }
 
 /// 网络代理档位(顶层配置,不随服务商走)
@@ -137,11 +169,53 @@ impl EffectiveProxy {
     }
 }
 
+/// 生效的预设请求头快照(已校验、已按优先级合并),随 `Resolved` 走全链路,
+/// 与 [`EffectiveProxy`] 同形。**只作用于模型请求**:网页抓取与更新下载走
+/// `net` 的那个客户端工厂,不经过这里,所以不会把内部追踪头泄漏给任意第三方 URL。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EffectiveHeaders(Vec<(String, String)>);
+
+impl EffectiveHeaders {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.0.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
+    /// 头名清单(逗号分隔)。**值可能带租户密钥,任何展示/日志都只能走这个。**
+    pub fn keys_line(&self) -> String {
+        self.0
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// 从已解析的键值对构造(测试与宿主用)
+    pub fn from_pairs(pairs: Vec<(String, String)>) -> Self {
+        Self(pairs)
+    }
+}
+
 /// 命令行的代理覆盖(`--proxy` / `--no-proxy`):当次生效,不写盘
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProxyOverride {
     pub url: Option<String>,
     pub no_proxy: bool,
+}
+
+/// 命令行的预设请求头覆盖(`--extra-header K=V`,可重复;`--no-extra-headers`):
+/// 当次生效,不写盘
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeaderOverride {
+    pub add: Vec<(String, String)>,
+    pub no_headers: bool,
 }
 
 /// 顶层 `proxy` 配置项
@@ -250,6 +324,9 @@ pub struct Resolved {
     /// 生效的网络代理(三处 HTTP 出口共用这一个快照;命令行 `--proxy`/`--no-proxy`
     /// 由宿主用 [`Config::resolve_proxy`] 叠上)
     pub proxy: EffectiveProxy,
+    /// 生效的预设请求头(**只作用于模型请求**;命令行 `--extra-header` /
+    /// `--no-extra-headers` 与专用环境变量由宿主用 [`Config::resolve_headers`] 叠上)
+    pub headers: EffectiveHeaders,
 }
 
 /// 模型窗口内置表(没配 context_window 时按名字匹配)。
@@ -312,6 +389,140 @@ fn model_context_window(model: &str) -> Option<usize> {
 
 fn env_first(names: &[&str]) -> Option<String> {
     names.iter().find_map(|n| std::env::var(n).ok())
+}
+
+/// 专用"关"开关(`ZNAIDE_NO_PROXY` / `ZNAIDE_NO_EXTRA_HEADERS`):
+/// 认 1/true/yes;其余(含未设、0/false/空)= 没开。
+fn env_flag_set(name: &str) -> bool {
+    env_first(&[name])
+        .map(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "no"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// 头名校验:RFC 9110 的 `tchar`(ASCII 字母数字 + `!#$%&'*+-.^_`|~`)。
+fn valid_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+/// 头值校验:用**真正发请求的同一套类型**来判,保证"校验通过 = 发得出去"
+/// (不会在 `RequestBuilder::header` 那一步 panic)。顺带挡住换行/控制字符。
+fn valid_header_value(value: &str) -> bool {
+    reqwest::header::HeaderValue::from_str(value).is_ok()
+}
+
+/// 展开值里的 `${VAR}` / `$VAR`。环境变量没设置时**保留原样**并留一句提示 ——
+/// 悄悄把一个字面量 `${VAR}` 发到网关上,比不发还难查。
+fn expand_env_vars(header: &str, value: &str) -> (String, Vec<String>) {
+    let mut out = String::with_capacity(value.len());
+    let mut notes = Vec::new();
+    let mut i = 0;
+    while i < value.len() {
+        if !value[i..].starts_with('$') {
+            let ch = value[i..].chars().next().expect("非空切片必有字符");
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        // `${VAR}` 或 `$VAR`;两样都不是(光一个 `$`)就按字面量原样带过
+        let (name, next) = if let Some(rest) = value[i..].strip_prefix("${") {
+            match rest.find('}') {
+                Some(end) => (&rest[..end], i + 2 + end + 1),
+                None => ("", i + 1),
+            }
+        } else {
+            let rest = &value[i + 1..];
+            // 谓词只放行 ASCII,所以这里的"字符数"就是"字节数"
+            let len = rest
+                .char_indices()
+                .take_while(|(idx, c)| {
+                    if *idx == 0 {
+                        c.is_ascii_alphabetic() || *c == '_'
+                    } else {
+                        c.is_ascii_alphanumeric() || *c == '_'
+                    }
+                })
+                .count();
+            (if len == 0 { "" } else { &rest[..len] }, i + 1 + len)
+        };
+        if name.is_empty() {
+            out.push('$');
+            i += 1;
+            continue;
+        }
+        match std::env::var(name) {
+            Ok(v) => out.push_str(&v),
+            Err(_) => {
+                out.push_str(&value[i..next]);
+                notes.push(format!(
+                    "预设请求头 {header} 引用的环境变量 {name} 未设置,已按原样发送"
+                ));
+            }
+        }
+        i = next;
+    }
+    (out, notes)
+}
+
+/// 把一层头表叠加到累积表上(同名覆盖,大小写不敏感)。空值 = **删掉**该头
+/// (provider 层用它删掉顶层继承来的那条);保留头 / 非法项只留提示、不落表。
+fn apply_headers(
+    entries: &std::collections::HashMap<String, String>,
+    map: &mut Vec<(String, String)>,
+    notes: &mut Vec<String>,
+) {
+    // HashMap 遍历顺序不定:排一下,让同一份配置每次给出同一结果(提示顺序也稳定)
+    let mut keys: Vec<&String> = entries.keys().collect();
+    keys.sort();
+    for k in keys {
+        let raw = &entries[k];
+        if raw.trim().is_empty() {
+            map.retain(|(n, _)| !n.eq_ignore_ascii_case(k));
+            continue;
+        }
+        if RESERVED_HEADERS.iter().any(|r| r.eq_ignore_ascii_case(k)) {
+            notes.push(format!("预设请求头 {k} 是保留头(改了会破坏请求本身),已忽略"));
+            continue;
+        }
+        if !valid_header_name(k) {
+            notes.push(format!("预设请求头名不合法,已忽略:{k}"));
+            continue;
+        }
+        let (value, mut vnotes) = expand_env_vars(k, raw);
+        notes.append(&mut vnotes);
+        if !valid_header_value(&value) {
+            notes.push(format!(
+                "预设请求头 {k} 的值含非法字符(换行/控制字符),已忽略"
+            ));
+            continue;
+        }
+        map.retain(|(n, _)| !n.eq_ignore_ascii_case(k));
+        map.push((k.clone(), value));
+    }
 }
 
 /// 内置 provider 预设;config.providers 可覆盖同名项
@@ -387,6 +598,14 @@ impl Config {
                     }
                     if v.context_window.is_some() {
                         base.context_window = v.context_window;
+                    }
+                    // 预设头是"新增的字段",字段级合并必须一起搬 —— 漏了就会
+                    // "用户写了却静默丢失"
+                    if v.extra_headers_enabled.is_some() {
+                        base.extra_headers_enabled = v.extra_headers_enabled;
+                    }
+                    if !v.extra_headers.is_empty() {
+                        base.extra_headers = v.extra_headers.clone();
                     }
                 }
                 None => {
@@ -470,6 +689,10 @@ impl Config {
             .or_else(|| pdef.api_key.clone().filter(|k| !k.is_empty()))
             .or_else(|| pdef.api_key_env.as_ref().and_then(|env| env_first(&[env])));
 
+        // provider 条目里的预设头要按名字取,先把名字留一份(resolved 会把它 move 走)
+        let headers = self
+            .resolve_headers(&provider_name, &HeaderOverride::default())
+            .0;
         Ok(Resolved {
             model,
             base_url,
@@ -480,6 +703,8 @@ impl Config {
             // 代理:先按"配置文件 + 专用环境变量"落定;CLI 覆盖由宿主调
             // `resolve_proxy` 再叠一层(命令行当次生效,不该被写进这里持久化)
             proxy: self.resolve_proxy(&ProxyOverride::default()).0,
+            // 预设头同理:配置 + 专用环境变量先落定,CLI 那层由宿主叠
+            headers,
         })
     }
 
@@ -513,15 +738,7 @@ impl Config {
             ));
         }
         // ② 专用环境变量(ZNAIDE_NO_PROXY 认 1/true/yes;0/false/空 = 没设)
-        if env_first(&["ZNAIDE_NO_PROXY"])
-            .map(|v| {
-                !matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "" | "0" | "false" | "no"
-                )
-            })
-            .unwrap_or(false)
-        {
+        if env_flag_set("ZNAIDE_NO_PROXY") {
             return (EffectiveProxy::Direct, notes);
         }
         if let Some(raw) = env_first(&["ZNAIDE_PROXY"]).filter(|v| !v.trim().is_empty()) {
@@ -548,6 +765,73 @@ impl Config {
             // ④ 交给 reqwest 读标准环境变量
             ProxyMode::Auto => (EffectiveProxy::Auto, notes),
         }
+    }
+
+    /// 算出生效的预设请求头。优先级(高 → 低):
+    ///
+    /// ① CLI `--extra-header` / `--no-extra-headers`
+    /// ② 专用环境变量 `ZNAIDE_EXTRA_HEADERS`(JSON 对象)/ `ZNAIDE_NO_EXTRA_HEADERS`
+    /// ③ 配置文件:当前 provider 条目的表叠加在顶层表之上(同名覆盖;条目里值为
+    ///    空串 = 删掉顶层继承来的那条)
+    ///
+    /// "关掉"的语义是**清空到目前为止累积的表**,所以排在最后的
+    /// `--no-extra-headers` 一定赢;而 provider 级开关只清配置层那一份,
+    /// 环境变量/命令行仍能再加 —— 排查网关问题时"这次一个头都不发"才有用。
+    ///
+    /// 校验:保留头(`Authorization`/`Host`/…)、非法头名/头值一律**跳过并留提示**
+    /// (不阻断启动);值里的 `${VAR}` / `$VAR` 先展开,未设置的环境变量保留原样
+    /// 并提示。返回 (生效头, 要提示给用户的话)。
+    pub fn resolve_headers(
+        &self,
+        provider: &str,
+        ov: &HeaderOverride,
+    ) -> (EffectiveHeaders, Vec<String>) {
+        let mut notes: Vec<String> = Vec::new();
+        // 小写名唯一、保原始大小写的累积表;同名后写覆盖先写
+        let mut map: Vec<(String, String)> = Vec::new();
+
+        // ③ 配置文件:顶层开关是**总闸** —— 关了连 provider 自己那张表也不看
+        // (provider 级开关只能"这家不发",不能再把总闸拧开)
+        if self.extra_headers_enabled != Some(false) {
+            apply_headers(&self.extra_headers, &mut map, &mut notes);
+            if let Some(def) = self.all_providers().get(provider) {
+                if def.extra_headers_enabled == Some(false) {
+                    // 这家单独关:连顶层继承来的也一起清掉
+                    map.clear();
+                } else {
+                    apply_headers(&def.extra_headers, &mut map, &mut notes);
+                }
+            }
+        }
+
+        // ② 专用环境变量
+        if env_flag_set("ZNAIDE_NO_EXTRA_HEADERS") {
+            map.clear();
+        } else if let Some(raw) =
+            env_first(&["ZNAIDE_EXTRA_HEADERS"]).filter(|v| !v.trim().is_empty())
+        {
+            match serde_json::from_str::<std::collections::HashMap<String, String>>(&raw) {
+                Ok(entries) => apply_headers(&entries, &mut map, &mut notes),
+                Err(e) => notes.push(format!(
+                    "ZNAIDE_EXTRA_HEADERS 不是合法的 JSON 对象({e}),已忽略"
+                )),
+            }
+        }
+
+        // ① CLI(追加在最上层)
+        if ov.no_headers {
+            map.clear();
+        } else {
+            for (k, v) in &ov.add {
+                let mut one = std::collections::HashMap::new();
+                one.insert(k.clone(), v.clone());
+                apply_headers(&one, &mut map, &mut notes);
+            }
+        }
+
+        // 排一次序:大小写不敏感,结果稳定(便于比较与展示)
+        map.sort_by_cached_key(|(name, _)| name.to_ascii_lowercase());
+        (EffectiveHeaders::from_pairs(map), notes)
     }
 
 }
@@ -639,6 +923,14 @@ impl Config {
     pub fn save_provider(&mut self, name: &str, def: &ProviderDef) -> anyhow::Result<()> {
         self.ensure_build_tag();
         self.providers.insert(name.to_string(), def.clone());
+        self.persist()
+    }
+
+    /// 切换预设请求头总开关并落盘(向导里那个开关用)。
+    /// 开 = 回到缺省(键不落盘,配置保持干净);关 = 显式写 `false`。
+    pub fn save_extra_headers_enabled(&mut self, enabled: bool) -> anyhow::Result<()> {
+        self.ensure_build_tag();
+        self.extra_headers_enabled = if enabled { None } else { Some(false) };
         self.persist()
     }
 
@@ -797,6 +1089,8 @@ mod tests {
             providers: Default::default(),
             proxy: Default::default(),
             retry: None,
+            extra_headers_enabled: None,
+            extra_headers: Default::default(),
         };
         let r = cfg
             .resolve(Some("cli-model".into()), None, None, None)
@@ -841,6 +1135,8 @@ mod tests {
             providers,
             proxy: Default::default(),
             retry: None,
+            extra_headers_enabled: None,
+            extra_headers: Default::default(),
         };
         let r = cfg.resolve(None, None, None, None).unwrap();
         assert_eq!(r.base_url, "http://127.0.0.1:8080/v1");
@@ -1428,5 +1724,269 @@ mod tests {
         assert_eq!(cfg.effective_retry(), 3);
         cfg.retry = Some(99);
         assert_eq!(cfg.effective_retry(), MAX_RETRY, "超上限要夹住");
+    }
+
+    // ---- 预设请求头 ----
+    // 这些用例会动 ZNAIDE_EXTRA_HEADERS / ZNAIDE_NO_EXTRA_HEADERS,自己串行一把
+    static HEADER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn clear_header_env() {
+        for v in [
+            "ZNAIDE_EXTRA_HEADERS",
+            "ZNAIDE_NO_EXTRA_HEADERS",
+            "ZNAIDE_TEST_TENANT",
+        ] {
+            std::env::remove_var(v);
+        }
+    }
+
+    fn hmap(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn hpairs(h: &EffectiveHeaders) -> Vec<(String, String)> {
+        h.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    /// 没配的人:一条头都不发,config.json 里也不该多出这两个键(零行为变化)
+    #[test]
+    fn headers_absent_by_default_and_key_skipped() {
+        let _g = HEADER_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_header_env();
+
+        let cfg = Config::default();
+        let (h, notes) = cfg.resolve_headers("ollama", &HeaderOverride::default());
+        assert!(h.is_empty());
+        assert!(notes.is_empty(), "{notes:?}");
+
+        let text = serde_json::to_string(&cfg).unwrap();
+        assert!(!text.contains("extra_headers"), "默认配置不该写这两键:{text}");
+    }
+
+    /// 优先级:CLI > ZNAIDE_EXTRA_HEADERS > 配置文件(provider 表叠在顶层表之上)
+    #[test]
+    fn headers_priority_cli_then_dedicated_env_then_config() {
+        let _g = HEADER_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_header_env();
+
+        let mut cfg = Config {
+            extra_headers: hmap(&[("X-Title", "znaide"), ("HTTP-Referer", "https://cfg")]),
+            ..Default::default()
+        };
+        cfg.providers.insert(
+            "openrouter".into(),
+            ProviderDef {
+                extra_headers: hmap(&[("X-Title", "znaide-openrouter"), ("X-Tenant-Id", "t1")]),
+                ..Default::default()
+            },
+        );
+
+        // ① 只有配置文件:provider 覆盖同名 X-Title、追加 X-Tenant-Id,顶层其余保留
+        let (h, notes) = cfg.resolve_headers("openrouter", &HeaderOverride::default());
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(
+            hpairs(&h),
+            vec![
+                ("HTTP-Referer".to_string(), "https://cfg".to_string()),
+                ("X-Tenant-Id".to_string(), "t1".to_string()),
+                ("X-Title".to_string(), "znaide-openrouter".to_string()),
+            ]
+        );
+
+        // 别的 provider 拿不到 openrouter 那份
+        let (h, _) = cfg.resolve_headers("deepseek", &HeaderOverride::default());
+        assert_eq!(
+            hpairs(&h),
+            vec![
+                ("HTTP-Referer".to_string(), "https://cfg".to_string()),
+                ("X-Title".to_string(), "znaide".to_string()),
+            ]
+        );
+
+        // ② 专用环境变量压过配置文件
+        std::env::set_var("ZNAIDE_EXTRA_HEADERS", r#"{"X-Title":"from-env"}"#);
+        let (h, _) = cfg.resolve_headers("openrouter", &HeaderOverride::default());
+        assert!(h.iter().any(|(k, v)| k == "X-Title" && v == "from-env"));
+
+        // ③ 命令行最高,而且是"追加"而不是替换
+        let cli = HeaderOverride {
+            add: vec![("X-Debug-Run".into(), "1".into())],
+            no_headers: false,
+        };
+        let (h, _) = cfg.resolve_headers("openrouter", &cli);
+        assert!(h.iter().any(|(k, v)| k == "X-Title" && v == "from-env"));
+        assert!(h.iter().any(|(k, v)| k == "X-Debug-Run" && v == "1"));
+
+        // ④ --no-extra-headers 清空一切(排最后,所以一定赢)
+        let (h, _) = cfg.resolve_headers(
+            "openrouter",
+            &HeaderOverride {
+                add: vec![("X-Debug-Run".into(), "1".into())],
+                no_headers: true,
+            },
+        );
+        assert!(h.is_empty());
+
+        // ⑤ ZNAIDE_NO_EXTRA_HEADERS 同理:清配置层,但命令行还能再加
+        std::env::remove_var("ZNAIDE_EXTRA_HEADERS");
+        std::env::set_var("ZNAIDE_NO_EXTRA_HEADERS", "1");
+        let cleared = cfg.resolve_headers("openrouter", &HeaderOverride::default()).0;
+        assert!(cleared.is_empty());
+        let (h, _) = cfg.resolve_headers(
+            "openrouter",
+            &HeaderOverride {
+                add: vec![("X-Only".into(), "1".into())],
+                no_headers: false,
+            },
+        );
+        assert_eq!(hpairs(&h), vec![("X-Only".to_string(), "1".to_string())]);
+
+        // 开关写 0/false 视为"没开"
+        std::env::set_var("ZNAIDE_NO_EXTRA_HEADERS", "0");
+        let back = cfg.resolve_headers("openrouter", &HeaderOverride::default()).0;
+        assert!(!back.is_empty());
+
+        clear_header_env();
+    }
+
+    /// provider 层:覆盖同名、空串删除继承来的、单独关一家;顶层是总闸
+    #[test]
+    fn headers_provider_overrides_and_can_disable() {
+        let _g = HEADER_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_header_env();
+
+        let mut cfg = Config {
+            extra_headers: hmap(&[("X-Keep", "1"), ("X-Drop", "2")]),
+            ..Default::default()
+        };
+        cfg.providers.insert(
+            "g".into(),
+            ProviderDef {
+                extra_headers: hmap(&[("X-Drop", ""), ("X-Add", "3")]),
+                ..Default::default()
+            },
+        );
+
+        let (h, notes) = cfg.resolve_headers("g", &HeaderOverride::default());
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(
+            hpairs(&h),
+            vec![
+                ("X-Add".to_string(), "3".to_string()),
+                ("X-Keep".to_string(), "1".to_string()),
+            ],
+            "空串删掉继承来的 X-Drop"
+        );
+
+        // 这家单独关:连顶层继承来的也不发
+        cfg.providers.get_mut("g").unwrap().extra_headers_enabled = Some(false);
+        let off = cfg.resolve_headers("g", &HeaderOverride::default()).0;
+        assert!(off.is_empty());
+
+        // 顶层总闸关掉:provider 自己那张表也不看(不是"provider 能拧开")
+        cfg.providers.get_mut("g").unwrap().extra_headers_enabled = None;
+        cfg.extra_headers_enabled = Some(false);
+        assert!(cfg.resolve_headers("g", &HeaderOverride::default()).0.is_empty());
+        assert!(cfg
+            .resolve_headers("other", &HeaderOverride::default())
+            .0
+            .is_empty());
+    }
+
+    /// 保留头与非法项:跳过 + 各提示一次,不阻断启动
+    #[test]
+    fn headers_reserved_and_invalid_are_skipped_with_note() {
+        let _g = HEADER_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_header_env();
+
+        let cfg = Config {
+            extra_headers: hmap(&[
+                ("Authorization", "Bearer 假的"),
+                ("Content-Type", "text/plain"),
+                ("Bad Name", "x"),
+                ("X-Evil", "a\r\nX-Injected: 1"),
+                ("X-Good", "ok"),
+            ]),
+            ..Default::default()
+        };
+        let (h, notes) = cfg.resolve_headers("ollama", &HeaderOverride::default());
+        assert_eq!(hpairs(&h), vec![("X-Good".to_string(), "ok".to_string())]);
+        assert_eq!(notes.len(), 4, "四条问题各提示一次:{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("Authorization")));
+        assert!(notes.iter().any(|n| n.contains("Content-Type")));
+        assert!(notes.iter().any(|n| n.contains("保留头")));
+        assert!(notes.iter().any(|n| n.contains("头名不合法")));
+        assert!(notes.iter().any(|n| n.contains("非法字符")));
+    }
+
+    /// 值里的 ${VAR} / $VAR 展开;未设置的环境变量保留原样 + 提示
+    #[test]
+    fn headers_env_var_expansion() {
+        let _g = HEADER_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_header_env();
+        std::env::set_var("ZNAIDE_TEST_TENANT", "t-42");
+
+        let cfg = Config {
+            extra_headers: hmap(&[
+                ("X-Tenant-Id", "${ZNAIDE_TEST_TENANT}"),
+                ("X-Also", "$ZNAIDE_TEST_TENANT"),
+                ("X-Missing", "${ZNAIDE_TEST_NOPE}"),
+                ("X-Literal", "价格 $ 5"),
+            ]),
+            ..Default::default()
+        };
+        let (h, notes) = cfg.resolve_headers("ollama", &HeaderOverride::default());
+        let get = |k: &str| {
+            h.iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+                .unwrap()
+        };
+        assert_eq!(get("X-Tenant-Id"), "t-42");
+        assert_eq!(get("X-Also"), "t-42");
+        assert_eq!(get("X-Missing"), "${ZNAIDE_TEST_NOPE}", "读不到就原样发,别静默丢");
+        assert_eq!(get("X-Literal"), "价格 $ 5");
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("ZNAIDE_TEST_NOPE"));
+
+        clear_header_env();
+    }
+
+    /// 开关落盘:关 = 写 false;开 = 回到缺省(键不落盘)
+    #[test]
+    fn headers_switch_roundtrips_through_save() {
+        let _g = crate::test_util::DATA_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("znaide_cfg_eh_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("ZNAIDE_DATA_DIR", &dir);
+
+        let mut cfg = Config::load().unwrap_or_default();
+        assert_eq!(cfg.extra_headers_enabled, None);
+        cfg.save_extra_headers_enabled(false).unwrap();
+        assert_eq!(Config::load().unwrap().extra_headers_enabled, Some(false));
+
+        let mut cfg = Config::load().unwrap();
+        cfg.extra_headers_enabled = Some(true);
+        cfg.save_extra_headers_enabled(true).unwrap();
+        assert_eq!(cfg.extra_headers_enabled, None, "开 = 回到缺省");
+        let text = std::fs::read_to_string(dir.join("config.json")).unwrap();
+        assert!(
+            !text.contains("extra_headers_enabled"),
+            "缺省不该写进文件:{text}"
+        );
+
+        // 老配置没有这两个键照常读
+        let legacy: Config = serde_json::from_str(r#"{"model":"m"}"#).unwrap();
+        assert_eq!(legacy.extra_headers_enabled, None);
+        assert!(legacy.extra_headers.is_empty());
+
+        std::env::remove_var("ZNAIDE_DATA_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

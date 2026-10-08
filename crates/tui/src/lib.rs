@@ -5,6 +5,8 @@ pub mod app;
 pub mod md;
 pub mod config_ui;
 pub mod sessions_ui;
+#[cfg(test)]
+pub mod test_util;
 
 use znaide_core::config::Resolved;
 use znaide_core::permissions::Mode;
