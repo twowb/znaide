@@ -14,10 +14,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use znaide_core::session::{list_history_sessions_detailed, remove_session, write_note};
-use znaide_core::tools::memory::{delete_memory, list_memories};
+use znaide_core::tools::memory::{delete_memory, list_memories, memory_path, Scope};
 
 /// 备注长度上限(与 app.rs 的 /note 一致)
 const NOTE_MAX_LEN: usize = 200;
@@ -57,8 +57,20 @@ struct MemoryRow {
     name: String,
     desc: String,
     mtype: String,
+    /// 存在哪一级(Global / Project)—— 列表要标出来,删除也要按它走
+    source: Scope,
     size_kb: u64,
     modified: u64,
+}
+
+impl MemoryRow {
+    /// 来源角标:G = 全局(随用户)/ P = 项目(随仓库)
+    fn source_badge(&self) -> &'static str {
+        match self.source {
+            Scope::Global => "G",
+            Scope::Project => "P",
+        }
+    }
 }
 
 /// 窗口内部模式
@@ -96,6 +108,8 @@ pub struct SessionsUi {
     /// 已生效的筛选词(小写)。以前筛选只活在 Mode::Filter 里,一按 Enter 就没了——
     /// 敲完筛选结果立刻恢复全量,也就没法"筛完再上下翻着挑",现在 Enter 保留、Esc 清除。
     filter: String,
+    /// 打开窗口时的工作目录:项目级记忆跟着它走(列表要读、删除要按作用域定位)
+    cwd: PathBuf,
     /// 最近一次操作结果 (是否成功, 文本)
     status: Option<(bool, String)>,
 }
@@ -155,8 +169,8 @@ fn short(s: &str, max: usize) -> String {
 }
 
 impl SessionsUi {
-    /// 打开窗口:载入全部历史会话与长期记忆(宿主在空闲时调用)
-    pub fn open(current_session_id: &str) -> Self {
+    /// 打开窗口:载入全部历史会话与两级长期记忆(宿主在空闲时调用)
+    pub fn open(current_session_id: &str, cwd: &Path) -> Self {
         let mut sessions = Vec::new();
         for h in list_history_sessions_detailed() {
             let id = h
@@ -182,13 +196,14 @@ impl SessionsUi {
                 is_current,
             });
         }
-        let mems = list_memories()
+        let mems = list_memories(cwd)
             .into_iter()
             .map(|m| MemoryRow {
                 filename: m.filename,
                 name: m.name,
                 desc: m.description,
                 mtype: m.mtype,
+                source: m.source,
                 size_kb: m.size / 1024,
                 modified: m.modified,
             })
@@ -205,6 +220,7 @@ impl SessionsUi {
             scroll: 0,
             mode: Mode::Browse,
             filter: String::new(),
+            cwd: cwd.to_path_buf(),
             status: None,
         }
     }
@@ -232,7 +248,12 @@ impl SessionsUi {
             }
             Tab::Memories => {
                 let m = &self.mems[i];
-                format!("{} {} {} {}", m.name, m.desc, m.filename, m.mtype).to_lowercase()
+                // 来源词也进索引:敲 / 后打 "项目" 或 "project" 就能只看某一级
+                let scope = match m.source {
+                    Scope::Global => "全局 global",
+                    Scope::Project => "项目 project",
+                };
+                format!("{} {} {} {} {}", m.name, m.desc, m.filename, m.mtype, scope).to_lowercase()
             }
         }
     }
@@ -398,7 +419,7 @@ impl SessionsUi {
             }
             Tab::Memories => {
                 for &i in &idxs {
-                    match delete_memory(&self.mems[i].filename) {
+                    match delete_memory(&self.mems[i].filename, self.mems[i].source, &self.cwd) {
                         Ok(true) => done += 1,
                         Ok(false) => {
                             failed += 1;
@@ -460,15 +481,12 @@ impl SessionsUi {
         let Some(row) = self.mems.get(self.cursor) else {
             return;
         };
-        let raw = std::fs::read_to_string(
-            znaide_core::config::data_dir()
-                .join("memories")
-                .join(format!("{}.md", row.filename)),
-        )
-        .unwrap_or_default();
+        let raw = memory_path(&row.filename, row.source, &self.cwd)
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_default();
         let body: Vec<String> = strip_frontmatter(&raw).lines().map(|l| l.to_string()).collect();
         self.mode = Mode::Detail {
-            title: format!("{} — {}", row.name, row.desc),
+            title: format!("[{}] {} — {}", row.source_badge(), row.name, row.desc),
             body,
             offset: 0,
         };
@@ -760,7 +778,16 @@ impl SessionsUi {
             },
             Mode::ConfirmDelete => (
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                format!("⚠ 删除确认:将删 {} 条(y 确认 / n 或 Esc 取消)", self.marked_count_for_delete()),
+                match self.delete_scope_summary() {
+                    Some(s) => format!(
+                        "⚠ 删除确认:将删 {} 条({s})(y 确认 / n 或 Esc 取消)",
+                        self.marked_count_for_delete()
+                    ),
+                    None => format!(
+                        "⚠ 删除确认:将删 {} 条(y 确认 / n 或 Esc 取消)",
+                        self.marked_count_for_delete()
+                    ),
+                },
             ),
             Mode::EditNote(buf) => (
                 Style::default().fg(Color::Cyan),
@@ -821,7 +848,8 @@ impl SessionsUi {
                         cursor_line = Some(lines.len());
                     }
                     lines.push(format!(
-                        "{mark}{cur} {} — {}{ty} · {}KB · {}",
+                        "{mark}{cur} [{}] {} — {}{ty} · {}KB · {}",
+                        m.source_badge(),
                         m.name,
                         short(&m.desc, 36),
                         m.size_kb,
@@ -853,6 +881,23 @@ impl SessionsUi {
     /// 确认框里显示的实际将删条数
     fn marked_count_for_delete(&self) -> usize {
         self.delete_candidates().len()
+    }
+
+    /// 记忆页删除确认要写清作用域:两级可能有同名,删错级等于删了另一个项目的记录。
+    /// 会话页没有作用域之分,返回 None。
+    fn delete_scope_summary(&self) -> Option<String> {
+        if !matches!(self.tab, Tab::Memories) {
+            return None;
+        }
+        let idxs = self.delete_candidates();
+        if idxs.is_empty() {
+            return None;
+        }
+        let project = idxs
+            .iter()
+            .filter(|&&i| self.mems[i].source == Scope::Project)
+            .count();
+        Some(format!("项目 {} 条 / 全局 {} 条", project, idxs.len() - project))
     }
 
     /// 让光标行可见的最小滚动值
@@ -896,11 +941,16 @@ mod tests {
     }
 
     fn mem(filename: &str, name: &str) -> MemoryRow {
+        mem_in(filename, name, Scope::Global)
+    }
+
+    fn mem_in(filename: &str, name: &str, source: Scope) -> MemoryRow {
         MemoryRow {
             filename: filename.to_string(),
             name: name.to_string(),
             desc: format!("关于{name}的记忆"),
             mtype: "project".to_string(),
+            source,
             size_kb: 1,
             modified: now_secs(),
         }
@@ -924,6 +974,7 @@ mod tests {
             scroll: 0,
             mode: Mode::Browse,
             filter: String::new(),
+            cwd: dir.clone(),
             status: None,
         };
         (ui, dir)
@@ -1107,5 +1158,83 @@ mod tests {
         ui.clamp_cursor();
         assert!(ui.empty());
         assert!(matches!(ui.on_key(key(KeyCode::Enter)), UiAction::None));
+    }
+
+    /// 记忆页:来源词进过滤索引,能只看某一级
+    #[test]
+    fn memory_page_filters_by_scope() {
+        let (mut ui, _d) = fake_ui();
+        ui.tab = Tab::Memories;
+        ui.mems = vec![
+            mem_in("proj", "本仓约定", Scope::Project),
+            mem_in("env", "机器环境", Scope::Global),
+        ];
+        ui.mem_marks = vec![false; 2];
+
+        ui.filter = "项目".into();
+        assert_eq!(ui.visible_len(), 1, "筛'项目'只剩项目级");
+        assert!(ui.row_visible(0, &ui.active_filter()));
+
+        ui.filter = "global".into();
+        assert_eq!(ui.visible_len(), 1, "筛'global'只剩全局");
+        assert!(ui.row_visible(1, &ui.active_filter()));
+
+        ui.filter.clear();
+        assert_eq!(ui.visible_len(), 2);
+    }
+
+    /// 记忆页删除:按行自己的 scope 定位(同名另一级不动),确认框写明作用域
+    #[test]
+    fn memory_delete_uses_row_scope() {
+        let _g = crate::test_util::DATA_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir().join(format!("znaide_su_mem_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let data = base.join("data");
+        let cwd = base.join("cwd");
+        std::fs::create_dir_all(data.join("memories")).unwrap();
+        std::fs::create_dir_all(cwd.join(".znaide").join("memories")).unwrap();
+        std::env::set_var("ZNAIDE_DATA_DIR", &data);
+        let gfile = data.join("memories").join("same.md");
+        let pfile = cwd.join(".znaide").join("memories").join("same.md");
+        std::fs::write(&gfile, "---\nname: 同名\n---\n全局").unwrap();
+        std::fs::write(&pfile, "---\nname: 同名\n---\n项目").unwrap();
+
+        let (mut ui, _d) = fake_ui();
+        ui.tab = Tab::Memories;
+        ui.cwd = cwd.clone();
+        ui.mems = vec![
+            mem_in("same", "同名", Scope::Project),
+            mem_in("same", "同名", Scope::Global),
+        ];
+        // 只标记项目那条:删项目那份,全局同名必须留着
+        ui.mem_marks = vec![true, false];
+        assert_eq!(
+            ui.delete_scope_summary().as_deref(),
+            Some("项目 1 条 / 全局 0 条"),
+            "确认框要写清删的是哪一级"
+        );
+        ui.commit_delete();
+        assert!(!pfile.exists(), "项目那份应删");
+        assert!(gfile.exists(), "全局同名不能被误删");
+
+        // 反过来:只标记全局那条(项目那份重新造一个,验证它不被连带删掉)
+        std::fs::write(&pfile, "---\nname: 同名\n---\n项目").unwrap();
+        ui.mems = vec![
+            mem_in("same", "同名", Scope::Project),
+            mem_in("same", "同名", Scope::Global),
+        ];
+        ui.mem_marks = vec![false, true];
+        assert_eq!(
+            ui.delete_scope_summary().as_deref(),
+            Some("项目 0 条 / 全局 1 条")
+        );
+        ui.commit_delete();
+        assert!(!gfile.exists(), "全局那份应删");
+        assert!(pfile.exists(), "项目同名不能被误删");
+
+        std::env::remove_var("ZNAIDE_DATA_DIR");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

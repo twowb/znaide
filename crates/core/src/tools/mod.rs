@@ -163,25 +163,30 @@ impl ToolRegistry {
             ),
             (
                 "memory_write",
-                "写入一条长期记忆(跨会话保留)。适合记录:用户机器环境、常用配置/路径、用户偏好、重要决策。\
+                "写入一条长期记忆(跨会话保留)。记忆分两级:Global(随用户走,记个人偏好/机器环境)\
+                 与 Project(随当前仓库走,记本仓库的约定/架构/待办);scope 缺省 global。\
+                 适合记录:用户机器环境、常用配置/路径、用户偏好、重要决策、本仓库约定。\
                  内容用 markdown,第一句是结论",
                 schema(
                     json!({
                         "name": {"type": "string", "description": "记忆名称(短,如 '机器硬件配置')"},
                         "content": {"type": "string", "description": "记忆正文(markdown)"},
                         "description": {"type": "string", "description": "一句话描述(用于索引,可选)"},
-                        "mtype": {"type": "string", "description": "类型:user/project/reference/feedback,缺省 project"}
+                        "mtype": {"type": "string", "description": "分类标签:user/project/reference/feedback,缺省 project(只是分类,不决定存哪一级)"},
+                        "scope": {"type": "string", "enum": ["global", "project"], "description": "存哪一级:project = 本仓库的约定/待办(随仓库走);global = 个人偏好/机器环境(随用户走)。缺省 global"}
                     }),
                     &["name", "content"],
                 ),
             ),
             (
                 "memory_read",
-                "读取长期记忆。可按名字精确读取,或按关键词搜索。会话开始已自动注入 MEMORY.md 索引摘要",
+                "读取长期记忆。可按名字精确读取,或按关键词搜索。会话开始已自动注入两级的 MEMORY.md 索引摘要。\
+                 缺省两级都读:同名的两条都会返回并标注来源(项目在前)",
                 schema(
                     json!({
                         "query": {"type": "string", "description": "关键词搜索(可选)"},
-                        "name": {"type": "string", "description": "精确读取某条记忆的名字(可选)"}
+                        "name": {"type": "string", "description": "精确读取某条记忆的名字(可选)"},
+                        "scope": {"type": "string", "enum": ["global", "project", "all"], "description": "只读哪一级;缺省或 all = 两级都读(结果按来源分组)"}
                     }),
                     &[],
                 ),

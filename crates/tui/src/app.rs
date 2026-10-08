@@ -1144,7 +1144,8 @@ pub async fn run(
                             }
                             Some(SlashOutcome::OpenSessions) => {
                                 // /resume 无参:打开全屏会话管理窗口
-                                sessions_ui = Some(SessionsUi::open(&session_id));
+                                // (cwd 要给:项目级记忆跟着工作目录走)
+                                sessions_ui = Some(SessionsUi::open(&session_id, cwd));
                             }
                             None => {}
                         }
