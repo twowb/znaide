@@ -11,14 +11,13 @@ use std::io::stdout;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
-use tokio_util::sync::CancellationToken;
 use crate::config_ui::{SetupWizard, WizardAction};
 use crate::sessions_ui::{SessionsUi, UiAction};
 use znaide_core::config::Resolved;
-use znaide_core::llm::OpenAiClient;
+use znaide_host::agent::AgentCmd;
 use znaide_core::permissions::Mode;
 use znaide_core::session::{
-    list_history_sessions_detailed, remove_session, Session, SessionEvent, SharedInbox,
+    list_history_sessions_detailed, remove_session, SessionEvent, SharedInbox,
 };
 
 /// 配置向导异步结果回传
@@ -26,27 +25,6 @@ enum WizardReply {
     Models(Result<Vec<String>, String>),
     Verify(Result<(), String>),
 }
-
-/// 发送给 agent 的命令
-enum AgentCmd {
-    Prompt(String),
-    SetMode(Mode),
-    /// 从历史文件恢复会话
-    LoadHistory(PathBuf),
-    /// 运行时重配置(切换 provider/模型/端点/key,立即生效)
-    Reconfigure(Resolved),
-    /// 手动触发技能:/技能名 [参数](可能含入口脚本,由 agent 侧统一执行)
-    RunSkill { name: String, args: String },
-    /// 清空会话上下文与历史文件(经确认后发送)
-    ClearContext,
-    /// 压缩上下文(旧消息 → 摘要,腾出上下文空间)
-    Compact,
-    /// 切换全局人格(/persona <名字>;空/无 = 关闭),写回配置持久生效
-    SetPersona(String),
-}
-
-/// 共享取消槽:UI 侧随时可取消"当前回合"
-type SharedCancel = std::sync::Arc<std::sync::Mutex<Option<CancellationToken>>>;
 
 /// UI 输入事件:按键或粘贴文本
 enum UiEvent {
@@ -259,30 +237,6 @@ fn disable_mouse_capture() -> std::io::Result<()> {
     crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture)
 }
 
-/// 生效的轮数上限:命令行 `--max-turns` 覆盖 > config 的 `max_turns`(0 = 不限)> 200。
-/// 启动与 `/config` 重配都走它,让"命令行优先"在交互模式里同样成立。
-fn effective_max_turns(cli_override: Option<usize>) -> usize {
-    cli_override.unwrap_or_else(|| {
-        znaide_core::config::Config::load()
-            .map(|c| c.effective_max_turns())
-            .unwrap_or(znaide_core::session::DEFAULT_MAX_TURNS)
-    })
-}
-
-/// 弱网重试的追加尝试次数:命令行 `--retry`/`--no-retry` > config `retry` > 0(关)。
-/// 与 `effective_max_turns` 同一套路:启动与 `/config` 重配处都调一次。
-fn effective_retry(cli_retry: Option<usize>, no_retry: bool) -> usize {
-    if no_retry {
-        return 0;
-    }
-    if let Some(n) = cli_retry {
-        return n.min(znaide_core::config::MAX_RETRY);
-    }
-    znaide_core::config::Config::load()
-        .map(|c| c.effective_retry())
-        .unwrap_or(0)
-}
-
 /// 交互主循环。resume = `--resume` 指定的历史会话文件;
 /// persona = 启动时注入的全局人格(空 = 不注入)。
 /// max_turns = 命令行 `--max-turns` 覆盖(None = 用 config/默认)。
@@ -314,152 +268,36 @@ pub async fn run(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let llm = OpenAiClient::new(resolved)?;
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<SessionEvent>();
-    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<AgentCmd>();
     // 更新进度/结果通知(update task → UI)
     let (update_tx, mut update_rx) = mpsc::unbounded_channel::<String>();
-    // 共享取消槽:每个回合的新 token 都放这里,UI 的 Esc 直接 cancel 它
-    let shared_cancel: SharedCancel = std::sync::Arc::default();
-    // 运行中插话的投递箱:UI 主循环入队,会话引擎在轮边界取走(两边看同一个队列)
-    let inbox: SharedInbox = std::sync::Arc::default();
 
-    let cwd_buf: PathBuf = cwd.to_path_buf();
-    let shared_cancel_agent = shared_cancel.clone();
-    let inbox_agent = inbox.clone();
     // --resume:直接"开在"被恢复的会话上(沿用其 ID/历史文件,后续对话续写回同一文件)
     let start_session_id: Option<String> = resume
         .as_ref()
         .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()));
 
     // 当前人格(状态栏显示;启动取配置,切换经 PersonaChanged 事件更新)。
-    // 必须在 agent task move persona 之前 clone
+    // 必须在把 persona move 进 AgentConfig 之前 clone
     let mut persona_disp = persona.clone();
 
-    let agent_task = tokio::spawn(async move {
-        let ev_broadcast = ev_tx.clone();
-        // MCP 启动(配置存在时)
-        let mcp_cfg_path = znaide_core::config::data_dir().join("mcp.json");
-        let mcp = if mcp_cfg_path.exists() {
-            let m = znaide_core::mcp::McpManager::start().await;
-            for (name, err) in &m.errors {
-                let _ = ev_broadcast.send(SessionEvent::Notice(format!("⚠ MCP {name}: {err}")));
-            }
-            if !m.client_names().is_empty() {
-                let names = m.client_names().join(", ");
-                let _ = ev_broadcast.send(SessionEvent::Notice(format!("🔌 MCP servers: {names}")));
-            }
-            Some(m)
-        } else {
-            None
-        };
-        let cancel = CancellationToken::new();
-        let mut session = match Session::new(
-            llm,
-            cwd_buf,
+    // 宿主层:动作面 + 后台任务 + 取消槽/投递箱。引擎驱动全在 host,GUI 复用同一份。
+    let agent = znaide_host::agent::spawn(
+        znaide_host::agent::AgentConfig {
+            resolved: resolved.clone(),
+            cwd: cwd.to_path_buf(),
             mode,
-            Some(ev_tx.clone()),
-            cancel.clone(),
-            true,
-            start_session_id.clone(),
-            mcp,
-            &persona,
-        ) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        // 轮数上限:--max-turns > config 的 max_turns(0 = 不限)> 默认。
-        // 以前这里只读 config,`znaide --max-turns N` 在交互模式下被静默忽略。
-        session.set_max_turns(effective_max_turns(max_turns));
-        // 弱网重试:--retry / --no-retry > config 的 retry > 0(关,旧行为)
-        session.set_retry(effective_retry(retry, no_retry));
-        // 运行中插话:引擎在每个轮边界从这个投递箱取一条插进对话(见 InputQueue)
-        session.set_inbox(inbox_agent);
-        if !persona.is_empty() {
-            let _ = ev_tx.send(SessionEvent::Notice(format!(
-                "人格:{persona}(全局生效,输入 /persona 可切换或关闭)"
-            )));
-        }
-        loop {
-            tokio::select! {
-                cmd = cmd_rx.recv() => match cmd {
-                    Some(AgentCmd::Prompt(p)) => {
-                        // 每个新回合:换新 token 并放入共享槽(旧 token 一经取消即失效,不可复用)
-                        let round_cancel = CancellationToken::new();
-                        *shared_cancel_agent.lock().unwrap() = Some(round_cancel.clone());
-                        session.reset_cancel(round_cancel);
-                        let _ = session.run_turn(&p).await;
-                        // 回合结束,清空槽,避免误取消下一回合
-                        *shared_cancel_agent.lock().unwrap() = None;
-                    }
-                    Some(AgentCmd::SetMode(m)) => {
-                        session.set_mode(m);
-                    }
-                    Some(AgentCmd::RunSkill { name, args }) => {
-                        let round_cancel = CancellationToken::new();
-                        *shared_cancel_agent.lock().unwrap() = Some(round_cancel.clone());
-                        session.reset_cancel(round_cancel);
-                        let _ = session.run_skill_turn(&name, &args).await;
-                        *shared_cancel_agent.lock().unwrap() = None;
-                    }
-                    Some(AgentCmd::Reconfigure(r)) => {
-                        // 代理不跟着模型重配走:界面这一轮不提供代理入口,拿当前生效那份
-                        // 顶上,免得一次 /config 就把 --proxy 或配置文件里的代理冲掉。
-                        // (将来 GUI 在设置页给出代理入口时,这里改成用 r.proxy)
-                        let mut r = r;
-                        r.proxy = session.proxy().clone();
-                        if let Err(e) = session.reconfigure(&r) {
-                            session.notify(format!("⚠ 重配失败(仍用原连接):{e}"));
-                        }
-                        // 轮数上限也跟着重读(/config 改了 max_turns 立即生效;
-                        // 命令行给了 --max-turns 的话仍然它优先)。
-                        // 状态栏的 round_limit 由宿主在保存配置处同步(这里在 agent 任务里,拿不到 UI 变量)
-                        session.set_max_turns(effective_max_turns(max_turns));
-                        // 重试次数也跟着重读(/config 改了 retry 立即生效;命令行仍优先)
-                        session.set_retry(effective_retry(retry, no_retry));
-                        session.notify(format!(
-                            "✔ 配置已切换: {} / {}",
-                            r.provider_name, r.model
-                        ));
-                    }
-                    Some(AgentCmd::LoadHistory(path)) => {
-                        match session.load_history(&path) {
-                            Ok(n) => {
-                                session.notify(format!(
-                                    "已恢复历史会话({} 条消息),可继续对话。历史文件:{}\n⚠ 恢复后最好核对一下上下文,模型未必理解此前的中间状态。",
-                                    n, path.display()
-                                ));
-                            }
-                            Err(e) => {
-                                session.notify(format!("恢复历史失败: {e}"));
-                            }
-                        }
-                    }
-                    Some(AgentCmd::ClearContext) => {
-                        // 清空上下文与历史文件;完成后经 ContextCleared 事件通知 UI
-                        session.clear_context();
-                    }
-                    Some(AgentCmd::Compact) => {
-                        // 进行中状态由 CompactionStarted / ContextCompacted / TurnFinished 事件驱动
-                        match session.compact_context().await {
-                            Ok(0) => session.notify("上下文还短,无需压缩。"),
-                            Ok(_n) => {
-                                // 完成提示经 ContextCompacted 事件展示(含摘要),无需重复通知
-                            }
-                            Err(e) => session.notify(format!("⚠ 上下文压缩失败: {e}")),
-                        }
-                    }
-                    Some(AgentCmd::SetPersona(name)) => {
-                        if let Err(e) = session.set_persona(&name) {
-                            session.notify(format!("⚠ {e}"));
-                        }
-                    }
-                    None => break,
-                },
-                _ = cancel.cancelled() => {}
-            }
-        }
-    });
+            persona,
+            max_turns,
+            retry,
+            no_retry,
+            resume_session_id: start_session_id,
+        },
+        ev_tx.clone(),
+    )?;
+    let cmd_tx = agent.cmd_tx();
+    // 运行中插话的投递箱:UI 主循环入队,会话引擎在轮边界取走(两边看同一个队列)
+    let inbox = agent.inbox();
 
     let mut items: Vec<MsgItem> = vec![MsgItem::Logo];
     items.push(MsgItem::Notice(
@@ -515,7 +353,7 @@ pub async fn run(
     let mut ctx_window = current_resolved.effective_context_window();
     // 轮次:本轮已用轮数 / 上限(0 = 不限),状态栏展示用
     let mut round_used: usize = 0;
-    let mut round_limit: usize = effective_max_turns(max_turns);
+    let mut round_limit: usize = znaide_host::policy::max_turns(max_turns);
     // 当前会话 id(agent 经 SessionInfo 事件回传,状态栏展示用)
     let mut session_id = String::new();
     // 配置向导(None = 对话模式)
@@ -1177,9 +1015,7 @@ pub async fn run(
             match k.code {
                 KeyCode::Esc => {
                     if busy {
-                        if let Some(tok) = shared_cancel.lock().unwrap().as_ref() {
-                            tok.cancel();
-                        }
+                        agent.cancel_round();
                         items.push(MsgItem::Notice("⏹ 已请求中断…".into()));
                     }
                 }
@@ -1272,7 +1108,7 @@ pub async fn run(
                                             }
                                             Ok(()) => {
                                                 // 状态栏立即跟上新的轮数上限(命令行 --max-turns 仍优先)
-                                                round_limit = effective_max_turns(max_turns);
+                                                round_limit = znaide_host::policy::max_turns(max_turns);
                                                 let _ = cmd_tx.send(AgentCmd::Reconfigure(draft.clone()));
                                                 current_resolved = draft.clone();
                                                 // 配置变了,窗口跟着刷新(状态栏 ctx 条用的就是它)
@@ -1393,7 +1229,7 @@ pub async fn run(
         }
     }
 
-    agent_task.abort();
+    agent.shutdown();
     {
         // 与启动镜像反序还原(Windows 上 crossterm 的 console mode 快照是链式的)
         let _ = disable_mouse_capture();
@@ -4362,12 +4198,6 @@ mod ctx_usage_tests {
         assert!(capped.chars().count() < long.chars().count());
     }
 
-    /// 轮数上限优先级:命令行 --max-turns 覆盖 config(0 = 不限,不能被换成默认)
-    #[test]
-    fn cli_max_turns_overrides_config() {
-        assert_eq!(effective_max_turns(Some(5)), 5);
-        assert_eq!(effective_max_turns(Some(0)), 0);
-    }
 }
 
 #[cfg(test)]

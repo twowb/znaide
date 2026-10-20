@@ -7,4 +7,6 @@ license.workspace = true
 
 [dependencies]
 znaide-core = { path = "../core" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
 anyhow = { workspace = true }
