@@ -12,6 +12,8 @@ use std::path::PathBuf;
 use anyhow::Result;
 use znaide_core::config::{Config, EffectiveProxy, HeaderOverride, ProxyOverride, Resolved};
 
+use crate::policy::RetryOverride;
+
 /// 提示级别。前端据此决定前缀/配色(CLI: ⚠ / 原样;GUI: 黄色 / 灰色 Toast)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoteLevel {
@@ -57,8 +59,7 @@ pub struct StartupArgs {
     pub provider: Option<String>,
     pub proxy: ProxyOverride,
     pub headers: HeaderOverride,
-    pub retry: Option<usize>,
-    pub no_retry: bool,
+    pub retry: RetryOverride,
     pub max_turns: Option<usize>,
     /// `--resume` 的原始参数(会话 ID 或文件名片段);`None` = 不恢复。
     /// 无头模式由前端自行忽略(host 不区分模式)。
@@ -85,6 +86,8 @@ pub struct Prepared {
     pub resume_error: Option<String>,
     /// 生效的重试次数(`--no-retry` > `--retry N` > 配置 > 0)
     pub retry: usize,
+    /// 命令行的重试覆盖(`/config` 重配时还要用它重新算)
+    pub retry_override: RetryOverride,
     /// 命令行 `--max-turns` 覆盖(原样透传;None = 配置/默认)
     pub max_turns: Option<usize>,
     pub notes: Vec<Note>,
@@ -170,7 +173,7 @@ pub fn prepare(args: StartupArgs) -> Result<Prepared> {
         None => (None, None),
     };
 
-    let retry = effective_retry(&cfg, args.retry, args.no_retry);
+    let retry = args.retry.resolve(&cfg);
 
     Ok(Prepared {
         cfg,
@@ -183,21 +186,10 @@ pub fn prepare(args: StartupArgs) -> Result<Prepared> {
         resume,
         resume_error,
         retry,
+        retry_override: args.retry,
         max_turns: args.max_turns,
         notes,
     })
-}
-
-/// 弱网重试的追加尝试次数:`--no-retry` > `--retry N` > 配置 > 0(关)。
-/// 启动与将来的"重配"都走这里 —— 政策只有一份,别在前端再抄一遍。
-pub fn effective_retry(cfg: &Config, cli_retry: Option<usize>, no_retry: bool) -> usize {
-    if no_retry {
-        return 0;
-    }
-    match cli_retry {
-        Some(n) => n.min(znaide_core::config::MAX_RETRY),
-        None => cfg.effective_retry(),
-    }
 }
 
 /// 按会话 ID(文件名 stem)或文件名片段定位历史会话;无匹配时列出最近的供参考。

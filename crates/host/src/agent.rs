@@ -18,6 +18,7 @@ use znaide_core::permissions::Mode;
 use znaide_core::session::{Session, SessionEvent, SharedInbox};
 
 use crate::ask::{Ask, Pending, PermissionAsk, RoundsAsk};
+use crate::policy::RetryOverride;
 
 /// 发送给 agent 的命令(动作面)。语义与 TUI 的 slash 命令/按钮一一对应。
 #[derive(Debug)]
@@ -58,8 +59,7 @@ pub struct AgentConfig {
     pub mode: Mode,
     pub persona: String,
     pub max_turns: Option<usize>,
-    pub retry: Option<usize>,
-    pub no_retry: bool,
+    pub retry: RetryOverride,
     /// `--resume` 的会话 ID(沿用该历史文件的身份;None = 新建)
     pub resume_session_id: Option<String>,
 }
@@ -149,7 +149,6 @@ pub fn spawn(cfg: AgentConfig, events: UnboundedSender<HostEvent>) -> Result<Age
         persona,
         max_turns,
         retry,
-        no_retry,
         resume_session_id,
         ..
     } = cfg;
@@ -195,7 +194,7 @@ pub fn spawn(cfg: AgentConfig, events: UnboundedSender<HostEvent>) -> Result<Age
         // 轮数上限:--max-turns > config 的 max_turns(0 = 不限)> 默认。
         session.set_max_turns(crate::policy::max_turns(max_turns));
         // 弱网重试:--retry / --no-retry > config 的 retry > 0(关,旧行为)
-        session.set_retry(crate::policy::retry(retry, no_retry));
+        session.set_retry(retry.resolve_now());
         // 运行中插话:引擎在每个轮边界从这个投递箱取一条插进对话
         session.set_inbox(inbox_agent);
         if !persona.is_empty() {
@@ -236,7 +235,7 @@ pub fn spawn(cfg: AgentConfig, events: UnboundedSender<HostEvent>) -> Result<Age
                         // 轮数上限与重试次数也跟着重读(/config 改了立即生效;
                         // 命令行给了覆盖的话仍以命令行优先)
                         session.set_max_turns(crate::policy::max_turns(max_turns));
-                        session.set_retry(crate::policy::retry(retry, no_retry));
+                        session.set_retry(retry.resolve_now());
                         session.notify(format!(
                             "✔ 配置已切换: {} / {}",
                             r.provider_name, r.model

@@ -149,8 +149,10 @@ async fn main() -> anyhow::Result<()> {
         provider: cli.provider.clone(),
         proxy: proxy_ov.clone(),
         headers: header_ov.clone(),
-        retry: cli.retry,
-        no_retry: cli.no_retry,
+        retry: znaide_host::policy::RetryOverride {
+            cli: cli.retry,
+            no_retry: cli.no_retry,
+        },
         max_turns: cli.max_turns,
         // 无头模式忽略 --resume(下面会提示),交互模式才解析恢复目标
         resume_target: if cli.prompt.is_none() {
@@ -194,31 +196,21 @@ async fn main() -> anyhow::Result<()> {
                 prompt,
                 &prepared.persona,
                 prepared.max_turns,
-                cli.retry,
-                cli.no_retry,
+                prepared.retry,
             )
             .await?;
         }
         None => {
-            // 首次运行(无任何配置来源)自动进配置引导
-            let fallback = prepared.fallback_resolved();
-            let resolved = match &prepared.resolved {
-                Some(r) => r.clone(),
-                None => {
-                    if let Some(e) = &prepared.resolve_error {
-                        eprintln!("⚠ 配置解析: {e}");
-                    }
-                    // 先给个默认值撑住引导界面,真正连接前会被覆盖
-                    fallback
-                }
-            };
+            // 配置解析失败时(首启)提示一次;界面用 host 提供的占位端点撑住
+            if let Some(e) = &prepared.resolve_error {
+                eprintln!("⚠ 配置解析: {e}");
+            }
             // --resume:找不到就打印候选清单并正常退出(不是错误退出码)
             if let Some(e) = &prepared.resume_error {
                 eprintln!("{e}");
                 return Ok(());
             }
-            let resume = prepared.resume.clone();
-            if let Some(p) = &resume {
+            if let Some(p) = &prepared.resume {
                 eprintln!(
                     "▶ 恢复会话 {}…(退出:输入 /quit、/exit 或 Ctrl+C)",
                     p.file_stem()
@@ -226,18 +218,7 @@ async fn main() -> anyhow::Result<()> {
                         .unwrap_or_default()
                 );
             }
-            let stats = run_interactive(
-                &resolved,
-                mode,
-                &prepared.cwd,
-                prepared.first_run,
-                resume,
-                prepared.persona.clone(),
-                cli.max_turns,
-                cli.retry,
-                cli.no_retry,
-            )
-            .await?;
+            let stats = run_interactive(&prepared, mode).await?;
             print_session_stats(&stats);
         }
     }
@@ -306,8 +287,7 @@ async fn run_headless(
     prompt: &str,
     persona: &str,
     max_turns: Option<usize>,
-    retry: Option<usize>,
-    no_retry: bool,
+    retry: usize,
 ) -> anyhow::Result<()> {
     let llm = OpenAiClient::new(resolved)?;
 
@@ -346,7 +326,7 @@ async fn run_headless(
         session.set_max_turns(cfg.effective_max_turns());
     }
     // 弱网重试:命令行(--no-retry 优先)> config > 0(关)
-    session.set_retry(effective_retry(retry, no_retry));
+    session.set_retry(retry);
     let result = session
         .run_turn(prompt)
         .await
@@ -372,38 +352,14 @@ async fn run_headless(
 }
 
 async fn run_interactive(
-    resolved: &Resolved,
+    prepared: &znaide_host::Prepared,
     mode: Mode,
-    cwd: &PathBuf,
-    first_run: bool,
-    resume: Option<PathBuf>,
-    persona: String,
-    max_turns: Option<usize>,
-    retry: Option<usize>,
-    no_retry: bool,
 ) -> anyhow::Result<znaide_tui::ExitStats> {
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         anyhow::bail!("交互模式需要终端。请在终端中运行 znaide,或用 -p \"指令\" 使用无头模式。");
     }
-    let stats = znaide_tui::run(
-        resolved, mode, cwd, first_run, resume, persona, max_turns, retry, no_retry,
-    )
-    .await?;
+    let stats = znaide_tui::run(prepared, mode).await?;
     Ok(stats)
-}
-
-/// 弱网重试的追加尝试次数:`--no-retry` > `--retry N` > config > 0(关)。
-/// 与 max_turns 同一口径:命令行优先,缺省看配置。
-fn effective_retry(cli_retry: Option<usize>, no_retry: bool) -> usize {
-    if no_retry {
-        return 0;
-    }
-    if let Some(n) = cli_retry {
-        return n.min(znaide_core::config::MAX_RETRY);
-    }
-    znaide_core::config::Config::load()
-        .map(|c| c.effective_retry())
-        .unwrap_or(0)
 }
 
 /// 是否已经有可用的配置来源(配置文件 / 命令行覆盖 / 环境变量)。

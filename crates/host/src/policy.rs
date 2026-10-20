@@ -11,9 +11,30 @@ pub fn max_turns(cli: Option<usize>) -> usize {
         .unwrap_or(znaide_core::session::DEFAULT_MAX_TURNS)
 }
 
-/// 弱网重试的追加尝试次数:`--no-retry` > `--retry N` > config `retry` > 0(关)。
-pub fn retry(cli: Option<usize>, no_retry: bool) -> usize {
-    super::prepare::effective_retry(&Config::load().unwrap_or_default(), cli, no_retry)
+/// 重试次数的命令行覆盖。启动与 `/config` 重配共用同一份政策 —— 以前 CLI、TUI 启动、
+/// TUI 重配各抄了一份,是"改了配置没生效"这类 bug 的温床。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetryOverride {
+    pub cli: Option<usize>,
+    pub no_retry: bool,
+}
+
+impl RetryOverride {
+    /// 按配置算出生效值:`--no-retry` > `--retry N` > config `retry` > 0(关)
+    pub fn resolve(&self, cfg: &Config) -> usize {
+        if self.no_retry {
+            return 0;
+        }
+        match self.cli {
+            Some(n) => n.min(znaide_core::config::MAX_RETRY),
+            None => cfg.effective_retry(),
+        }
+    }
+
+    /// 现读配置文件再算(启动与重配都用这个入口)
+    pub fn resolve_now(&self) -> usize {
+        self.resolve(&Config::load().unwrap_or_default())
+    }
 }
 
 #[cfg(test)]
@@ -30,7 +51,9 @@ mod tests {
     /// --no-retry 最高优先;--retry 夹到 0..=MAX_RETRY
     #[test]
     fn retry_override_wins_and_clamps() {
-        assert_eq!(retry(Some(3), true), 0, "--no-retry 压过 --retry");
-        assert_eq!(retry(Some(99), false), znaide_core::config::MAX_RETRY);
+        let off = RetryOverride { cli: Some(3), no_retry: true };
+        assert_eq!(off.resolve_now(), 0, "--no-retry 压过 --retry");
+        let clamped = RetryOverride { cli: Some(99), no_retry: false };
+        assert_eq!(clamped.resolve_now(), znaide_core::config::MAX_RETRY);
     }
 }

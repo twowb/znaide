@@ -8,33 +8,13 @@ pub mod sessions_ui;
 #[cfg(test)]
 pub mod test_util;
 
-use znaide_core::config::Resolved;
 use znaide_core::permissions::Mode;
-use std::path::{Path, PathBuf};
 
 pub use app::ExitStats;
 
-/// 启动交互模式。resolved:模型连接配置;mode:权限模式;cwd:agent 工作目录;
-/// first_run:没有任何配置来源(配置文件 / 环境变量 / 命令行覆盖)时才为 true,
-/// 启动后自动进入配置引导;它同时是"是否已配置可用"的唯一来源(取反即 configured_ok);
-/// resume:启动时直接恢复的历史会话文件(--resume <会话ID|片段>);
-/// persona:启动时注入的全局人格(空 = 不注入);
-/// max_turns:命令行 `--max-turns` 覆盖(优先级高于 config;None = 用 config/默认)。
-/// retry / no_retry:命令行 `--retry` / `--no-retry` 覆盖(同上;`no_retry` 优先)。
+/// 入口:宿主层已把配置/首启/恢复目标/重试/轮数都算好(`host::prepare`),
+/// TUI 只决定"怎么显示、按键怎么映射"。`mode` 是本次权限档(命令行 `--permission`)。
 /// 正常退出(/quit、/exit、Ctrl+C)返回本次会话统计供 CLI 打印。
-pub async fn run(
-    resolved: &Resolved,
-    mode: Mode,
-    cwd: &Path,
-    first_run: bool,
-    resume: Option<PathBuf>,
-    persona: String,
-    max_turns: Option<usize>,
-    retry: Option<usize>,
-    no_retry: bool,
-) -> anyhow::Result<ExitStats> {
-    app::run(
-        resolved, mode, cwd, first_run, resume, persona, max_turns, retry, no_retry,
-    )
-    .await
+pub async fn run(prepared: &znaide_host::Prepared, mode: Mode) -> anyhow::Result<ExitStats> {
+    app::run(prepared, mode).await
 }

@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use crate::config_ui::{SetupWizard, WizardAction};
 use crate::sessions_ui::{SessionsUi, UiAction};
-use znaide_core::config::Resolved;
 use znaide_host::agent::AgentCmd;
 use znaide_core::permissions::Mode;
 use znaide_core::session::{
@@ -242,17 +241,20 @@ fn disable_mouse_capture() -> std::io::Result<()> {
 /// persona = 启动时注入的全局人格(空 = 不注入)。
 /// max_turns = 命令行 `--max-turns` 覆盖(None = 用 config/默认)。
 /// 退出(/quit、/exit、Ctrl+C)时返回本次统计,由 CLI 打印。
-pub async fn run(
-    resolved: &Resolved,
-    mode: Mode,
-    cwd: &Path,
-    first_run: bool,
-    resume: Option<PathBuf>,
-    persona: String,
-    max_turns: Option<usize>,
-    retry: Option<usize>,
-    no_retry: bool,
-) -> anyhow::Result<ExitStats> {
+pub async fn run(prepared: &znaide_host::Prepared, mode: Mode) -> anyhow::Result<ExitStats> {
+    // 与界面无关的准备(配置/首启/恢复目标/重试/轮数)都在 host;这里只解出要用的几项。
+    // 配置解析失败时(首启)用占位端点撑住引导界面,真正连接前会被覆盖。
+    let resolved_owned = match &prepared.resolved {
+        Some(r) => r.clone(),
+        None => prepared.fallback_resolved(),
+    };
+    let resolved = &resolved_owned;
+    let cwd = prepared.cwd.as_path();
+    let first_run = prepared.first_run;
+    let resume = prepared.resume.clone();
+    let persona = prepared.persona.clone();
+    let max_turns = prepared.max_turns;
+    let retry = prepared.retry_override;
     enable_raw_mode()?;
     let mut stdout = stdout();
     // 启用 bracketed paste(多行粘贴整段到达)
@@ -291,7 +293,6 @@ pub async fn run(
             persona,
             max_turns,
             retry,
-            no_retry,
             resume_session_id: start_session_id,
         },
         ev_tx.clone(),
