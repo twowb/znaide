@@ -7,8 +7,10 @@
 //! 依赖方向:`tui → host → core`、`gui → host → core`(两个客户端之间零引用)。
 
 pub mod agent;
+pub mod ask;
 pub mod policy;
 pub mod prepare;
 
-pub use agent::{spawn, AgentCmd, AgentConfig, AgentHandle, SharedCancel};
+pub use agent::{spawn, AgentCmd, AgentConfig, AgentHandle, HostEvent, SharedCancel};
+pub use ask::{Ask, PermissionAsk, RoundsAsk};
 pub use prepare::{prepare, Note, NoteLevel, Prepared, StartupArgs};

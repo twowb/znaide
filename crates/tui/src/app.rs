@@ -10,7 +10,7 @@ use ratatui::Terminal;
 use std::io::stdout;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use crate::config_ui::{SetupWizard, WizardAction};
 use crate::sessions_ui::{SessionsUi, UiAction};
 use znaide_core::config::Resolved;
@@ -95,17 +95,18 @@ fn logo_lines() -> Vec<String> {
 struct PermissionPrompt {
     title: String,
     body: String,
-    /// Some(说明) = 高危命令或目标无法判定:红色渲染,且不提供"本会话都允许"
+    /// Some(说明) = 高危命令或目标无法判定:红色渲染
     warning: Option<String>,
-    tx: oneshot::Sender<(bool, bool)>,
+    /// 是否提供"本会话总是允许"(有 warning 时为 false;host 侧另有兜底)
+    allow_always: bool,
 }
 
 /// 破坏性操作确认(/clear 等),跟权限确认同款全屏弹窗
 #[derive(Debug)]
 enum ConfirmAction {
     ClearSession,
-    /// 轮次预算用尽,问是否再放一批(引擎在等这个回答)
-    ContinueRounds(oneshot::Sender<bool>),
+    /// 轮次预算用尽,问是否再放一批(回答走 host.answer_rounds)
+    ContinueRounds,
 }
 
 struct ConfirmBox {
@@ -268,7 +269,7 @@ pub async fn run(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<SessionEvent>();
+    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<znaide_host::HostEvent>();
     // 更新进度/结果通知(update task → UI)
     let (update_tx, mut update_rx) = mpsc::unbounded_channel::<String>();
 
@@ -717,17 +718,16 @@ pub async fn run(
                 break;
             }
             if let Some(pp) = permission.take() {
-                let danger = pp.warning.is_some();
                 match k.code {
                     KeyCode::Char('y') | KeyCode::Char('Y') => {
-                        let _ = pp.tx.send((true, false));
+                        agent.answer_permission(true, false);
                     }
-                    // 高危/目标无法判定的命令不提供"本会话都允许"
-                    KeyCode::Char('a') | KeyCode::Char('A') if !danger => {
-                        let _ = pp.tx.send((true, true));
+                    // 高危/目标无法判定的命令不提供"本会话都允许"(host 侧也会拒)
+                    KeyCode::Char('a') | KeyCode::Char('A') if pp.allow_always => {
+                        agent.answer_permission(true, true);
                     }
                     KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                        let _ = pp.tx.send((false, false));
+                        agent.answer_permission(false, false);
                     }
                     _ => {
                         permission = Some(pp);
@@ -744,14 +744,14 @@ pub async fn run(
                             items.clear();
                             let _ = cmd_tx.send(AgentCmd::ClearContext);
                         }
-                        ConfirmAction::ContinueRounds(tx) => {
-                            let _ = tx.send(true);
+                        ConfirmAction::ContinueRounds => {
+                            agent.answer_rounds(true);
                             items.push(MsgItem::Notice("▶ 继续执行,再放一批轮次。".into()));
                         }
                     },
                     KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => match cf.action {
-                        ConfirmAction::ContinueRounds(tx) => {
-                            let _ = tx.send(false);
+                        ConfirmAction::ContinueRounds => {
+                            agent.answer_rounds(false);
                             items.push(MsgItem::Notice(
                                 "已停在当前进度;要继续直接再发一条消息。".into(),
                             ));
@@ -1152,23 +1152,41 @@ pub async fn run(
         loop {
             match ev_rx.try_recv() {
                 Ok(ev) => {
+                    // 宿主截下来的询问:权限弹窗 / 轮数续跑确认。
+                    // 这两类不再走 SessionEvent,前端也拿不到 oneshot —— 回答只能经 host。
+                    let ev = match ev {
+                        znaide_host::HostEvent::Ask(ask) => {
+                            match ask {
+                                znaide_host::Ask::Permission(p) => {
+                                    permission = Some(PermissionPrompt {
+                                        title: p.title,
+                                        body: p.body,
+                                        warning: p.warning,
+                                        allow_always: p.allow_always,
+                                    });
+                                }
+                                znaide_host::Ask::Rounds(r) => {
+                                    confirm = Some(ConfirmBox {
+                                        title: "继续执行".into(),
+                                        body: format!(
+                                            "已达 {} 轮工具调用上限,任务还没干完。\n\
+                                             再放一批继续跑吗?(想一次跑更久:启动加 --max-turns N,\
+                                             或在 config.json 里设 max_turns,0 = 不限)",
+                                            r.used
+                                        ),
+                                        action: ConfirmAction::ContinueRounds,
+                                    });
+                                }
+                            }
+                            continue;
+                        }
+                        znaide_host::HostEvent::Session(ev) => ev,
+                    };
                     match ev {
                         // 轮次进度:只更新状态栏,不进消息流
                         SessionEvent::RoundStarted { used, limit } => {
                             round_used = used;
                             round_limit = limit;
-                        }
-                        // 轮次预算用尽:用确认框问用户要不要再放一批(引擎在等回答)
-                        SessionEvent::RoundsExhausted { used, tx } => {
-                            confirm = Some(ConfirmBox {
-                                title: "继续执行".into(),
-                                body: format!(
-                                    "已达 {used} 轮工具调用上限,任务还没干完。\n\
-                                     再放一批继续跑吗?(想一次跑更久:启动加 --max-turns N,\
-                                     或在 config.json 里设 max_turns,0 = 不限)"
-                                ),
-                                action: ConfirmAction::ContinueRounds(tx),
-                            });
                         }
                         other => handle_session_event(
                             other,
@@ -1842,8 +1860,9 @@ fn handle_session_event(
             // 状态栏人格显示跟随切换(空 = 关闭人格)
             *persona = name;
         }
-        SessionEvent::PermissionRequest { title, body, warning, tx, .. } => {
-            *permission = Some(PermissionPrompt { title, body, warning, tx });
+        SessionEvent::PermissionRequest { .. } => {
+            // 正常路径:宿主截住并以 `HostEvent::Ask` 转给前端(见 run 的事件泵)。
+            // 走到这里说明有人绕过了 host —— 丢弃发送端 = 引擎按"拒绝"收尾。
         }
         SessionEvent::RoundsExhausted { .. } => {
             // 正常路径下由事件循环拦截并弹"继续执行"确认框(见 run 的事件泵);

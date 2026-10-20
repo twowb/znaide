@@ -17,6 +17,8 @@ use znaide_core::llm::OpenAiClient;
 use znaide_core::permissions::Mode;
 use znaide_core::session::{Session, SessionEvent, SharedInbox};
 
+use crate::ask::{Ask, Pending, PermissionAsk, RoundsAsk};
+
 /// 发送给 agent 的命令(动作面)。语义与 TUI 的 slash 命令/按钮一一对应。
 #[derive(Debug)]
 pub enum AgentCmd {
@@ -39,6 +41,16 @@ pub enum AgentCmd {
 /// 共享取消槽:前端随时可取消"当前回合"。
 pub type SharedCancel = Arc<Mutex<Option<CancellationToken>>>;
 
+/// 宿主发给前端的事件。
+///
+/// `Session` 是 core 的事件**原样转发**(事件面是 core 的契约);
+/// `Ask` 是宿主截下来的"需要用户回答"——回答走 `answer_permission`/`answer_rounds`,
+/// 前端拿不到 oneshot,也就绕不过政策。
+pub enum HostEvent {
+    Session(SessionEvent),
+    Ask(Ask),
+}
+
 /// 起一个会话任务所需的全部输入(与界面无关)。
 pub struct AgentConfig {
     pub resolved: Resolved,
@@ -57,6 +69,7 @@ pub struct AgentHandle {
     cmd_tx: UnboundedSender<AgentCmd>,
     cancel: SharedCancel,
     inbox: SharedInbox,
+    pending: Arc<Mutex<Option<Pending>>>,
     task: JoinHandle<()>,
 }
 
@@ -83,6 +96,35 @@ impl AgentHandle {
         self.inbox.clone()
     }
 
+    /// 回答工具权限询问。返回 false = 没有待回答的权限询问,或**被政策拒绝**
+    /// (有 `warning` 的请求不接受"本会话总是允许",即使前端发错也按单次放行处理)。
+    pub fn answer_permission(&self, allow: bool, always: bool) -> bool {
+        let mut slot = self.pending.lock().unwrap();
+        match slot.take() {
+            Some(Pending::Permission { tx, allow_always }) => {
+                tx.send(crate::ask::resolve_permission(allow, always, allow_always))
+                    .is_ok()
+            }
+            other => {
+                // 不是权限询问:原样放回,别把别人的 oneshot 吞掉
+                *slot = other;
+                false
+            }
+        }
+    }
+
+    /// 回答轮数续跑询问。返回 false = 当前没有待回答的轮数询问。
+    pub fn answer_rounds(&self, cont: bool) -> bool {
+        let mut slot = self.pending.lock().unwrap();
+        match slot.take() {
+            Some(Pending::Rounds { tx }) => tx.send(cont).is_ok(),
+            other => {
+                *slot = other;
+                false
+            }
+        }
+    }
+
     /// 退出:停掉后台任务(未落盘的回合被丢弃,与旧行为一致)
     pub fn shutdown(&self) {
         self.task.abort();
@@ -91,11 +133,14 @@ impl AgentHandle {
 
 /// 起会话任务。`ev_tx` 是前端的事件出口 —— `SessionEvent` **原样转发**,
 /// 不在这里重新包装(事件面是 core 的契约,GUI 也吃同一份)。
-pub fn spawn(cfg: AgentConfig, ev_tx: UnboundedSender<SessionEvent>) -> Result<AgentHandle> {
+pub fn spawn(cfg: AgentConfig, events: UnboundedSender<HostEvent>) -> Result<AgentHandle> {
     let llm = OpenAiClient::new(&cfg.resolved)?;
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<AgentCmd>();
+    // 引擎事件先进宿主:权限/轮数询问在这里被截下来,其余原样转发给前端
+    let (sess_tx, mut sess_rx) = mpsc::unbounded_channel::<SessionEvent>();
     let cancel: SharedCancel = Arc::default();
     let inbox: SharedInbox = Arc::default();
+    let pending: Arc<Mutex<Option<Pending>>> = Arc::default();
     let cancel_agent = cancel.clone();
     let inbox_agent = inbox.clone();
     let AgentConfig {
@@ -109,18 +154,24 @@ pub fn spawn(cfg: AgentConfig, ev_tx: UnboundedSender<SessionEvent>) -> Result<A
         ..
     } = cfg;
 
+    // 任务里用的发送端(与路由任务各持一份,避免互相 move)
+    let ui_tx_agent = events.clone();
     let task = tokio::spawn(async move {
-        let ev_broadcast = ev_tx.clone();
+        let ui_tx = ui_tx_agent;
         // MCP 启动(配置存在时)
         let mcp_cfg_path = znaide_core::config::data_dir().join("mcp.json");
         let mcp = if mcp_cfg_path.exists() {
             let m = znaide_core::mcp::McpManager::start().await;
             for (name, err) in &m.errors {
-                let _ = ev_broadcast.send(SessionEvent::Notice(format!("⚠ MCP {name}: {err}")));
+                let _ = ui_tx.send(HostEvent::Session(SessionEvent::Notice(format!(
+                    "⚠ MCP {name}: {err}"
+                ))));
             }
             if !m.client_names().is_empty() {
                 let names = m.client_names().join(", ");
-                let _ = ev_broadcast.send(SessionEvent::Notice(format!("🔌 MCP servers: {names}")));
+                let _ = ui_tx.send(HostEvent::Session(SessionEvent::Notice(format!(
+                    "🔌 MCP servers: {names}"
+                ))));
             }
             Some(m)
         } else {
@@ -131,7 +182,7 @@ pub fn spawn(cfg: AgentConfig, ev_tx: UnboundedSender<SessionEvent>) -> Result<A
             llm,
             cwd,
             mode,
-            Some(ev_tx.clone()),
+            Some(sess_tx),
             cancel.clone(),
             true,
             resume_session_id,
@@ -148,9 +199,9 @@ pub fn spawn(cfg: AgentConfig, ev_tx: UnboundedSender<SessionEvent>) -> Result<A
         // 运行中插话:引擎在每个轮边界从这个投递箱取一条插进对话
         session.set_inbox(inbox_agent);
         if !persona.is_empty() {
-            let _ = ev_tx.send(SessionEvent::Notice(format!(
+            let _ = ui_tx.send(HostEvent::Session(SessionEvent::Notice(format!(
                 "人格:{persona}(全局生效,输入 /persona 可切换或关闭)"
-            )));
+            ))));
         }
         loop {
             tokio::select! {
@@ -230,10 +281,47 @@ pub fn spawn(cfg: AgentConfig, ev_tx: UnboundedSender<SessionEvent>) -> Result<A
         }
     });
 
+    // 路由任务:引擎事件 → 前端;两类询问被截住并记进 pending
+    tokio::spawn({
+        let events = events.clone();
+        let pending = pending.clone();
+        async move {
+            while let Some(ev) = sess_rx.recv().await {
+                match ev {
+                    SessionEvent::PermissionRequest {
+                        title,
+                        body,
+                        warning,
+                        tx,
+                        ..
+                    } => {
+                        // 安全语义:有 warning 就不给"本会话总是允许"
+                        let allow_always = warning.is_none();
+                        *pending.lock().unwrap() = Some(Pending::Permission { tx, allow_always });
+                        let _ = events.send(HostEvent::Ask(Ask::Permission(PermissionAsk {
+                            title,
+                            body,
+                            warning,
+                            allow_always,
+                        })));
+                    }
+                    SessionEvent::RoundsExhausted { used, tx } => {
+                        *pending.lock().unwrap() = Some(Pending::Rounds { tx });
+                        let _ = events.send(HostEvent::Ask(Ask::Rounds(RoundsAsk { used })));
+                    }
+                    other => {
+                        let _ = events.send(HostEvent::Session(other));
+                    }
+                }
+            }
+        }
+    });
+
     Ok(AgentHandle {
         cmd_tx,
         cancel,
         inbox,
+        pending,
         task,
     })
 }
