@@ -1924,7 +1924,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "znaide-cli"
-version = "1.0.9"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1937,7 +1937,7 @@ dependencies = [
 
 [[package]]
 name = "znaide-core"
-version = "1.0.9"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -1952,7 +1952,7 @@ dependencies = [
 
 [[package]]
 name = "znaide-host"
-version = "1.0.9"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "tokio",
@@ -1962,7 +1962,7 @@ dependencies = [
 
 [[package]]
 name = "znaide-tui"
-version = "1.0.9"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "crossterm",
