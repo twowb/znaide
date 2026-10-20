@@ -17,7 +17,7 @@ use znaide_core::config::Resolved;
 use znaide_host::agent::AgentCmd;
 use znaide_core::permissions::Mode;
 use znaide_core::session::{
-    list_history_sessions_detailed, remove_session, SessionEvent, SharedInbox,
+    SessionEvent, SharedInbox,
 };
 
 /// 配置向导异步结果回传
@@ -1330,22 +1330,6 @@ fn collect_exit_stats(
 }
 
 /// 按序号(1 起)或文件名片段匹配历史会话
-fn match_session(sessions: &[PathBuf], target: &str) -> Option<PathBuf> {
-    if let Ok(idx) = target.parse::<usize>() {
-        return sessions.get(idx.saturating_sub(1)).cloned();
-    }
-    sessions
-        .iter()
-        .find(|p| {
-            p.to_string_lossy().contains(target)
-                || p
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().contains(target))
-                    .unwrap_or(false)
-        })
-        .cloned()
-}
-
 /// slash 命令处理结果
 enum SlashOutcome {
     /// 需作为新回合发给 agent 的普通指令(技能无入口时,正文即指令)
@@ -1371,140 +1355,31 @@ fn handle_command(
     // 当前生效代理(/update 也走统一出口)
     proxy: &znaide_core::config::EffectiveProxy,
 ) -> Option<SlashOutcome> {
-    let parts: Vec<&str> = cmd.split_whitespace().collect();
-    let name = parts.first().copied().unwrap_or("");
-    match name {
-        "/help" => {
-            items.push(MsgItem::CommandOutput(znaide_host::command::HELP_TEXT.to_string()));
-        }
-        "/clear" => {
-            // 破坏性操作:先弹确认,y 才真正清空
+    use znaide_host::command::{Line, Outcome};
+
+    // 语义全在 host;这里只把"输出行"翻译成 UI 条目、按 Outcome 做界面动作
+    let res = znaide_host::command::run(cmd, cmd_tx, cwd);
+    for (line, text) in res.lines {
+        items.push(match line {
+            Line::Notice => MsgItem::Notice(text),
+            Line::Output => MsgItem::CommandOutput(text),
+        });
+    }
+    match res.outcome {
+        Outcome::Handled => None,
+        Outcome::NeedConfirmClear { title, body } => {
             *confirm = Some(ConfirmBox {
-                title: "清空会话?".into(),
-                body: "将清空本会话全部上下文(模型记忆)与历史文件(jsonl),不可恢复。\n清空后继续对话不再带此前任何内容,重要内容先自己保存。".into(),
+                title,
+                body,
                 action: ConfirmAction::ClearSession,
             });
+            None
         }
-        "/skills" => {
-            let txt = znaide_host::command::skills_text(cwd);
-            if txt.is_empty() {
-                items.push(MsgItem::CommandOutput(
-                    "暂无已安装技能。\n技能目录:~/.znaide/skills/ 用户级, .znaide/skills/ 项目级"
-                        .into(),
-                ));
-            } else {
-                items.push(MsgItem::CommandOutput(txt));
-            }
-        }
-        "/undo" => {
-            if parts.len() >= 2 {
-                if let Ok(idx) = parts[1].parse::<usize>() {
-                    match znaide_core::undo::rollback_by_index(idx) {
-                        Ok(snap) => {
-                            items.push(MsgItem::Notice(format!(
-                                "已回滚 #{idx}: {} ← 快照 {}",
-                                snap.orig,
-                                snap.ts_ms
-                            )));
-                        }
-                        Err(e) => items.push(MsgItem::CommandOutput(format!("回滚失败: {e}"))),
-                    }
-                } else {
-                    items.push(MsgItem::CommandOutput("用法:/undo(列表) 或 /undo <序号>(回滚)".into()));
-                }
-                return None;
-            }
-            let snaps = znaide_core::undo::list();
-            if snaps.is_empty() {
-                items.push(MsgItem::CommandOutput("暂无 undo 快照(还没有文件被修改过)".into()));
-                return None;
-            }
-            let mut out = String::from("undo 快照(最新在前,共 " .to_owned() + &snaps.len().to_string() + "):\n");
-            for (i, s) in snaps.iter().take(20).enumerate() {
-                let t = s.ts_ms as f64 / 1000.0;
-                let ext = if s.is_external() { " ·外部" } else { "" };
-                out.push_str(&format!(
-                    "  {}. {} — {} ({}){}\n",
-                    i + 1,
-                    s.action,
-                    s.orig,
-                    fmt_time(t),
-                    ext
-                ));
-            }
-            if snaps.len() > 20 {
-                out.push_str(&format!("…(共 {} 条,最新 20 条)\n", snaps.len()));
-            }
-            items.push(MsgItem::CommandOutput(out));
-        }
-        "/resume" => {
-            // 无参:打开全屏会话管理窗口(会话 / 记忆两个页签,多选批量删除、
-            // 备注编辑、过滤、恢复;Esc 返回)
-            if parts.len() == 1 {
-                return Some(SlashOutcome::OpenSessions);
-            }
-            // 带参数:恢复 / 删除(兼容旧行为,脚本友好)
-            let history = list_history_sessions_detailed();
-            if history.is_empty() {
-                items.push(MsgItem::CommandOutput("暂无历史会话(~/.znaide/sessions/ 为空)".into()));
-                return None;
-            }
-            let paths: Vec<PathBuf> = history.iter().map(|h| h.path.clone()).collect();
-            if parts[1] == "del" {
-                // /resume del <序号|片段> 删除历史
-                if parts.len() < 3 {
-                    items.push(MsgItem::CommandOutput("用法:/resume del <序号|文件名片段>".into()));
-                    return None;
-                }
-                let target = parts[2];
-                let matched = match_session(&paths, target);
-                match matched {
-                    Some(path) => {
-                        match remove_session(&path) {
-                            Ok(()) => {
-                                items.push(MsgItem::Notice(format!(
-                                    "🗑 已删除历史会话: {}",
-                                    path.display()
-                                )));
-                            }
-                            Err(e) => items.push(MsgItem::CommandOutput(format!(
-                                "删除失败: {e}"
-                            ))),
-                        }
-                    }
-                    None => {
-                        items.push(MsgItem::CommandOutput(format!("未找到匹配「{target}」的历史会话")));
-                    }
-                }
-                return None;
-            }
-            // 尝试:传入序号或文件路径 → 恢复
-            let target = parts[1];
-            let matched = match_session(&paths, target);
-            match matched {
-                Some(path) => {
-                    let _ = cmd_tx.send(AgentCmd::LoadHistory(path));
-                    items.push(MsgItem::Notice("正在恢复历史会话…".into()));
-                }
-                None => {
-                    items.push(MsgItem::CommandOutput(format!("未找到匹配「{target}」的历史会话")));
-                }
-            }
-            return None;
-        }
-        "/compact" => {
-            items.push(MsgItem::Notice("▶ 请求压缩上下文…".into()));
-            return Some(SlashOutcome::Compact);
-        }
-        "/quit" | "/exit" => {
-            items.push(MsgItem::Notice("正在退出…".into()));
-            return Some(SlashOutcome::Quit);
-        }
-        "/update" => {
+        Outcome::OpenSessions => Some(SlashOutcome::OpenSessions),
+        Outcome::Quit => Some(SlashOutcome::Quit),
+        Outcome::Compact => Some(SlashOutcome::Compact),
+        Outcome::RunUpdate => {
             // 后台执行(下载可能要一阵),进度/结果经 update 通道回 UI
-            items.push(MsgItem::Notice(
-                "正在检查更新…(Gitee 优先,不通自动切 GitHub)".into(),
-            ));
             let tx = update_tx.clone();
             let proxy = proxy.clone();
             tokio::spawn(async move {
@@ -1512,86 +1387,11 @@ fn handle_command(
                 let msg = znaide_core::update::perform_update(&proxy).await.describe(&cur);
                 let _ = tx.send(msg);
             });
+            None
         }
-        "/persona" => {
-            let avail = znaide_core::persona::list();
-            let current = znaide_core::config::Config::load()
-                .ok()
-                .and_then(|c| c.persona)
-                .unwrap_or_default();
-            let cur_label = if current.is_empty() {
-                "无(默认助手)".to_string()
-            } else {
-                format!("「{current}」")
-            };
-            if parts.len() >= 2 {
-                let target = parts[1];
-                let known = target == "无" || avail.iter().any(|n| n == target);
-                if !known {
-                    let hint = if avail.is_empty() {
-                        "无".to_string()
-                    } else {
-                        format!("{}、无", avail.join("、"))
-                    };
-                    items.push(MsgItem::CommandOutput(format!(
-                        "没有这个人格:「{target}」。可用:{hint}"
-                    )));
-                    return None;
-                }
-                let _ = cmd_tx.send(AgentCmd::SetPersona(target.to_string()));
-                items.push(MsgItem::Notice(format!(
-                    "正在切换人格「{target}」…(重建系统提示,之后所有对话都带着它)"
-                )));
-                return None;
-            }
-            let mut out = format!("人格设置(当前:{cur_label},全局生效)\n\n可用人格:\n");
-            for n in &avail {
-                out.push_str(&format!("  /persona {n}\n"));
-            }
-            out.push_str("  /persona 无   关闭人格,恢复默认助手\n\n自定义:往 ~/.znaide/personas/ 放一个 <名字>.md(正文即人设说明),下次启动即可用 /persona 选它");
-            items.push(MsgItem::CommandOutput(out));
-        }
-        _ => {
-            // 不是内置命令:当技能 /名字 手动触发(技能目录 ~/.znaide/skills/ 或 .znaide/skills/)
-            let cmd_name = name.trim_start_matches('/');
-            let set = znaide_core::skills::scan(cwd);
-            match znaide_core::skills::find(&set.skills, cmd_name) {
-                Some(skill) => {
-                    let args = parts[1..].join(" ");
-                    items.push(MsgItem::Notice(format!(
-                        "▶ 技能「{}」已触发: {}({})",
-                        skill.name,
-                        skill.description,
-                        skill.source.label()
-                    )));
-                    if skill.entry.is_some() {
-                        items.push(MsgItem::Notice(
-                            "该技能声明了入口脚本,执行时可能需要你确认。".into(),
-                        ));
-                        return Some(SlashOutcome::RunSkill {
-                            name: skill.name.clone(),
-                            args,
-                        });
-                    }
-                    // 无入口:正文即本回合指令(旧自定义命令同款行为)
-                    let prompt = skill.render(&args);
-                    return Some(SlashOutcome::Task(prompt));
-                }
-                None => {
-                    // 输入的不是内置命令,也不是已安装技能
-                    let hint = if set.skills.is_empty() {
-                        String::new()
-                    } else {
-                        "\n输入 /skills 可查看已安装技能".to_string()
-                    };
-                    items.push(MsgItem::CommandOutput(format!(
-                        "未知命令: {name}\n输入 /help 查看内置命令{hint}"
-                    )));
-                }
-            }
-        }
+        Outcome::Task(p) => Some(SlashOutcome::Task(p)),
+        Outcome::RunSkill { name, args } => Some(SlashOutcome::RunSkill { name, args }),
     }
-    None
 }
 
 /// 把一条历史消息转成 UI 展示条目(供 /resume 恢复后展示)
@@ -3122,24 +2922,6 @@ fn cycle_permission_mode(
         "🔒 权限模式:{} (Shift+Tab 循环切换)",
         next.hint()
     )));
-}
-
-fn fmt_time(epoch_secs: f64) -> String {
-    // 简化:显示相对时间(分钟前/小时前/日期)
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
-    let diff = now - epoch_secs;
-    if diff < 60.0 {
-        format!("{:.0}秒前", diff)
-    } else if diff < 3600.0 {
-        format!("{:.0}分钟前", diff / 60.0)
-    } else if diff < 86400.0 {
-        format!("{:.1}小时前", diff / 3600.0)
-    } else {
-        format!("{:.0}天前", diff / 86400.0)
-    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
