@@ -1,0 +1,10 @@
+[package]
+name = "znaide-host"
+description = "znaide 宿主层:启动准备序列 + 会话驱动 + 询问政策(无渲染、无终端)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+znaide-core = { path = "../core" }
+anyhow = { workspace = true }

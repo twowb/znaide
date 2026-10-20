@@ -137,53 +137,34 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mode = Mode::parse(&cli.permission)?;
+    let config_provided = config_provided(&cli);
 
-    // 建数据目录;顺带清掉历史遗留的空会话文件、迁移旧版 commands/*.md 为 skill、
-    // 把内置人格同步成 ~/.znaide/personas/ 的可编辑副本(缺失才写,不覆盖用户改动)、
-    // 物化内置示例技能到 ~/.znaide/builtin-skills/(开箱即用,不再单独发 skills 包)
-    let _ = znaide_core::config::ensure_data_dirs()?;
-    znaide_core::persona::ensure_builtin_files();
-    znaide_core::skills::ensure_builtin_skills();
-    let pruned = znaide_core::session::prune_empty_sessions();
-    if pruned > 0 {
-        eprintln!("♻ 已清理 {pruned} 个空的会话文件(未产生任何对话的残留)");
-    }
-    let migrated = znaide_core::skills::migrate_legacy_commands();
-    if migrated > 0 {
-        eprintln!("♻ 已将 {migrated} 个旧自定义命令迁移为 skill(~/.znaide/skills/,保持仅手动触发)");
-    }
-
-    let mut cfg = Config::load()?;
-    // 配置格式标记迁移:他版/外部写入的 build_tag 会被自动置回当前版本
-    if cfg.migrate()? {
-        eprintln!("♻ 检测到配置由其他版本写入,格式标记已升级。");
-    }
-    // 全局人格(空 = 不注入),随配置持久
-    let persona = cfg.persona.clone().unwrap_or_default();
-    // 代理:配置文件 → 专用环境变量 → 本次命令行(命令行那层最高);有话说就提示
-    let (proxy, proxy_notes) = cfg.resolve_proxy(&proxy_ov);
-    for n in &proxy_notes {
-        eprintln!("⚠ {n}");
-    }
-    let mut resolved = cfg.resolve(
-        cli.model.clone(),
-        cli.base_url.clone(),
-        cli.api_key.clone(),
-        cli.provider.clone(),
-    );
-    if let Ok(r) = resolved.as_mut() {
-        r.proxy = proxy.clone();
-        // 预设请求头:配置 + 专用环境变量在 `resolve` 里已落定,这里叠命令行那层
-        // (保留头/非法项/读不到的环境变量都在这个返回值里提示一次)
-        let (headers, header_notes) = cfg.resolve_headers(&r.provider_name, &header_ov);
-        for n in &header_notes {
-            eprintln!("⚠ {n}");
+    // 启动准备序列(数据目录/内置资源/清理迁移/配置/代理与预设头/首启/恢复目标/重试)。
+    // 与界面无关的部分全在 host 里,将来的 GUI 走同一条路,不必再抄一遍。
+    let prepared = znaide_host::prepare(znaide_host::StartupArgs {
+        cwd: cli.cwd.clone().unwrap_or(std::env::current_dir()?),
+        model: cli.model.clone(),
+        base_url: cli.base_url.clone(),
+        api_key: cli.api_key.clone(),
+        provider: cli.provider.clone(),
+        proxy: proxy_ov.clone(),
+        headers: header_ov.clone(),
+        retry: cli.retry,
+        no_retry: cli.no_retry,
+        max_turns: cli.max_turns,
+        // 无头模式忽略 --resume(下面会提示),交互模式才解析恢复目标
+        resume_target: if cli.prompt.is_none() {
+            cli.resume.clone()
+        } else {
+            None
+        },
+        config_provided,
+    })?;
+    for n in &prepared.notes {
+        match n.level {
+            znaide_host::NoteLevel::Warn => eprintln!("⚠ {}", n.text),
+            znaide_host::NoteLevel::Info => eprintln!("{}", n.text),
         }
-        r.headers = headers;
-    }
-    let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
-    if !cwd.is_dir() {
-        anyhow::bail!("工作目录不存在: {}", cwd.display());
     }
 
     match cli.prompt.as_deref() {
@@ -192,18 +173,27 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("⚠ --resume 仅交互模式可用;已忽略(-p 无头模式)。");
             }
             // 什么配置来源都没有时才引导
-            if !config_provided(&cli) {
+            if prepared.first_run {
                 print_first_run_headless_hint();
                 return Ok(());
             }
-            let resolved = resolved?;
+            let resolved = match &prepared.resolved {
+                Some(r) => r,
+                None => anyhow::bail!(
+                    "{}",
+                    prepared
+                        .resolve_error
+                        .clone()
+                        .unwrap_or_else(|| "配置未就绪".into())
+                ),
+            };
             run_headless(
-                &resolved,
+                resolved,
                 mode,
-                &cwd,
+                &prepared.cwd,
                 prompt,
-                &persona,
-                cli.max_turns,
+                &prepared.persona,
+                prepared.max_turns,
                 cli.retry,
                 cli.no_retry,
             )
@@ -211,46 +201,38 @@ async fn main() -> anyhow::Result<()> {
         }
         None => {
             // 首次运行(无任何配置来源)自动进配置引导
-            let first_run = !config_provided(&cli);
-            let resolved = resolved.unwrap_or_else(|e| {
-                eprintln!("⚠ 配置解析: {e}");
-                // 先给个默认值撑住引导界面,真正连接前会被覆盖
-                znaide_core::config::Resolved {
-                    model: String::new(),
-                    base_url: "http://localhost:11434/v1".into(),
-                    api_key: None,
-                    provider_name: "ollama".into(),
-                    context_window: None,
-                    proxy: proxy.clone(),
-                    headers: Default::default(),
+            let fallback = prepared.fallback_resolved();
+            let resolved = match &prepared.resolved {
+                Some(r) => r.clone(),
+                None => {
+                    if let Some(e) = &prepared.resolve_error {
+                        eprintln!("⚠ 配置解析: {e}");
+                    }
+                    // 先给个默认值撑住引导界面,真正连接前会被覆盖
+                    fallback
                 }
-            });
-            // --resume:按 ID/文件名片段定位历史文件,启动即恢复
-            let resume = match cli.resume.as_deref() {
-                Some(target) => match resolve_resume(target) {
-                    Ok(p) => {
-                        eprintln!(
-                            "▶ 恢复会话 {}…(退出:输入 /quit、/exit 或 Ctrl+C)",
-                            p.file_stem()
-                                .map(|s| s.to_string_lossy().to_string())
-                                .unwrap_or_default()
-                        );
-                        Some(p)
-                    }
-                    Err(e) => {
-                        eprintln!("{e}");
-                        return Ok(());
-                    }
-                },
-                None => None,
             };
+            // --resume:找不到就打印候选清单并正常退出(不是错误退出码)
+            if let Some(e) = &prepared.resume_error {
+                eprintln!("{e}");
+                return Ok(());
+            }
+            let resume = prepared.resume.clone();
+            if let Some(p) = &resume {
+                eprintln!(
+                    "▶ 恢复会话 {}…(退出:输入 /quit、/exit 或 Ctrl+C)",
+                    p.file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                );
+            }
             let stats = run_interactive(
                 &resolved,
                 mode,
-                &cwd,
-                first_run,
+                &prepared.cwd,
+                prepared.first_run,
                 resume,
-                persona.clone(),
+                prepared.persona.clone(),
                 cli.max_turns,
                 cli.retry,
                 cli.no_retry,
@@ -260,36 +242,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
-}
-
-/// 按会话 ID(文件名 stem)或文件名片段定位历史会话文件;无匹配时列出最近的供参考
-fn resolve_resume(target: &str) -> anyhow::Result<PathBuf> {
-    let sessions = znaide_core::session::list_history_sessions_detailed();
-    if let Some(h) = sessions.iter().find(|h| {
-        h.path
-            .file_stem()
-            .map(|s| s.to_string_lossy() == target)
-            .unwrap_or(false)
-    }) {
-        return Ok(h.path.clone());
-    }
-    if let Some(h) = sessions.iter().find(|h| {
-        h.path.to_string_lossy().contains(target)
-            || h.path
-                .file_stem()
-                .map(|s| s.to_string_lossy().contains(target))
-                .unwrap_or(false)
-    }) {
-        return Ok(h.path.clone());
-    }
-    let mut msg = format!("未找到匹配「{target}」的历史会话。最近 {} 个会话(ID 即文件名,[无头]=命令行 -p 产生):\n", sessions.len().min(8));
-    for h in sessions.iter().take(8) {
-        let stem = h.path.file_stem().unwrap_or_default().to_string_lossy().to_string();
-        let flag = if h.headless { " [无头]" } else { "" };
-        msg.push_str(&format!("  {stem}{flag}\n"));
-    }
-    let msg = msg.trim_end().to_string();
-    anyhow::bail!(msg)
 }
 
 /// 会话结束统计的格式化时长(秒 → 人类可读)

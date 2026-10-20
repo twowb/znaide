@@ -1931,6 +1931,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "znaide-core",
+ "znaide-host",
  "znaide-tui",
 ]
 
@@ -1947,6 +1948,14 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "znaide-host"
+version = "1.0.9"
+dependencies = [
+ "anyhow",
+ "znaide-core",
 ]
 
 [[package]]

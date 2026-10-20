@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 znaide-core = { path = "../core" }
+znaide-host = { path = "../host" }
 znaide-tui = { path = "../tui" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
