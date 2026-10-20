@@ -8,6 +8,7 @@
 
 pub mod agent;
 pub mod ask;
+pub mod command;
 pub mod policy;
 pub mod prepare;
 
