@@ -391,16 +391,8 @@ pub async fn run(
         let proxy = current_resolved.proxy.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            let Ok(client) = znaide_core::update::http_client(&proxy) else { return };
-            let Ok((src, latest)) = znaide_core::update::probe_latest(&client).await else {
-                return;
-            };
-            let cur = znaide_core::update::current_version();
-            if znaide_core::update::version_gt(&latest, &cur) {
-                let _ = update_tx.send(format!(
-                    "发现新版本 v{latest}(来源 {})\n当前 v{cur}:输入 /update 立即更新,或忽略继续使用。",
-                    src.label()
-                ));
+            if let Some(msg) = znaide_host::update::check_notice(&proxy).await {
+                let _ = update_tx.send(msg);
             }
         });
     }
@@ -1383,8 +1375,7 @@ fn handle_command(
             let tx = update_tx.clone();
             let proxy = proxy.clone();
             tokio::spawn(async move {
-                let cur = znaide_core::update::current_version();
-                let msg = znaide_core::update::perform_update(&proxy).await.describe(&cur);
+                let msg = znaide_host::update::install(&proxy).await;
                 let _ = tx.send(msg);
             });
             None

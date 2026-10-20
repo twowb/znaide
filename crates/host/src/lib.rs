@@ -11,6 +11,7 @@ pub mod ask;
 pub mod command;
 pub mod policy;
 pub mod prepare;
+pub mod update;
 
 pub use agent::{spawn, AgentCmd, AgentConfig, AgentHandle, HostEvent, SharedCancel};
 pub use ask::{Ask, PermissionAsk, RoundsAsk};
