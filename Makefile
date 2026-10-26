@@ -152,7 +152,7 @@ define build_one
 	$(call check_cc,$(2))
 	$(call check_target,$(1))
 	@echo "==> cargo build --release --target $(1)"
-	@export CC_$(subst -,_,$(1))="$(2)"; cargo build --release --target $(1)
+	@export CC_$(subst -,_,$(1))="$(2)"; cargo build --release --target $(1) -p znaide-cli
 	@mkdir -p $(DIST)
 	@cp $(TARGET)/$(1)/$(PROFILE)/$(APP)$(3) $(DIST)/$(APP)-$(4)-v$(VERSION)$(3)
 	@echo "==> 产物: $(DIST)/$(APP)-$(4)-v$(VERSION)$(3)"
@@ -202,7 +202,7 @@ build-android: ## Android aarch64 (NDK bionic 动态,Termux 用)
 	@export CC_aarch64_linux_android="$(CC_ANDROID)" \
 	        AR_aarch64_linux_android="$(AR_ANDROID)" \
 	        CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$(CC_ANDROID)"; \
-	  cargo build --release --target $(TRIPLE_ANDROID)
+	  cargo build --release --target $(TRIPLE_ANDROID) -p znaide-cli
 	@mkdir -p $(DIST)
 	@cp $(TARGET)/$(TRIPLE_ANDROID)/$(PROFILE)/$(APP) $(DIST)/$(APP)-android-arm64-v$(VERSION)
 	@echo "==> 产物: $(DIST)/$(APP)-android-arm64-v$(VERSION) (Android bionic 动态版,Termux 用)"

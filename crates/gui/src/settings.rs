@@ -139,6 +139,15 @@ pub fn pick_directory() -> Result<Option<PathBuf>, String> {
             _ => Ok(None),
         }
     }
+    // 其它目标(如 Android)没有系统目录选择器:让前端回退到输入框
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "windows",
+        target_os = "macos"
+    )))]
+    {
+        Err("当前平台没有系统目录选择器".into())
+    }
 }
 
 /// 列出 cwd 下某一层路径(供 @ 补全)。返回 (相对路径,是否目录,是否截断)。
