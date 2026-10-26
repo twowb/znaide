@@ -40,7 +40,10 @@ struct ShellArgs {
     idle_ms: Option<u64>,
 }
 
-pub async fn run_shell_command(ctx: &ToolContext<'_>, args: &Value) -> Result<ToolOutput, ToolError> {
+pub async fn run_shell_command(
+    ctx: &ToolContext<'_>,
+    args: &Value,
+) -> Result<ToolOutput, ToolError> {
     let a: ShellArgs = serde_json::from_value(args.clone())?;
     if a.command.trim().is_empty() {
         return Err(ToolError(
@@ -68,9 +71,19 @@ pub async fn run_shell_command(ctx: &ToolContext<'_>, args: &Value) -> Result<To
         None => ctx.cwd.to_path_buf(),
     };
     // idle_ms = AI 的完成时长预期(没传就没有总预算约束,靠静默+总保险)
-    let budget = a.idle_ms.map(|v| Duration::from_millis(v.min(MAX_BUDGET_MS)));
+    let budget = a
+        .idle_ms
+        .map(|v| Duration::from_millis(v.min(MAX_BUDGET_MS)));
 
-    let output = run(&a.command, &dir, SILENT_CAP, budget, ctx.cancel.clone(), ctx.events).await?;
+    let output = run(
+        &a.command,
+        &dir,
+        SILENT_CAP,
+        budget,
+        ctx.cancel.clone(),
+        ctx.events,
+    )
+    .await?;
     Ok(output)
 }
 
@@ -173,6 +186,9 @@ async fn run(
         c.arg("/C").arg(command);
         c
     };
+
+    // GUI(无控制台)下别给每条命令弹一个黑框;TUI 有控制台时这个调用是空操作
+    crate::winproc::hide_console_window_async(&mut cmd);
 
     cmd.current_dir(dir)
         // stdin 不继承:避免命令(ssh/sudo/read 等)与 znaide 抢读同一个 raw
@@ -372,8 +388,19 @@ fn truncate_middle(s: &str, max: usize) -> String {
     }
     let half = max / 2;
     let head: String = s.chars().take(half).collect();
-    let tail: String = s.chars().rev().take(half).collect::<Vec<_>>().into_iter().rev().collect();
-    format!("{head}\n…(输出过长,中间 {}/{} 字符已省略)…\n{tail}", s.chars().count() - max, s.chars().count())
+    let tail: String = s
+        .chars()
+        .rev()
+        .take(half)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!(
+        "{head}\n…(输出过长,中间 {}/{} 字符已省略)…\n{tail}",
+        s.chars().count() - max,
+        s.chars().count()
+    )
 }
 
 #[cfg(test)]
@@ -393,11 +420,23 @@ mod tests {
         });
         let start = Instant::now();
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let r = run("sleep 30", dir, Duration::from_secs(60), None, Some(cancel), None).await;
+        let r = run(
+            "sleep 30",
+            dir,
+            Duration::from_secs(60),
+            None,
+            Some(cancel),
+            None,
+        )
+        .await;
         assert!(r.is_err());
         assert!(r.unwrap_err().0.contains("中断"));
         // 200ms 后取消,应在几秒内返回(sleep 30 远未结束)
-        assert!(start.elapsed() < Duration::from_secs(5), "取消未生效,耗时 {:?}", start.elapsed());
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "取消未生效,耗时 {:?}",
+            start.elapsed()
+        );
         let _ = killer.await;
     }
 
@@ -407,7 +446,15 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let r = run("echo should-not-run > /tmp/znaide_should_not_exist", dir, Duration::from_secs(10), None, Some(cancel), None).await;
+        let r = run(
+            "echo should-not-run > /tmp/znaide_should_not_exist",
+            dir,
+            Duration::from_secs(10),
+            None,
+            Some(cancel),
+            None,
+        )
+        .await;
         assert!(r.is_err());
         assert!(!std::path::Path::new("/tmp/znaide_should_not_exist").exists());
         let _ = std::fs::remove_file("/tmp/znaide_should_not_exist");
@@ -418,12 +465,27 @@ mod tests {
     async fn silent_timeout_kills_silent_command() {
         let start = Instant::now();
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let r = run("sleep 30", dir, Duration::from_millis(800), None, None, None).await;
+        let r = run(
+            "sleep 30",
+            dir,
+            Duration::from_millis(800),
+            None,
+            None,
+            None,
+        )
+        .await;
         let err = r.unwrap_err().0;
         assert!(err.contains("没有新输出"), "错误应点明静默卡死: {err}");
-        assert!(err.contains("没有任何输出"), "sleep 无输出,遗言应如实说明: {err}");
+        assert!(
+            err.contains("没有任何输出"),
+            "sleep 无输出,遗言应如实说明: {err}"
+        );
         // 800ms 静默上限,应在几秒内被终止
-        assert!(start.elapsed() < Duration::from_secs(5), "静默终止未生效,耗时 {:?}", start.elapsed());
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "静默终止未生效,耗时 {:?}",
+            start.elapsed()
+        );
     }
 
     /// 有输出就不算卡死:持续输出的命令不会因静默上限被掐
@@ -434,10 +496,18 @@ mod tests {
         let cmd = "for i in $(seq 1 8); do echo tick-$i; sleep 0.25; done";
         let start = Instant::now();
         let r = run(cmd, dir, Duration::from_millis(700), None, None, None).await;
-        assert!(r.is_ok(), "持续输出的命令不应被静默上限掐死: {:?}", r.err().map(|e| e.0));
+        assert!(
+            r.is_ok(),
+            "持续输出的命令不应被静默上限掐死: {:?}",
+            r.err().map(|e| e.0)
+        );
         let out = r.unwrap();
         assert!(out.contains("tick-8"), "应完整跑完拿到最后输出: {out}");
-        assert!(start.elapsed() >= Duration::from_secs(1), "命令应真实跑完: {:?}", start.elapsed());
+        assert!(
+            start.elapsed() >= Duration::from_secs(1),
+            "命令应真实跑完: {:?}",
+            start.elapsed()
+        );
     }
 
     /// 死前遗言:被静默杀掉的命令,错误里带出它死前已输出的片段
@@ -447,8 +517,14 @@ mod tests {
         let cmd = "echo START-OF-WORK; echo progress-line-1; sleep 30";
         let r = run(cmd, dir, Duration::from_millis(800), None, None, None).await;
         let err = r.unwrap_err().0;
-        assert!(err.contains("START-OF-WORK"), "死前输出应随错误回给模型: {err}");
-        assert!(err.contains("progress-line-1"), "死前输出应随错误回给模型: {err}");
+        assert!(
+            err.contains("START-OF-WORK"),
+            "死前输出应随错误回给模型: {err}"
+        );
+        assert!(
+            err.contains("progress-line-1"),
+            "死前输出应随错误回给模型: {err}"
+        );
     }
 
     /// 总预算:超过 AI 预估(含宽限)仍在跑 → 有输出也终止,错误说清规则
@@ -471,7 +547,11 @@ mod tests {
         assert!(err.contains("AI 预估预算"), "应点明超预算终止: {err}");
         assert!(err.contains("idle_ms"), "应引导 AI 调大预算重试: {err}");
         assert!(err.contains("tick-"), "死前输出应保留: {err}");
-        assert!(start.elapsed() < Duration::from_secs(3), "应尽早终止: {:?}", start.elapsed());
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "应尽早终止: {:?}",
+            start.elapsed()
+        );
     }
 
     /// 没传预算(模型没承诺时长)就不受总预算约束:有输出可跑完

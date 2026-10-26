@@ -88,7 +88,11 @@ pub fn backup(file: &Path, action: &str) -> anyhow::Result<Option<Snapshot>> {
 }
 
 /// 为指定会话生成快照
-pub fn backup_for_session(session_id: &str, file: &Path, action: &str) -> anyhow::Result<Option<Snapshot>> {
+pub fn backup_for_session(
+    session_id: &str,
+    file: &Path,
+    action: &str,
+) -> anyhow::Result<Option<Snapshot>> {
     if !file.is_file() {
         return Ok(None);
     }
@@ -126,7 +130,13 @@ pub fn backup_for_session(session_id: &str, file: &Path, action: &str) -> anyhow
 fn sanitize_session(id: &str) -> String {
     let cleaned: String = id
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     if cleaned.is_empty() {
         "default".into()
@@ -199,7 +209,9 @@ mod tests {
         let f = dir.join("a.txt");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&f, "v1").unwrap();
-        let rec = backup_for_session("test-sess", &f, "write").unwrap().unwrap();
+        let rec = backup_for_session("test-sess", &f, "write")
+            .unwrap()
+            .unwrap();
         std::fs::write(&f, "v2").unwrap();
         rollback(&rec).unwrap();
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "v1");
@@ -230,7 +242,9 @@ mod tests {
         let f = dir.join("g.txt");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&f, "x").unwrap();
-        backup_for_session("gen-sess", &f, "write").unwrap().unwrap();
+        backup_for_session("gen-sess", &f, "write")
+            .unwrap()
+            .unwrap();
         let text = std::fs::read_to_string(manifest_path()).unwrap();
         assert!(text.contains(GEN_TAG), "manifest 应记录生成器标识");
         // 本会话快照字段里 gen 被正确写入(并行测试会共享同一 manifest,不数总数)

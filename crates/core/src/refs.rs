@@ -3,8 +3,14 @@ use std::path::{Path, PathBuf};
 /// 展开提示词里的 @引用:文件注入内容、目录注入清单;@"带空格路径" 也行。
 /// 路径不存在或不可读就保留原文,不吞用户输入。
 pub fn expand_at_refs(prompt: &str, cwd: &Path) -> String {
+    expand_at_refs_report(prompt, cwd).0
+}
+
+/// 同 `expand_at_refs`,额外返回未命中的引用(用于回合开始提示)
+pub fn expand_at_refs_report(prompt: &str, cwd: &Path) -> (String, Vec<String>) {
     let chars: Vec<char> = prompt.chars().collect();
     let mut out = String::with_capacity(prompt.len() + 512);
+    let mut missing = Vec::new();
     let mut i = 0;
     while i < chars.len() {
         if chars[i] == '@' {
@@ -32,6 +38,7 @@ pub fn expand_at_refs(prompt: &str, cwd: &Path) -> String {
                             out.push('\n');
                         }
                         None => {
+                            missing.push(format!("@\"{path_str}\""));
                             out.push('@');
                             out.push('"');
                             out.push_str(&path_str);
@@ -51,7 +58,12 @@ pub fn expand_at_refs(prompt: &str, cwd: &Path) -> String {
             let mut path_str = String::new();
             while j < chars.len() {
                 let c = chars[j];
-                if c.is_whitespace() || matches!(c, ',' | '。' | ';' | '\n' | '\r' | '」' | ')' | ']' | '}' | '：' | ':') {
+                if c.is_whitespace()
+                    || matches!(
+                        c,
+                        ',' | '。' | ';' | '\n' | '\r' | '」' | ')' | ']' | '}' | '：' | ':'
+                    )
+                {
                     break;
                 }
                 path_str.push(c);
@@ -68,6 +80,7 @@ pub fn expand_at_refs(prompt: &str, cwd: &Path) -> String {
                     out.push('\n');
                 }
                 None => {
+                    missing.push(format!("@{path_str}"));
                     out.push('@');
                     out.push_str(&path_str);
                 }
@@ -78,7 +91,7 @@ pub fn expand_at_refs(prompt: &str, cwd: &Path) -> String {
             i += 1;
         }
     }
-    out
+    (out, missing)
 }
 
 /// 展开单个引用;路径不存在或不可读返回 None(保留原文)

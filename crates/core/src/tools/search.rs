@@ -61,11 +61,12 @@ pub async fn glob(ctx: &ToolContext<'_>, args: &Value) -> Result<ToolOutput, Too
     if matches.is_empty() {
         return Ok(format!("在 {} 下没有匹配 {pattern} 的文件", root.display()));
     }
-    let shown: Vec<String> = matches
-        .iter()
-        .map(|m| m.display().to_string())
-        .collect();
-    Ok(format!("匹配 {} 个文件:\n{}", shown.len(), shown.join("\n")))
+    let shown: Vec<String> = matches.iter().map(|m| m.display().to_string()).collect();
+    Ok(format!(
+        "匹配 {} 个文件:\n{}",
+        shown.len(),
+        shown.join("\n")
+    ))
 }
 
 /// 简化 glob:遍历目录树,用通配匹配相对路径段
@@ -150,8 +151,8 @@ pub async fn grep_search(ctx: &ToolContext<'_>, args: &Value) -> Result<ToolOutp
         Some(p) => resolve_path(ctx.cwd, p),
         None => ctx.cwd.to_path_buf(),
     };
-    let re = regex::Regex::new(&a.pattern)
-        .map_err(|e| ToolError(format!("正则表达式无效: {e}")))?;
+    let re =
+        regex::Regex::new(&a.pattern).map_err(|e| ToolError(format!("正则表达式无效: {e}")))?;
 
     let mut files: Vec<std::path::PathBuf> = Vec::new();
     if target.is_file() {
@@ -205,7 +206,12 @@ pub async fn grep_search(ctx: &ToolContext<'_>, args: &Value) -> Result<ToolOutp
     } else {
         String::new()
     };
-    Ok(format!("找到 {} 条匹配:\n{}{}", results.len(), shown.join("\n"), more))
+    Ok(format!(
+        "找到 {} 条匹配:\n{}{}",
+        results.len(),
+        shown.join("\n"),
+        more
+    ))
 }
 
 #[cfg(test)]

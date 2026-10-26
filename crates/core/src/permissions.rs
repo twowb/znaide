@@ -143,8 +143,19 @@ const SHELL_NAMES: &[&str] = &["sh", "bash", "dash", "zsh", "ksh", "fish", "ash"
 
 /// 块设备路径前缀(命中即视为块设备)
 const DEVICE_PREFIXES: &[&str] = &[
-    "/dev/sd", "/dev/hd", "/dev/vd", "/dev/xvd", "/dev/nvme", "/dev/mmcblk", "/dev/loop",
-    "/dev/mapper/", "/dev/dm-", "/dev/disk", "/dev/rdisk", "/dev/fd0", "/dev/ram",
+    "/dev/sd",
+    "/dev/hd",
+    "/dev/vd",
+    "/dev/xvd",
+    "/dev/nvme",
+    "/dev/mmcblk",
+    "/dev/loop",
+    "/dev/mapper/",
+    "/dev/dm-",
+    "/dev/disk",
+    "/dev/rdisk",
+    "/dev/fd0",
+    "/dev/ram",
     "\\\\.\\physicaldrive",
 ];
 
@@ -386,7 +397,10 @@ fn judge_segment(argv: &[String], cwd: &Path, home: Option<&Path>, depth: u8) ->
 
     // xargs rm …:目标来自标准输入,无法判定
     if cmd == "xargs" {
-        if args.iter().any(|a| DESTRUCTIVE_NAMES.contains(&basename(a))) {
+        if args
+            .iter()
+            .any(|a| DESTRUCTIVE_NAMES.contains(&basename(a)))
+        {
             return CommandRisk::Uncertain {
                 reason: "无法确定 xargs 的删除目标".into(),
                 detail: "待删路径来自标准输入,判定时看不到".into(),
@@ -408,7 +422,8 @@ fn judge_segment(argv: &[String], cwd: &Path, home: Option<&Path>, depth: u8) ->
         "find" => {
             let delete = args.iter().any(|a| a == "-delete");
             let exec_rm = args.windows(2).any(|w| {
-                (w[0] == "-exec" || w[0] == "-execdir") && DESTRUCTIVE_NAMES.contains(&basename(&w[1]))
+                (w[0] == "-exec" || w[0] == "-execdir")
+                    && DESTRUCTIVE_NAMES.contains(&basename(&w[1]))
             });
             if !delete && !exec_rm {
                 return CommandRisk::Safe;
@@ -508,7 +523,11 @@ fn worst_of_targets(targets: &[&str], cwd: &Path, home: Option<&Path>, verb: &st
 
 /// 去掉 sudo/env/timeout 之类前缀与前置变量赋值(`FOO=1 rm -rf /`),拿到真正的命令
 fn strip_prefixes(mut argv: &[String]) -> &[String] {
-    let is_assignment = |t: &str| t.split_once('=').map(|(n, _)| is_var_name(n)).unwrap_or(false);
+    let is_assignment = |t: &str| {
+        t.split_once('=')
+            .map(|(n, _)| is_var_name(n))
+            .unwrap_or(false)
+    };
     while let Some(t) = argv.first() {
         if is_assignment(t) {
             argv = &argv[1..];
@@ -517,7 +536,9 @@ fn strip_prefixes(mut argv: &[String]) -> &[String] {
         }
     }
     loop {
-        let Some(first) = argv.first() else { return argv };
+        let Some(first) = argv.first() else {
+            return argv;
+        };
         let cmd = basename(first);
         if !PREFIX_COMMANDS.contains(&cmd) {
             return argv;
@@ -527,7 +548,9 @@ fn strip_prefixes(mut argv: &[String]) -> &[String] {
         while let Some(t) = argv.first() {
             let takes_value = prefix_flag_takes_value(prefix, t);
             let is_flag_or_assign = (t.starts_with('-') && t.len() > 1) || t.contains('=');
-            let is_duration = t.chars().all(|c| c.is_ascii_digit() || c == '.' || c == 's' || c == 'm' || c == 'h');
+            let is_duration = t
+                .chars()
+                .all(|c| c.is_ascii_digit() || c == '.' || c == 's' || c == 'm' || c == 'h');
             if is_flag_or_assign || is_duration {
                 argv = &argv[1..];
                 if takes_value {
@@ -561,7 +584,8 @@ fn basename(s: &str) -> &str {
 fn is_redirect_op(t: &str) -> bool {
     !t.is_empty()
         && (t.contains('>') || t.contains('<'))
-        && t.chars().all(|c| matches!(c, '>' | '<' | '|' | '&' | '0'..='9'))
+        && t.chars()
+            .all(|c| matches!(c, '>' | '<' | '|' | '&' | '0'..='9'))
 }
 
 fn has_short_flag(args: &[String], ch: char) -> bool {
@@ -635,7 +659,9 @@ fn classify_target(raw: &str, cwd: &Path, home: Option<&Path>) -> TargetClass {
             let dir = if base.is_empty() || base.ends_with('/') {
                 p.clone()
             } else {
-                p.parent().map(|x| x.to_path_buf()).unwrap_or_else(|| p.clone())
+                p.parent()
+                    .map(|x| x.to_path_buf())
+                    .unwrap_or_else(|| p.clone())
             };
             if let Some(why) = dangerous_why(&dir, cwd, home) {
                 return TargetClass::Dangerous(why, dir.display().to_string());
@@ -715,7 +741,10 @@ fn normalize_lexically(p: &Path) -> PathBuf {
 }
 
 /// 快照到 undo 目录,事后可回滚;返回快照路径,文件不存在(新建)返回 None
-pub fn snapshot_file(session_dir: &Path, file: &Path) -> anyhow::Result<Option<std::path::PathBuf>> {
+pub fn snapshot_file(
+    session_dir: &Path,
+    file: &Path,
+) -> anyhow::Result<Option<std::path::PathBuf>> {
     if !file.exists() {
         return Ok(None);
     }

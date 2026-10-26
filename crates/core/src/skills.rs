@@ -162,9 +162,24 @@ pub struct SkillSet {
 pub fn scan(cwd: &Path) -> SkillSet {
     let mut map: BTreeMap<String, Skill> = BTreeMap::new();
     let mut warnings: Vec<String> = Vec::new();
-    scan_dir_into(&mut map, &mut warnings, &builtin_dir(), SkillSource::Builtin);
-    scan_dir_into(&mut map, &mut warnings, &data_dir().join("skills"), SkillSource::User);
-    scan_dir_into(&mut map, &mut warnings, &cwd.join(".znaide").join("skills"), SkillSource::Project);
+    scan_dir_into(
+        &mut map,
+        &mut warnings,
+        &builtin_dir(),
+        SkillSource::Builtin,
+    );
+    scan_dir_into(
+        &mut map,
+        &mut warnings,
+        &data_dir().join("skills"),
+        SkillSource::User,
+    );
+    scan_dir_into(
+        &mut map,
+        &mut warnings,
+        &cwd.join(".znaide").join("skills"),
+        SkillSource::Project,
+    );
     finish_skill_set(map, warnings)
 }
 
@@ -225,7 +240,10 @@ fn load_skill(dir: &Path, source: SkillSource) -> Result<Skill, String> {
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
     if !valid_name(&name) {
-        return Err(format!("跳过无效技能目录名: {name:?}({} 级)", source.label()));
+        return Err(format!(
+            "跳过无效技能目录名: {name:?}({} 级)",
+            source.label()
+        ));
     }
     let md_path = dir.join("SKILL.md");
     let text = match std::fs::read_to_string(&md_path) {
@@ -441,7 +459,10 @@ fn migrate_commands_from(commands_dir: &Path, skills_dir: &Path) -> usize {
     }
     let mut migrated = 0;
     for src in &md_files {
-        let name = src.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let name = src
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
         if !valid_name(&name) {
             continue;
         }
@@ -455,9 +476,8 @@ fn migrate_commands_from(commands_dir: &Path, skills_dir: &Path) -> usize {
             continue;
         }
         let dest = dest_dir.join("SKILL.md");
-        let new_text = format!(
-            "---\ndescription: {desc}\ndisable-model-invocation: true\n---\n\n{body}"
-        );
+        let new_text =
+            format!("---\ndescription: {desc}\ndisable-model-invocation: true\n---\n\n{body}");
         if std::fs::write(&dest, new_text).is_err() {
             continue;
         }
@@ -486,13 +506,19 @@ mod tests {
     #[test]
     fn builtin_assets_complete() {
         let names: Vec<&str> = BUILTIN_ASSETS.iter().map(|(n, _)| *n).collect();
-        assert_eq!(names, vec!["archive-downloads", "clean-junk", "weekly-report"]);
+        assert_eq!(
+            names,
+            vec!["archive-downloads", "clean-junk", "weekly-report"]
+        );
         for (name, files) in BUILTIN_ASSETS {
             let md = files
                 .iter()
                 .find(|(p, _)| *p == "SKILL.md")
                 .expect("每个内置技能都要有 SKILL.md");
-            assert!(md.1.trim_start().starts_with("---"), "{name} 应带 frontmatter");
+            assert!(
+                md.1.trim_start().starts_with("---"),
+                "{name} 应带 frontmatter"
+            );
             // 手工解析 entry 行(frontmatter 简子集,与 load_skill 同规则)
             if let Some(rest) = md.1.strip_prefix("---") {
                 if let Some(end) = rest.find("\n---") {
@@ -501,7 +527,11 @@ mod tests {
                         .lines()
                         .find_map(|l| l.trim().strip_prefix("entry:"))
                     {
-                        let entry = entry.trim().trim_matches('"').trim_matches('\'').to_string();
+                        let entry = entry
+                            .trim()
+                            .trim_matches('"')
+                            .trim_matches('\'')
+                            .to_string();
                         assert!(
                             files.iter().any(|(p, _)| *p == entry),
                             "{name}:entry 脚本 {entry} 未随内置物化"
@@ -562,13 +592,15 @@ mod tests {
         assert_eq!(alpha.body, "项目版 alpha");
         assert_eq!(alpha.source, SkillSource::Project);
         assert_eq!(set.skills.len(), 3); // alpha(项目)+ beta + gamma
-        // beta disable → 不出现在模型可见列表
+                                         // beta disable → 不出现在模型可见列表
         let visible = model_visible(&set.skills);
         assert!(visible.iter().all(|s| s.name != "beta"));
         assert_eq!(visible.len(), 2);
         // 告警:坏目录与 name 不一致
         assert!(
-            set.warnings.iter().any(|w| w.contains("1bad") || w.contains("other")),
+            set.warnings
+                .iter()
+                .any(|w| w.contains("1bad") || w.contains("other")),
             "warnings: {:?}",
             set.warnings
         );
@@ -580,12 +612,27 @@ mod tests {
     fn entry_must_be_relative_and_inner() {
         let tmp = std::env::temp_dir().join(format!("znaide_skills2_{}", std::process::id()));
         let user = tmp.join("user");
-        write(&user, "ok", "---\ndescription: e\nentry: scripts/run.sh\n---\nx");
+        write(
+            &user,
+            "ok",
+            "---\ndescription: e\nentry: scripts/run.sh\n---\nx",
+        );
         let set = scan_with_dirs(&user, &tmp.join("empty"));
-        assert!(set.skills[0].entry_abs().unwrap().ends_with("scripts/run.sh"));
+        assert!(set.skills[0]
+            .entry_abs()
+            .unwrap()
+            .ends_with("scripts/run.sh"));
         // 绝对路径 / 含 .. 的 entry → 整包拒绝
-        write(&user, "badabs", "---\ndescription: e\nentry: /etc/passwd\n---\nx");
-        write(&user, "badup", "---\ndescription: e\nentry: ../evil.sh\n---\nx");
+        write(
+            &user,
+            "badabs",
+            "---\ndescription: e\nentry: /etc/passwd\n---\nx",
+        );
+        write(
+            &user,
+            "badup",
+            "---\ndescription: e\nentry: ../evil.sh\n---\nx",
+        );
         let set = scan_with_dirs(&user, &tmp.join("empty"));
         assert!(!set.skills.iter().any(|s| s.name == "badabs"));
         assert!(!set.skills.iter().any(|s| s.name == "badup"));
@@ -651,8 +698,14 @@ mod tests {
             ]
         );
         // 显式平台脚本 → 直接用
-        assert_eq!(win_entry_candidates("scripts/scan.ps1"), vec!["scripts/scan.ps1"]);
-        assert_eq!(win_entry_candidates("scripts/scan.bat"), vec!["scripts/scan.bat"]);
+        assert_eq!(
+            win_entry_candidates("scripts/scan.ps1"),
+            vec!["scripts/scan.ps1"]
+        );
+        assert_eq!(
+            win_entry_candidates("scripts/scan.bat"),
+            vec!["scripts/scan.bat"]
+        );
     }
 
     #[test]
@@ -666,7 +719,11 @@ mod tests {
             "---\ndescription: 总结代码\n---\n请总结 {args} 的代码",
         )
         .unwrap();
-        std::fs::write(cmd_dir.join("ping.md"), "---\ndescription: ping\n---\nping {args}").unwrap();
+        std::fs::write(
+            cmd_dir.join("ping.md"),
+            "---\ndescription: ping\n---\nping {args}",
+        )
+        .unwrap();
 
         // 1) skills 为空 → 迁移
         assert_eq!(migrate_commands_from(&cmd_dir, &skill_dir), 2);

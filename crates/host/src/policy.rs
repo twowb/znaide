@@ -51,9 +51,15 @@ mod tests {
     /// --no-retry 最高优先;--retry 夹到 0..=MAX_RETRY
     #[test]
     fn retry_override_wins_and_clamps() {
-        let off = RetryOverride { cli: Some(3), no_retry: true };
+        let off = RetryOverride {
+            cli: Some(3),
+            no_retry: true,
+        };
         assert_eq!(off.resolve_now(), 0, "--no-retry 压过 --retry");
-        let clamped = RetryOverride { cli: Some(99), no_retry: false };
+        let clamped = RetryOverride {
+            cli: Some(99),
+            no_retry: false,
+        };
         assert_eq!(clamped.resolve_now(), znaide_core::config::MAX_RETRY);
     }
 }

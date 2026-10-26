@@ -30,7 +30,10 @@ mod tests {
     fn cuts_on_char_boundary_and_marks() {
         // 中文按字符切:3 个汉字 + 后缀(不会切出半个 UTF-8)
         assert_eq!(truncate_chars("中文测试文本", 3, "…"), "中文测…");
-        assert_eq!(truncate_chars("中文测试文本", 3, "\n…(已截断)"), "中文测\n…(已截断)");
+        assert_eq!(
+            truncate_chars("中文测试文本", 3, "\n…(已截断)"),
+            "中文测\n…(已截断)"
+        );
         // emoji(多字节)同样按字符算
         assert_eq!(truncate_chars("😀😀😀😀", 2, "…"), "😀😀…");
     }

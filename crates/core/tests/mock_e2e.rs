@@ -7,12 +7,12 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::{timeout, Duration};
+use tokio_util::sync::CancellationToken;
 use znaide_core::config::{EffectiveHeaders, EffectiveProxy, Resolved};
 use znaide_core::llm::openai::StreamEvent;
 use znaide_core::llm::{ChatMessage, OpenAiClient, Usage};
 use znaide_core::permissions::Mode;
 use znaide_core::session::{Session, SessionEvent, SharedInbox};
-use tokio_util::sync::CancellationToken;
 
 /// 启动 mock:每个连接读完整请求(header + content-length body),调用 handler 生成响应
 async fn spawn_mock<F>(handler: F) -> String
@@ -39,7 +39,9 @@ where
     let log_server = log.clone();
     tokio::spawn(async move {
         loop {
-            let Ok((mut sock, _)) = listener.accept().await else { break };
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
             let counter = counter.clone();
             let handler = handler.clone();
             let log = log_server.clone();
@@ -271,7 +273,10 @@ async fn sse_stream_accumulates_tool_calls() {
         .unwrap();
     assert_eq!(reply.tool_calls.len(), 1);
     assert_eq!(reply.tool_calls[0].function.name, "read_file");
-    assert_eq!(reply.tool_calls[0].function.arguments, r#"{"path":"/tmp/x"}"#);
+    assert_eq!(
+        reply.tool_calls[0].function.arguments,
+        r#"{"path":"/tmp/x"}"#
+    );
 }
 
 #[tokio::test]
@@ -323,8 +328,8 @@ async fn session_run_turn_executes_tools() {
         CancellationToken::new(),
         false, // persist=false:测试不写历史
         Some("mock-e2e-test".into()),
-        None,  // 无 MCP
-        "",    // 无人格
+        None, // 无 MCP
+        "",   // 无人格
     )
     .unwrap();
     let result = session.run_turn("看看 src 目录").await.unwrap();
@@ -403,7 +408,10 @@ async fn queued_message_is_injected_at_round_boundary() {
     // 投递箱里先放一条(等价于"回合执行中用户按了 Enter"),它应该在本轮工具跑完后被插进去
     let inbox: SharedInbox = Arc::default();
     session.set_inbox(inbox.clone());
-    inbox.lock().unwrap().push_back("顺便把 y 也改了".to_string());
+    inbox
+        .lock()
+        .unwrap()
+        .push_back("顺便把 y 也改了".to_string());
 
     let result = session.run_turn("看看 src").await.unwrap();
     assert_eq!(result.text, "收到,顺带一起改");
@@ -432,7 +440,10 @@ async fn queued_message_is_injected_at_round_boundary() {
         msgs[tool_at + 1].get("content").and_then(|c| c.as_str()),
         Some("顺便把 y 也改了")
     );
-    assert!(inbox.lock().unwrap().is_empty(), "插过的消息要从投递箱里消失");
+    assert!(
+        inbox.lock().unwrap().is_empty(),
+        "插过的消息要从投递箱里消失"
+    );
 
     // UI 靠这个事件补卡片,否则历史里多了一条 user 却看不见
     let mut injected = Vec::new();
@@ -565,9 +576,11 @@ async fn headless_session_lazy_file_meta_and_resume() {
     assert_eq!(r1.text, "收到");
     assert!(hp.exists());
     let text = std::fs::read_to_string(&hp).unwrap();
-    let first: serde_json::Value =
-        serde_json::from_str(text.lines().next().unwrap_or("")).unwrap();
-    assert_eq!(first["meta"]["headless"], true, "无头会话首行应有 headless 标记");
+    let first: serde_json::Value = serde_json::from_str(text.lines().next().unwrap_or("")).unwrap();
+    assert_eq!(
+        first["meta"]["headless"], true,
+        "无头会话首行应有 headless 标记"
+    );
     assert_eq!(
         first["meta"]["schema"], "c4a23d6e50c7",
         "无头会话首行同样带历史格式版本"
@@ -779,8 +792,7 @@ async fn foreign_schema_in_history_emits_notice() {
     )
     .unwrap();
 
-    let (tx, mut rx) =
-        tokio::sync::mpsc::unbounded_channel::<znaide_core::session::SessionEvent>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<znaide_core::session::SessionEvent>();
     let llm = OpenAiClient::new(&cfg).unwrap();
     let mut session = Session::new(
         llm,
@@ -850,7 +862,9 @@ async fn tool_call_survives_sse_line_split_across_network_chunks() {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         loop {
-            let Ok((mut sock, _)) = listener.accept().await else { break };
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
             tokio::spawn(async move {
                 let _ = timeout(Duration::from_secs(10), async {
                     // 读完请求 header + body
@@ -1001,7 +1015,8 @@ async fn empty_and_null_tool_arguments_keep_loop_alive() {
     let log = tool_results.lock().unwrap().clone();
     // list_directory 空参数:应正常执行(列出目录),而不是 "invalid type: null"
     assert!(
-        log.iter().any(|c| c.contains("目录") && !c.contains("参数解析错误")),
+        log.iter()
+            .any(|c| c.contains("目录") && !c.contains("参数解析错误")),
         "list_directory 空参数应正常执行,实际: {log:?}"
     );
     // run_shell_command "null" 参数:归一化为 {} → 返回带指引的错误信息,循环继续
@@ -1221,8 +1236,14 @@ async fn compact_context_shrinks_next_request() {
     assert_eq!(r.text, "收到");
     let after = *last_len.lock().unwrap();
     // 摘要(1)+保留最近(≤4)+本回合新 user → 显著小于压缩前
-    assert!(after < before, "压缩后请求应更小:before={before} after={after}");
-    assert!(saw_summary.load(Ordering::SeqCst), "压缩后请求应含【上下文摘要】注入");
+    assert!(
+        after < before,
+        "压缩后请求应更小:before={before} after={after}"
+    );
+    assert!(
+        saw_summary.load(Ordering::SeqCst),
+        "压缩后请求应含【上下文摘要】注入"
+    );
 
     std::fs::remove_dir_all(cwd).ok();
 }
@@ -1389,7 +1410,11 @@ async fn max_turns_zero_means_unlimited() {
     let free = session.run_turn("这次不限轮数").await.unwrap();
     assert!(!free.truncated, "不限轮数时不该被截断: {}", free.text);
     assert!(free.text.contains("收工"));
-    assert!(free.tool_calls >= 8, "应真的跑满 8 轮以上,got {}", free.tool_calls);
+    assert!(
+        free.tool_calls >= 8,
+        "应真的跑满 8 轮以上,got {}",
+        free.tool_calls
+    );
 
     std::fs::remove_dir_all(cwd).ok();
 }
@@ -1458,7 +1483,11 @@ async fn round_started_events_report_progress() {
             got.push((used, limit));
         }
     }
-    assert_eq!(got, vec![(1, 50), (2, 50), (3, 50), (4, 50)], "每轮都要带上限");
+    assert_eq!(
+        got,
+        vec![(1, 50), (2, 50), (3, 50), (4, 50)],
+        "每轮都要带上限"
+    );
 
     // 不限:limit = 0(UI 用 ∞ 表示)
     session.set_max_turns(0);

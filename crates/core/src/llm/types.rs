@@ -40,23 +40,53 @@ pub struct ChatMessage {
 
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: Role::System, content: Some(content.into()), tool_calls: None, tool_call_id: None, reasoning_content: None }
+        Self {
+            role: Role::System,
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }
     }
 
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: Role::User, content: Some(content.into()), tool_calls: None, tool_call_id: None, reasoning_content: None }
+        Self {
+            role: Role::User,
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }
     }
 
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: Role::Assistant, content: Some(content.into()), tool_calls: None, tool_call_id: None, reasoning_content: None }
+        Self {
+            role: Role::Assistant,
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }
     }
 
     pub fn assistant_with_tool_calls(content: Option<String>, tool_calls: Vec<ToolCall>) -> Self {
-        Self { role: Role::Assistant, content, tool_calls: Some(tool_calls), tool_call_id: None, reasoning_content: None }
+        Self {
+            role: Role::Assistant,
+            content,
+            tool_calls: Some(tool_calls),
+            tool_call_id: None,
+            reasoning_content: None,
+        }
     }
 
     pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
-        Self { role: Role::Tool, content: Some(content.into()), tool_calls: None, tool_call_id: Some(tool_call_id.into()), reasoning_content: None }
+        Self {
+            role: Role::Tool,
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id.into()),
+            reasoning_content: None,
+        }
     }
 }
 
@@ -91,7 +121,11 @@ pub struct ToolFunction {
 }
 
 impl ToolDef {
-    pub fn function(name: impl Into<String>, description: impl Into<String>, parameters: serde_json::Value) -> Self {
+    pub fn function(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        parameters: serde_json::Value,
+    ) -> Self {
         Self {
             ty: "function".into(),
             function: ToolFunction {

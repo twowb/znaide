@@ -139,9 +139,9 @@ impl McpManager {
         if parts.len() != 3 || parts[0] != "mcp" {
             return false;
         }
-        self.clients.iter().any(|c| {
-            c.name == parts[1] && c.tools.iter().any(|t| t.name == parts[2])
-        })
+        self.clients
+            .iter()
+            .any(|c| c.name == parts[1] && c.tools.iter().any(|t| t.name == parts[2]))
     }
 
     /// 调用 MCP 工具,返回文本结果
@@ -171,6 +171,8 @@ impl McpClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // GUI 无控制台:别给 MCP server 弹黑框
+        crate::winproc::hide_console_window_async(&mut cmd);
         let mut child = cmd
             .spawn()
             .map_err(|e| anyhow::anyhow!("启动 {}({}): {e}", name, def.command))?;
@@ -320,12 +322,15 @@ impl McpClient {
             text = serde_json::to_string_pretty(&result)?;
         }
         // 检查 isError
-        if result.get("isError").and_then(|x| x.as_bool()).unwrap_or(false) {
+        if result
+            .get("isError")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false)
+        {
             anyhow::bail!("MCP 工具 {tool} 执行出错:\n{text}");
         }
         Ok(text)
     }
-
 }
 
 #[derive(Debug, Deserialize)]

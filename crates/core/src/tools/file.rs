@@ -75,9 +75,9 @@ pub async fn write_file(ctx: &ToolContext<'_>, args: &Value) -> Result<ToolOutpu
     }
     crate::undo::backup_for_session(ctx.session_id, &path, "write_file")
         .map_err(|e| ToolError(format!("备份失败: {e}")))?;
-    tokio::fs::write(&path, &a.content).await.map_err(|e| {
-        ToolError(format!("写入 {} 失败: {e}", path.display()))
-    })?;
+    tokio::fs::write(&path, &a.content)
+        .await
+        .map_err(|e| ToolError(format!("写入 {} 失败: {e}", path.display())))?;
     Ok(format!(
         "已写入 {} ({} 字节)",
         path.display(),
@@ -117,10 +117,7 @@ pub async fn edit(ctx: &ToolContext<'_>, args: &Value) -> Result<ToolOutput, Too
         .map_err(|e| ToolError(format!("备份失败: {e}")))?;
     let new_content = content.replace(&a.old_string, &a.new_string);
     tokio::fs::write(&path, &new_content).await?;
-    Ok(format!(
-        "已替换 {} 中的 1 处文本。",
-        path.display()
-    ))
+    Ok(format!("已替换 {} 中的 1 处文本。", path.display()))
 }
 
 #[cfg(test)]
@@ -162,7 +159,10 @@ mod tests {
             .await
             .unwrap();
         assert!(part.contains("显示 3-4"), "{part}");
-        assert!(part.contains("l3") && part.contains("l4") && !part.contains("l5"), "{part}");
+        assert!(
+            part.contains("l3") && part.contains("l4") && !part.contains("l5"),
+            "{part}"
+        );
 
         // offset 越界:空切片,不 panic
         let over = read_file(&ctx, &json!({"path": "t.txt", "offset": 99}))

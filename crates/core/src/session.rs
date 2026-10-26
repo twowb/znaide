@@ -3,7 +3,7 @@ use crate::llm::openai::{AssistantReply, StreamEvent};
 use crate::llm::types::{ChatMessage, ToolCall, ToolDef};
 use crate::llm::OpenAiClient;
 use crate::permissions::{inspect_command, CommandRisk, Mode, Permission};
-use crate::refs::expand_at_refs;
+use crate::refs::expand_at_refs_report;
 use crate::tools::{self, ToolContext};
 use serde_json::{json, Value};
 use std::fs::OpenOptions;
@@ -41,15 +41,27 @@ pub enum SessionEvent {
         idle_ms: Option<u64>,
     },
     /// 工具执行结束
-    ToolFinished { name: String, ok: bool, output: String },
+    ToolFinished {
+        name: String,
+        ok: bool,
+        output: String,
+    },
     /// 命令长时间无输出、接近被静默超时终止:UI 让对应卡片变黄(1)/红(2);
     /// level=0 表示恢复输出、解除预警
-    ToolSilentAlert { name: String, level: u8 },
+    ToolSilentAlert {
+        name: String,
+        level: u8,
+    },
     /// 命令实时输出增量(执行中推给 UI 滚动显示;约 200ms 节流一次;
     /// 无头模式 events=None 不发)
-    ToolOutputDelta { name: String, delta: String },
+    ToolOutputDelta {
+        name: String,
+        delta: String,
+    },
     /// 全局人格已切换(空 = 关闭):UI 据此更新状态栏人格显示
-    PersonaChanged { name: String },
+    PersonaChanged {
+        name: String,
+    },
     /// 权限询问(交互模式):UI 用 tx 回 (是否允许, 本会话是否总是允许)
     PermissionRequest {
         kind: PermKind,
@@ -62,13 +74,21 @@ pub enum SessionEvent {
     },
     /// 一轮模型往返开始(轮次预算用):used = 已用轮数(含本轮),limit = 上限
     /// (0 = 不限)。UI 拿它显示"轮 x/y"。
-    RoundStarted { used: usize, limit: usize },
+    RoundStarted {
+        used: usize,
+        limit: usize,
+    },
     /// 排队消息已在**轮边界**插进对话历史(UI 据此在正确位置补一张"你:"卡片)。
     /// 与 TurnFinished 不同:忙态不变,这一轮还在继续跑。
-    UserInjected { text: String },
+    UserInjected {
+        text: String,
+    },
     /// 轮次预算用尽、任务还没完(交互模式):问 UI 要不要再放一批。
     /// tx 回 true = 再放一批(默认 200 轮),false / Esc / 通道关闭 = 就此收尾
-    RoundsExhausted { used: usize, tx: oneshot::Sender<bool> },
+    RoundsExhausted {
+        used: usize,
+        tx: oneshot::Sender<bool>,
+    },
     /// 弱网重试:单次模型调用失败(或空回复)后又试了一次。UI 据此把本轮已吐出的
     /// 半截流式输出撤掉 —— 不撤就成了"半截 + 完整"拼接的鬼影。忙态不变。
     LlmRetrying {
@@ -82,7 +102,10 @@ pub enum SessionEvent {
     /// 通知/提示(如危险命令拦截)
     Notice(String),
     /// 一次模型调用的真实 token 用量(端点不提供 usage 就不发)
-    Usage { prompt: u64, completion: u64 },
+    Usage {
+        prompt: u64,
+        completion: u64,
+    },
     /// 上下文与历史已清空(/clear):UI 记得同步清掉展示
     ContextCleared,
     /// 压缩开始(/compact 耗时长,UI 先显示进行中)
@@ -97,11 +120,20 @@ pub enum SessionEvent {
         kept: Vec<ChatMessage>,
     },
     /// 回合结束
-    TurnFinished { text: String, truncated: bool },
+    TurnFinished {
+        text: String,
+        truncated: bool,
+    },
     /// 会话元信息(会话 id、历史文件路径等)
-    SessionInfo { id: String, history: Option<String> },
+    SessionInfo {
+        id: String,
+        history: Option<String>,
+    },
     /// 历史会话载入成功(消息列表给 UI 恢复展示)
-    HistoryLoaded { count: usize, messages: Vec<ChatMessage> },
+    HistoryLoaded {
+        count: usize,
+        messages: Vec<ChatMessage>,
+    },
 }
 
 /// 回合执行结果(供 headless 使用)
@@ -163,12 +195,7 @@ impl Session {
         mcp: Option<crate::mcp::McpManager>,
         persona: &str,
     ) -> anyhow::Result<Self> {
-        let id = session_id.unwrap_or_else(|| {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| format!("{:x}", d.as_millis()))
-                .unwrap_or_else(|_| "s".into())
-        });
+        let id = session_id.unwrap_or_else(fresh_session_id);
         // 懒创建:先只登记路径,首次 record 时才落盘——
         // 启动后没对话就退出的会话不再留下 0 字节空壳文件
         let (history_writer, history_path) = if persist {
@@ -201,10 +228,7 @@ impl Session {
         s.push_system_prompt();
         s.emit(SessionEvent::SessionInfo {
             id: s.session_id.clone(),
-            history: s
-                .history_path
-                .as_ref()
-                .map(|p| p.display().to_string()),
+            history: s.history_path.as_ref().map(|p| p.display().to_string()),
         });
         Ok(s)
     }
@@ -311,18 +335,27 @@ impl Session {
             self.emit(SessionEvent::CompactionStarted);
         }
         let Some(sys) = self.messages.first().cloned() else {
-            self.emit(SessionEvent::TurnFinished { text: String::new(), truncated: false });
+            self.emit(SessionEvent::TurnFinished {
+                text: String::new(),
+                truncated: false,
+            });
             return Ok(0);
         };
         if sys.role != crate::llm::types::Role::System {
-            self.emit(SessionEvent::TurnFinished { text: String::new(), truncated: false });
+            self.emit(SessionEvent::TurnFinished {
+                text: String::new(),
+                truncated: false,
+            });
             return Ok(0);
         }
         // 只读拆分,成功前不动 self.messages
         let tail: Vec<ChatMessage> = self.messages.iter().skip(1).cloned().collect();
         if tail.len() <= KEEP_TAIL + 1 {
             // 历史太短,没有可压缩空间
-            self.emit(SessionEvent::TurnFinished { text: String::new(), truncated: false });
+            self.emit(SessionEvent::TurnFinished {
+                text: String::new(),
+                truncated: false,
+            });
             return Ok(0);
         }
         let keep_at = tail.len().saturating_sub(KEEP_TAIL);
@@ -366,9 +399,16 @@ impl Session {
                     break single;
                 };
                 attempt += 1;
-                self.emit(SessionEvent::LlmRetrying { attempt, max: self.retry, reason });
+                self.emit(SessionEvent::LlmRetrying {
+                    attempt,
+                    max: self.retry,
+                    reason,
+                });
                 if self.wait_retry_backoff(attempt).await {
-                    self.emit(SessionEvent::TurnFinished { text: String::new(), truncated: false });
+                    self.emit(SessionEvent::TurnFinished {
+                        text: String::new(),
+                        truncated: false,
+                    });
                     anyhow::bail!("压缩已中断");
                 }
             }
@@ -377,13 +417,19 @@ impl Session {
             Ok(r) => r,
             Err(e) => {
                 // 失败:复位 UI 状态,保持原上下文不动
-                self.emit(SessionEvent::TurnFinished { text: String::new(), truncated: false });
+                self.emit(SessionEvent::TurnFinished {
+                    text: String::new(),
+                    truncated: false,
+                });
                 return Err(e);
             }
         };
         let summary = reply.content.unwrap_or_default();
         if summary.trim().is_empty() {
-            self.emit(SessionEvent::TurnFinished { text: String::new(), truncated: false });
+            self.emit(SessionEvent::TurnFinished {
+                text: String::new(),
+                truncated: false,
+            });
             anyhow::bail!("压缩模型没返回内容,再试一次");
         }
         let summary_msg = ChatMessage::user(format!(
@@ -485,6 +531,40 @@ impl Session {
         Ok(loaded)
     }
 
+    /// 切换工作目录(只影响后续回合;当前回合不换)
+    pub fn set_cwd(&mut self, cwd: PathBuf) -> anyhow::Result<()> {
+        if !cwd.is_dir() {
+            anyhow::bail!("目录不存在或不是目录:{}", cwd.display());
+        }
+        self.cwd = cwd;
+        Ok(())
+    }
+
+    /// 新会话:换身份、清空消息与历史路径,保留模型/人格/模式等设置。
+    pub fn start_new(&mut self) -> anyhow::Result<()> {
+        let id = fresh_session_id();
+        let history_path = if self.history_path.is_some() {
+            let dir = data_dir().join("sessions");
+            std::fs::create_dir_all(&dir)?;
+            Some(dir.join(format!("{id}.jsonl")))
+        } else {
+            None
+        };
+        self.session_id = id;
+        self.history_path = history_path;
+        self.history_writer = None;
+        self.messages.clear();
+        self.file_always = false;
+        self.command_always = false;
+        self.push_system_prompt();
+        self.emit(SessionEvent::SessionInfo {
+            id: self.session_id.clone(),
+            history: self.history_path.as_ref().map(|p| p.display().to_string()),
+        });
+        self.emit(SessionEvent::ContextCleared);
+        Ok(())
+    }
+
     fn push_system_prompt(&mut self) {
         // 避免重复注入
         if self
@@ -555,14 +635,17 @@ impl Session {
         let Some(path) = self.history_path.clone() else {
             return;
         };
-        let fresh = std::fs::metadata(&path).map(|m| m.len() == 0).unwrap_or(true);
+        let fresh = std::fs::metadata(&path)
+            .map(|m| m.len() == 0)
+            .unwrap_or(true);
         if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
             if fresh {
                 let _ = writeln!(
                     f,
-                    r#"{{"meta":{{"headless":{},"schema":"{}"}}}}"#,
+                    r#"{{"meta":{{"headless":{},"schema":"{}","cwd":"{}"}}}}"#,
                     self.events.is_none(),
-                    HISTORY_SCHEMA
+                    HISTORY_SCHEMA,
+                    self.cwd.display().to_string().replace('\\', "\\\\").replace('"', "\\\"")
                 );
                 let _ = f.flush();
             }
@@ -644,9 +727,9 @@ impl Session {
             // (以前这里手抄了一遍,已经和那边抄得不一样了)
             match kind {
                 PermKind::Write => match self.mode {
-                    Mode::Ask => PermissionResult::Denied(
-                        crate::permissions::NEED_ACCEPT_EDITS.into(),
-                    ),
+                    Mode::Ask => {
+                        PermissionResult::Denied(crate::permissions::NEED_ACCEPT_EDITS.into())
+                    }
                     _ => PermissionResult::Allowed,
                 },
                 PermKind::Command => match self.mode {
@@ -672,7 +755,13 @@ impl Session {
                         PermKind::Write => "znaide 想要修改文件".to_string(),
                         PermKind::Command => cmd.to_string(),
                     };
-                    self.emit(SessionEvent::PermissionRequest { kind, title, body, warning, tx });
+                    self.emit(SessionEvent::PermissionRequest {
+                        kind,
+                        title,
+                        body,
+                        warning,
+                        tx,
+                    });
                     tokio::select! {
                         r = rx => match r {
                             Ok((allow, always)) => {
@@ -717,7 +806,13 @@ impl Session {
 
     /// 回合主体(错误由 run_turn 包装成 UI 事件)
     async fn run_turn_inner(&mut self, prompt: &str) -> anyhow::Result<TurnResult> {
-        let expanded = expand_at_refs(prompt, &self.cwd);
+        let (expanded, missing) = expand_at_refs_report(prompt, &self.cwd);
+        if !missing.is_empty() {
+            self.notify(format!(
+                "未找到引用:{}（已按原文保留）",
+                missing.join("、")
+            ));
+        }
         self.record(&ChatMessage::user(expanded));
         self.emit(SessionEvent::TurnStarted);
 
@@ -733,11 +828,16 @@ impl Session {
         defs.extend(self.mcp.tool_defs());
 
         // D1 轮数预算:max_turns = 0 视为不限;每批用完问用户要不要续跑(D2)
-        let batch = if self.max_turns == 0 { usize::MAX } else { self.max_turns };
+        let batch = if self.max_turns == 0 {
+            usize::MAX
+        } else {
+            self.max_turns
+        };
         let mut budget = batch;
         let mut used = 0usize;
         // D3 刹车:完全相同(工具 + 参数)的调用计数
-        let mut sig_seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut sig_seen: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
 
         loop {
             if used >= budget {
@@ -754,7 +854,10 @@ impl Session {
                              --max-turns 0 表示不限"
                         )
                     };
-                    self.emit(SessionEvent::TurnFinished { text: text.clone(), truncated: true });
+                    self.emit(SessionEvent::TurnFinished {
+                        text: text.clone(),
+                        truncated: true,
+                    });
                     return Ok(TurnResult {
                         text,
                         tool_calls,
@@ -819,12 +922,25 @@ impl Session {
                         break single;
                     };
                     attempt += 1;
-                    self.emit(SessionEvent::LlmRetrying { attempt, max: self.retry, reason });
+                    self.emit(SessionEvent::LlmRetrying {
+                        attempt,
+                        max: self.retry,
+                        reason,
+                    });
                     if self.wait_retry_backoff(attempt).await {
                         // 退避期间按了 Esc:与"生成中断"同一语义收尾
                         let text = "⏹ 生成已中断".to_string();
-                        self.emit(SessionEvent::TurnFinished { text: text.clone(), truncated: true });
-                        return Ok(TurnResult { text, tool_calls, truncated: true, input_tokens: usage_in, output_tokens: usage_out });
+                        self.emit(SessionEvent::TurnFinished {
+                            text: text.clone(),
+                            truncated: true,
+                        });
+                        return Ok(TurnResult {
+                            text,
+                            tool_calls,
+                            truncated: true,
+                            input_tokens: usage_in,
+                            output_tokens: usage_out,
+                        });
                     }
                 };
                 // 重试用尽(或这次失败不值得重试):错误在这里上抛,与旧行为一致
@@ -849,8 +965,17 @@ impl Session {
                     .clone()
                     .or(reply.reasoning_content.clone())
                     .unwrap_or_else(|| "(模型无文本输出)".to_string());
-                self.emit(SessionEvent::TurnFinished { text: text.clone(), truncated: false });
-                return Ok(TurnResult { text, tool_calls, truncated: false, input_tokens: usage_in, output_tokens: usage_out });
+                self.emit(SessionEvent::TurnFinished {
+                    text: text.clone(),
+                    truncated: false,
+                });
+                return Ok(TurnResult {
+                    text,
+                    tool_calls,
+                    truncated: false,
+                    input_tokens: usage_in,
+                    output_tokens: usage_out,
+                });
             }
 
             // 逐个执行工具。Esc 中断后不再跑同批剩余的,但要给它们补齐
@@ -909,7 +1034,10 @@ impl Session {
                         "⚠ 检测到原地打转:工具 `{name}` 用完全相同的参数重复了 {n} 次,已中止本轮。\
                          换个思路再来,或直接告诉我要什么。"
                     );
-                    self.emit(SessionEvent::TurnFinished { text: text.clone(), truncated: true });
+                    self.emit(SessionEvent::TurnFinished {
+                        text: text.clone(),
+                        truncated: true,
+                    });
                     return Ok(TurnResult {
                         text,
                         tool_calls,
@@ -944,8 +1072,16 @@ impl Session {
                 let msg = format!(
                     "工具参数解析失败:{detail}\n请按工具定义的 JSON Schema 重新构造 arguments 后再次调用。"
                 );
-                self.emit(SessionEvent::ToolStarted { name: name.clone(), args: String::new(), idle_ms: None });
-                self.emit(SessionEvent::ToolFinished { name: name.clone(), ok: false, output: msg.clone() });
+                self.emit(SessionEvent::ToolStarted {
+                    name: name.clone(),
+                    args: String::new(),
+                    idle_ms: None,
+                });
+                self.emit(SessionEvent::ToolFinished {
+                    name: name.clone(),
+                    ok: false,
+                    output: msg.clone(),
+                });
                 return msg;
             }
         };
@@ -968,10 +1104,18 @@ impl Session {
             } else {
                 format!("skill「{skill_name}」")
             };
-            self.emit(SessionEvent::ToolStarted { name: card.clone(), args: pretty_args(&args), idle_ms: None });
+            self.emit(SessionEvent::ToolStarted {
+                name: card.clone(),
+                args: pretty_args(&args),
+                idle_ms: None,
+            });
             let (out, ok) = self.run_skill(&skill_name, &skill_args).await;
             let out = truncate_for_ui(&out);
-            self.emit(SessionEvent::ToolFinished { name: card, ok, output: out.clone() });
+            self.emit(SessionEvent::ToolFinished {
+                name: card,
+                ok,
+                output: out.clone(),
+            });
             return out;
         }
 
@@ -980,21 +1124,41 @@ impl Session {
             let perm = self.check_permission(PermKind::Write, "").await;
             return match perm {
                 PermissionResult::Denied(reason) => {
-                    self.emit(SessionEvent::ToolStarted { name: name.clone(), args: pretty_args(&args), idle_ms: None });
-                    self.emit(SessionEvent::ToolFinished { name: name.clone(), ok: false, output: reason.clone() });
+                    self.emit(SessionEvent::ToolStarted {
+                        name: name.clone(),
+                        args: pretty_args(&args),
+                        idle_ms: None,
+                    });
+                    self.emit(SessionEvent::ToolFinished {
+                        name: name.clone(),
+                        ok: false,
+                        output: reason.clone(),
+                    });
                     format!("操作未执行: {reason}")
                 }
                 PermissionResult::Allowed => {
-                    self.emit(SessionEvent::ToolStarted { name: name.clone(), args: pretty_args(&args), idle_ms: None });
+                    self.emit(SessionEvent::ToolStarted {
+                        name: name.clone(),
+                        args: pretty_args(&args),
+                        idle_ms: None,
+                    });
                     match self.mcp.call(&name, args).await {
                         Ok(out) => {
                             let out = truncate_for_ui(&out);
-                            self.emit(SessionEvent::ToolFinished { name: name.clone(), ok: true, output: out.clone() });
+                            self.emit(SessionEvent::ToolFinished {
+                                name: name.clone(),
+                                ok: true,
+                                output: out.clone(),
+                            });
                             out
                         }
                         Err(e) => {
                             let msg = format!("MCP 工具 {name} 执行失败: {e}");
-                            self.emit(SessionEvent::ToolFinished { name: name.clone(), ok: false, output: msg.clone() });
+                            self.emit(SessionEvent::ToolFinished {
+                                name: name.clone(),
+                                ok: false,
+                                output: msg.clone(),
+                            });
                             msg
                         }
                     }
@@ -1012,8 +1176,16 @@ impl Session {
                     .to_string();
                 if cmd.trim().is_empty() {
                     let msg = "command 不能为空:请传入要执行的完整命令字符串,如 {\"command\": \"ls -la\"}".to_string();
-                    self.emit(SessionEvent::ToolStarted { name: name.clone(), args: String::new(), idle_ms: tool_idle_ms(&name, &args) });
-                    self.emit(SessionEvent::ToolFinished { name: name.clone(), ok: false, output: msg.clone() });
+                    self.emit(SessionEvent::ToolStarted {
+                        name: name.clone(),
+                        args: String::new(),
+                        idle_ms: tool_idle_ms(&name, &args),
+                    });
+                    self.emit(SessionEvent::ToolFinished {
+                        name: name.clone(),
+                        ok: false,
+                        output: msg.clone(),
+                    });
                     return msg;
                 }
                 let perm = self.check_permission(PermKind::Command, &cmd).await;
@@ -1026,25 +1198,33 @@ impl Session {
             let perm = self.check_permission(kind, "").await;
             self.after_permission(name, args, perm).await
         } else {
-            self.after_permission(name, args, PermissionResult::Allowed).await
+            self.after_permission(name, args, PermissionResult::Allowed)
+                .await
         }
     }
 
     /// 权限通过后执行工具
-    async fn after_permission(
-        &self,
-        name: String,
-        args: Value,
-        perm: PermissionResult,
-    ) -> String {
+    async fn after_permission(&self, name: String, args: Value, perm: PermissionResult) -> String {
         match perm {
             PermissionResult::Denied(reason) => {
-                self.emit(SessionEvent::ToolStarted { name: name.clone(), args: pretty_args(&args), idle_ms: tool_idle_ms(&name, &args) });
-                self.emit(SessionEvent::ToolFinished { name: name.clone(), ok: false, output: reason.clone() });
+                self.emit(SessionEvent::ToolStarted {
+                    name: name.clone(),
+                    args: pretty_args(&args),
+                    idle_ms: tool_idle_ms(&name, &args),
+                });
+                self.emit(SessionEvent::ToolFinished {
+                    name: name.clone(),
+                    ok: false,
+                    output: reason.clone(),
+                });
                 format!("操作未执行: {reason}")
             }
             PermissionResult::Allowed => {
-                self.emit(SessionEvent::ToolStarted { name: name.clone(), args: pretty_args(&args), idle_ms: tool_idle_ms(&name, &args) });
+                self.emit(SessionEvent::ToolStarted {
+                    name: name.clone(),
+                    args: pretty_args(&args),
+                    idle_ms: tool_idle_ms(&name, &args),
+                });
                 // 会话已放行:工具内权限给"全放行";YOLO 会话透传 YOLO,连高危命令判定也跳过
                 let tool_mode = if self.mode == Mode::Yolo {
                     Mode::Yolo
@@ -1062,12 +1242,20 @@ impl Session {
                 };
                 match tools::execute(&name, args, &ctx).await {
                     Ok(out) => {
-                        self.emit(SessionEvent::ToolFinished { name: name.clone(), ok: true, output: out.clone() });
+                        self.emit(SessionEvent::ToolFinished {
+                            name: name.clone(),
+                            ok: true,
+                            output: out.clone(),
+                        });
                         out
                     }
                     Err(e) => {
                         let msg = format!("工具 {name} 执行失败: {e}");
-                        self.emit(SessionEvent::ToolFinished { name: name.clone(), ok: false, output: msg.clone() });
+                        self.emit(SessionEvent::ToolFinished {
+                            name: name.clone(),
+                            ok: false,
+                            output: msg.clone(),
+                        });
                         msg
                     }
                 }
@@ -1085,7 +1273,8 @@ impl Session {
                 "未找到该技能(当前没有任何已安装的技能,可参考 README 的 skill 示例)。".to_string()
             } else {
                 format!(
-                    "未找到技能「{name}」。可用技能:{}(输入 /skills 查看详情)", avail.join(", ")
+                    "未找到技能「{name}」。可用技能:{}(输入 /skills 查看详情)",
+                    avail.join(", ")
                 )
             };
             return (msg, false);
@@ -1145,16 +1334,21 @@ impl Session {
 
     /// 手动触发技能:/名字 [参数]。渲染正文(+ 入口输出)后当一个新回合跑;
     /// 技能不存在就只提示、不开回合(免得 UI 的 busy 状态没人清)。
-    pub async fn run_skill_turn(
-        &mut self,
-        name: &str,
-        args: &str,
-    ) -> anyhow::Result<TurnResult> {
+    pub async fn run_skill_turn(&mut self, name: &str, args: &str) -> anyhow::Result<TurnResult> {
         let (content, ok) = self.run_skill(name, args).await;
         if !ok {
             self.notify(content);
-            self.emit(SessionEvent::TurnFinished { text: String::new(), truncated: false });
-            return Ok(TurnResult { text: String::new(), tool_calls: 0, truncated: false, input_tokens: 0, output_tokens: 0 });
+            self.emit(SessionEvent::TurnFinished {
+                text: String::new(),
+                truncated: false,
+            });
+            return Ok(TurnResult {
+                text: String::new(),
+                tool_calls: 0,
+                truncated: false,
+                input_tokens: 0,
+                output_tokens: 0,
+            });
         }
         self.run_turn(&content).await
     }
@@ -1226,7 +1420,10 @@ fn retry_backoff_ms(attempt: usize) -> u64 {
 ///
 /// 连接类失败会把**当前生效代理**附在后面:`代理没起` 与 `端点不对` 是两回事,
 /// 只给一句"检查 base_url、网络和代理设置"等于让人瞎猜。
-pub fn describe_request_error(err: &anyhow::Error, proxy: Option<&crate::config::EffectiveProxy>) -> String {
+pub fn describe_request_error(
+    err: &anyhow::Error,
+    proxy: Option<&crate::config::EffectiveProxy>,
+) -> String {
     let re = err.chain().find_map(|c| c.downcast_ref::<reqwest::Error>());
     let hint = || match proxy {
         Some(p) => format!("\n{}", crate::net::describe_proxy(p)),
@@ -1248,9 +1445,7 @@ pub fn describe_request_error(err: &anyhow::Error, proxy: Option<&crate::config:
                 hint()
             )
         }
-        Some(re) if re.is_body() => {
-            "读模型响应读到一半断了(连接被关或网络抖动):可重试一次".into()
-        }
+        Some(re) if re.is_body() => "读模型响应读到一半断了(连接被关或网络抖动):可重试一次".into(),
         Some(re) => format!("模型请求失败: {re}"),
         None => format!("{err:#}"),
     }
@@ -1516,7 +1711,10 @@ fn build_system_prompt(cwd: &Path, mode: Mode, session_id: &str, persona: &str) 
 /// 时机提醒:这个摘要只在**新会话 / `/clear` / `/resume` / 切模式 / 切人格**时重建 ——
 /// 会话中途写进去的记忆不会立刻进提示,但 `memory_read` 是实时读盘的。
 fn memory_hint(cwd: &Path) -> String {
-    let global = hint_block(&crate::config::data_dir().join("memories").join("MEMORY.md"), 60);
+    let global = hint_block(
+        &crate::config::data_dir().join("memories").join("MEMORY.md"),
+        60,
+    );
     let project = hint_block(&cwd.join(".znaide").join("memories").join("MEMORY.md"), 40);
     if global.is_none() && project.is_none() {
         return "(暂无记忆。若用户提到重要的环境信息/偏好,用 memory_write 记录;本仓库的约定用 scope=project)".into();
@@ -1563,15 +1761,76 @@ pub struct HistoryEntry {
     pub path: PathBuf,
     /// 命令行无头模式(-p)产生的会话(文件首行 meta 标记)
     pub headless: bool,
+    /// 会话创建时的工作目录(老文件为 None)
+    pub cwd: Option<PathBuf>,
     /// 用户备注(会话旁 <id>.meta.json 的 note;无备注为 None)
     pub note: Option<String>,
 }
 
+/// 侧边栏用的会话摘要(标题 = 首条用户消息的首行,按字符截断)。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HistorySummary {
+    pub title: String,
+    pub user_msgs: usize,
+    pub assistant_msgs: usize,
+    /// 最后修改时间(epoch 毫秒;拿不到为 0)
+    pub mtime_ms: u64,
+}
+
+/// 扫一遍会话文件,取标题与消息数。会话列表只读它,不加载完整对话。
+pub fn summarize_history(path: &Path) -> HistorySummary {
+    use std::io::BufRead;
+    const TITLE_CHARS: usize = 60;
+    let mut out = HistorySummary::default();
+    if let Ok(f) = std::fs::File::open(path) {
+        for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
+            // jsonl 是 ChatMessage 的顺序序列化(role 第一个字段);兼容带空格的 JSON
+            let l = line.trim_start();
+            let is_user =
+                l.starts_with("{\"role\":\"user\"") || l.starts_with("{\"role\": \"user\"");
+            let is_assistant = l.starts_with("{\"role\":\"assistant\"")
+                || l.starts_with("{\"role\": \"assistant\"");
+            if is_user {
+                out.user_msgs += 1;
+                if out.title.is_empty() {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(l) {
+                        if let Some(c) = v.get("content").and_then(|c| c.as_str()) {
+                            let flat = c
+                                .lines()
+                                .find(|l| !l.trim().is_empty())
+                                .unwrap_or("")
+                                .trim();
+                            out.title = flat.chars().take(TITLE_CHARS).collect();
+                            if flat.chars().count() > TITLE_CHARS {
+                                out.title.push('…');
+                            }
+                        }
+                    }
+                }
+            } else if is_assistant {
+                out.assistant_msgs += 1;
+            }
+        }
+    }
+    out.mtime_ms = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    out
+}
+
 /// 解析历史文件首行的会话元数据(仅 headless 标志;旧文件无 meta 视为交互会话)
+#[allow(dead_code)]
 fn entry_headless(path: &Path) -> bool {
+    entry_meta(path).0
+}
+
+fn entry_meta(path: &Path) -> (bool, Option<PathBuf>) {
     use std::io::BufRead;
     let Ok(f) = std::fs::File::open(path) else {
-        return false;
+        return (false, None);
     };
     let mut first = String::new();
     if std::io::BufReader::new(f)
@@ -1580,16 +1839,16 @@ fn entry_headless(path: &Path) -> bool {
         .map(|n| n == 0)
         .unwrap_or(true)
     {
-        return false;
+        return (false, None);
     }
     let first = first.trim();
     if !first.starts_with("{\"meta\"") {
-        return false;
+        return (false, None);
     }
-    serde_json::from_str::<serde_json::Value>(first)
-        .ok()
-        .and_then(|v| v.get("meta").and_then(|m| m.get("headless")).and_then(|h| h.as_bool()))
-        .unwrap_or(false)
+    let v: serde_json::Value = serde_json::from_str(first).unwrap_or_default();
+    let headless = v["meta"]["headless"].as_bool().unwrap_or(false);
+    let cwd = v["meta"]["cwd"].as_str().map(PathBuf::from);
+    (headless, cwd)
 }
 
 /// 会话备注 sidecar 路径:<id>.jsonl → 同目录 <id>.meta.json。
@@ -1664,10 +1923,12 @@ pub fn list_history_sessions_detailed() -> Vec<HistoryEntry> {
                 && e.metadata().map(|m| m.len() > 0).unwrap_or(false)
             {
                 let note = read_note(&p);
+                let (headless, cwd) = entry_meta(&p);
                 out.push(HistoryEntry {
-                    headless: entry_headless(&p),
+                    headless,
                     path: p,
                     note,
+                    cwd,
                 });
             }
         }
@@ -1704,6 +1965,14 @@ pub fn prune_empty_sessions() -> usize {
         }
     }
     removed
+}
+
+/// 新会话 id(毫秒 + 纳秒,避免同毫秒内连续新建撞车)
+fn fresh_session_id() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{:x}{:x}", now.as_millis(), now.subsec_nanos())
 }
 
 #[cfg(test)]
@@ -1829,8 +2098,9 @@ mod tests {
     #[test]
     fn truncated_json_is_repaired() {
         // 模型漏掉字符串结尾引号 + 对象右花括号 → 补 "}
-        let v = parse_tool_args(r#"{"command":"du -sh /home/zngeek/.cache | sort -rh | head -n 10"#)
-            .unwrap();
+        let v =
+            parse_tool_args(r#"{"command":"du -sh /home/zngeek/.cache | sort -rh | head -n 10"#)
+                .unwrap();
         assert_eq!(
             v["command"],
             "du -sh /home/zngeek/.cache | sort -rh | head -n 10"
@@ -1857,7 +2127,8 @@ mod tests {
         assert!(yes.contains("## 人设"), "应注入人设段");
         assert!(yes.contains("「毒舌损友」"));
         assert!(yes.contains("底层约束"), "应声明工作守则不可被人设覆盖");
-        let bad = super::build_system_prompt(cwd, crate::permissions::Mode::Ask, "s1", "不存在的角色");
+        let bad =
+            super::build_system_prompt(cwd, crate::permissions::Mode::Ask, "s1", "不存在的角色");
         assert!(!bad.contains("## 人设"), "未知人格应静默不注入");
     }
 
@@ -1868,11 +2139,18 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let h = dir.join("h.jsonl");
         let i = dir.join("i.jsonl");
-        std::fs::write(&h, "{\"meta\":{\"headless\":true}}\n{\"role\":\"user\"...}\n").unwrap();
+        std::fs::write(
+            &h,
+            "{\"meta\":{\"headless\":true}}\n{\"role\":\"user\"...}\n",
+        )
+        .unwrap();
         std::fs::write(&i, "{\"role\":\"user\",\"content\":\"hi\"}\n").unwrap();
         assert!(super::entry_headless(&h), "headless 标记应识别");
         assert!(!super::entry_headless(&i), "无 meta 的普通会话应为 false");
-        assert!(!super::entry_headless(&dir.join("not_exist.jsonl")), "文件缺失不应 panic");
+        assert!(
+            !super::entry_headless(&dir.join("not_exist.jsonl")),
+            "文件缺失不应 panic"
+        );
         std::fs::remove_file(&h).ok();
         std::fs::remove_file(&i).ok();
         std::fs::remove_dir_all(&dir).ok();
@@ -1892,7 +2170,10 @@ mod tests {
         assert_eq!(super::read_note(&sess), None, "无 sidecar → None");
         // 写入 → 读回;首尾空白应裁剪
         super::write_note(&sess, "  给 README 做英文版  ").unwrap();
-        assert_eq!(super::read_note(&sess).as_deref(), Some("给 README 做英文版"));
+        assert_eq!(
+            super::read_note(&sess).as_deref(),
+            Some("给 README 做英文版")
+        );
         // sidecar 落在 <id>.meta.json,不改动 jsonl 本体
         assert!(dir.join("s1.meta.json").exists());
         assert!(!dir.join("s1.meta.json.tmp").exists(), "临时文件应已改名");
@@ -1903,11 +2184,40 @@ mod tests {
         );
         // 覆盖更新
         super::write_note(&sess, "改成英文 README 的会话").unwrap();
-        assert_eq!(super::read_note(&sess).as_deref(), Some("改成英文 README 的会话"));
+        assert_eq!(
+            super::read_note(&sess).as_deref(),
+            Some("改成英文 README 的会话")
+        );
         // 空文本 = 清除
         super::write_note(&sess, "   ").unwrap();
         assert_eq!(super::read_note(&sess), None, "空备注应清除");
         assert!(!dir.join("s1.meta.json").exists(), "sidecar 应被删除");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 侧边栏摘要:标题取首条用户消息的首行,消息计数不解析整份对话
+    #[test]
+    fn summary_takes_title_and_counts() {
+        let dir = std::env::temp_dir().join(format!("znaide_sum_ut_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sess = dir.join("s3.jsonl");
+        std::fs::write(
+            &sess,
+            concat!(
+                "{\"meta\":{\"headless\":false}}\n",
+                "{\"role\":\"user\",\"content\":\"第一条消息\\n第二行\"}\n",
+                "{\"role\":\"assistant\",\"content\":\"好的\"}\n",
+                "{\"role\": \"assistant\", \"content\": \"带空格的旧文件\"}\n",
+                "{\"role\":\"tool\",\"content\":\"输出\"}\n",
+                "{\"role\":\"user\",\"content\":\"再来一条\"}\n",
+            ),
+        )
+        .unwrap();
+        let s = super::summarize_history(&sess);
+        assert_eq!(s.title, "第一条消息");
+        assert_eq!(s.user_msgs, 2);
+        assert_eq!(s.assistant_msgs, 2, "带空格的行也要计数");
+        assert!(s.mtime_ms > 0, "应有最后修改时间");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1984,7 +2294,10 @@ mod tests {
         )
         .unwrap();
         let both = super::memory_hint(&cwd);
-        assert!(both.contains("### Global") && both.contains("### Project"), "{both}");
+        assert!(
+            both.contains("### Global") && both.contains("### Project"),
+            "{both}"
+        );
         assert!(both.contains("[约定]") && both.contains("[机器]"));
         let proj_at = both.find("### Project").unwrap();
         assert!(
@@ -1993,7 +2306,9 @@ mod tests {
         );
 
         // 项目级超预算(40 行)→ 各自计数、各自截断
-        let many: String = (0..45).map(|i| format!("- [条{i}](f{i}.md) — x\n")).collect();
+        let many: String = (0..45)
+            .map(|i| format!("- [条{i}](f{i}.md) — x\n"))
+            .collect();
         std::fs::write(cwd.join(".znaide").join("memories").join("MEMORY.md"), many).unwrap();
         let cut = super::memory_hint(&cwd);
         assert!(cut.contains("共 45 行"), "{cut}");
@@ -2060,7 +2375,10 @@ mod tests {
                     .clone()
                     .or_else(|| {
                         m.tool_calls.as_ref().map(|cs| {
-                            cs.iter().map(|c| c.id.clone()).collect::<Vec<_>>().join("+")
+                            cs.iter()
+                                .map(|c| c.id.clone())
+                                .collect::<Vec<_>>()
+                                .join("+")
                         })
                     })
                     .unwrap_or_else(|| m.content.clone().unwrap_or_default());
@@ -2097,10 +2415,7 @@ mod tests {
     #[test]
     fn repair_fills_when_no_tool_ran_at_all() {
         // 批里第一个工具还没执行(权限确认时)就被中断:所有调用都缺响应
-        let mut msgs = vec![
-            asst_with_calls(&["a", "b"]),
-            ChatMessage::user("接着干"),
-        ];
+        let mut msgs = vec![asst_with_calls(&["a", "b"]), ChatMessage::user("接着干")];
         let fixed = super::repair_tool_chain(&mut msgs);
         assert_eq!(fixed, 2);
         let fp = fingerprint(&msgs);

@@ -86,7 +86,9 @@ pub fn run(raw: &str, cmd_tx: &UnboundedSender<AgentCmd>, cwd: &Path) -> Command
         "/skills" => {
             let txt = skills_text(cwd);
             if txt.is_empty() {
-                r.output("暂无已安装技能。\n技能目录:~/.znaide/skills/ 用户级, .znaide/skills/ 项目级");
+                r.output(
+                    "暂无已安装技能。\n技能目录:~/.znaide/skills/ 用户级, .znaide/skills/ 项目级",
+                );
             } else {
                 r.output(txt);
             }

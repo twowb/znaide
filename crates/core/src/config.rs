@@ -405,6 +405,37 @@ fn env_flag_set(name: &str) -> bool {
 }
 
 /// 头名校验:RFC 9110 的 `tchar`(ASCII 字母数字 + `!#$%&'*+-.^_`|~`)。
+/// 校验并收集额外请求头:保留头/非法名字/非法值都丢弃并返回提示。
+fn validate_extra_headers(
+    extra_headers: Vec<(String, String)>,
+) -> (std::collections::HashMap<String, String>, Vec<String>) {
+    let mut notes = Vec::new();
+    let mut map = std::collections::HashMap::new();
+    for (raw_name, value) in extra_headers {
+        let name = raw_name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if RESERVED_HEADERS
+            .iter()
+            .any(|r| r.eq_ignore_ascii_case(name))
+        {
+            notes.push(format!("{name} 是保留头,已忽略"));
+            continue;
+        }
+        if !valid_header_name(name) {
+            notes.push(format!("{name} 不是合法的头名,已忽略"));
+            continue;
+        }
+        if !valid_header_value(&value) {
+            notes.push(format!("{name} 的值含有非法字符,已忽略"));
+            continue;
+        }
+        map.insert(name.to_string(), value);
+    }
+    (map, notes)
+}
+
 fn valid_header_name(name: &str) -> bool {
     !name.is_empty()
         && name.bytes().all(|b| {
@@ -505,7 +536,9 @@ fn apply_headers(
             continue;
         }
         if RESERVED_HEADERS.iter().any(|r| r.eq_ignore_ascii_case(k)) {
-            notes.push(format!("预设请求头 {k} 是保留头(改了会破坏请求本身),已忽略"));
+            notes.push(format!(
+                "预设请求头 {k} 是保留头(改了会破坏请求本身),已忽略"
+            ));
             continue;
         }
         if !valid_header_name(k) {
@@ -833,7 +866,6 @@ impl Config {
         map.sort_by_cached_key(|(name, _)| name.to_ascii_lowercase());
         (EffectiveHeaders::from_pairs(map), notes)
     }
-
 }
 
 impl Resolved {
@@ -865,9 +897,7 @@ impl Config {
         let mut out: Vec<(String, String, String)> = providers
             .into_iter()
             .map(|(name, def)| {
-                let base = def
-                    .base_url
-                    .unwrap_or_else(|| "?".into());
+                let base = def.base_url.unwrap_or_else(|| "?".into());
                 let model = def.model.unwrap_or_else(|| "(未设模型)".into());
                 (name, base, model)
             })
@@ -943,6 +973,63 @@ impl Config {
             Some(name.to_string())
         };
         self.persist()
+    }
+
+    /// 保存运行期选项(轮数/重试/代理/预设请求头),供 GUI 设置页用。
+    ///
+    /// 与 `save()` 同一套校验口径:保留头/非法头被丢弃并**返回提示**,不会静默写坏;
+    /// 手动代理必须给 http(s) 地址。返回的提示由前端展示。
+    pub fn save_runtime_settings(
+        &mut self,
+        max_turns: Option<usize>,
+        retry: Option<usize>,
+        proxy: ProxyConfig,
+        extra_headers_enabled: bool,
+        extra_headers: Vec<(String, String)>,
+    ) -> anyhow::Result<Vec<String>> {
+        if proxy.mode == ProxyMode::Manual {
+            let url = proxy.url.as_deref().unwrap_or("").trim();
+            if url.is_empty() {
+                anyhow::bail!("手动代理要填地址(如 http://127.0.0.1:7897)");
+            }
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                anyhow::bail!("代理地址要以 http:// 或 https:// 开头:{url}");
+            }
+        }
+        self.ensure_build_tag();
+        self.max_turns = max_turns;
+        self.retry = retry.filter(|n| *n > 0).map(|n| n.min(MAX_RETRY));
+        self.proxy = ProxyConfig {
+            warning: None,
+            ..proxy
+        };
+        self.extra_headers_enabled = if extra_headers_enabled {
+            None
+        } else {
+            Some(false)
+        };
+
+        let (map, notes) = validate_extra_headers(extra_headers);
+        self.extra_headers = map;
+        self.persist()?;
+        Ok(notes)
+    }
+
+    /// 保存**当前服务商条目**的额外请求头(叠加在顶层表之上;值留空 = 删除继承项)。
+    /// 返回被忽略的头提示(与顶层同一套校验)。
+    pub fn save_provider_headers(
+        &mut self,
+        provider: &str,
+        enabled: Option<bool>,
+        headers: Vec<(String, String)>,
+    ) -> anyhow::Result<Vec<String>> {
+        let (map, notes) = validate_extra_headers(headers);
+        self.ensure_build_tag();
+        let entry = self.providers.entry(provider.to_string()).or_default();
+        entry.extra_headers_enabled = enabled;
+        entry.extra_headers = map;
+        self.persist()?;
+        Ok(notes)
     }
 
     /// 落盘(整份序列化写入)
@@ -1046,9 +1133,11 @@ pub fn env_configured() -> bool {
         "ZNAIDE_API_KEY",
         "OPENAI_API_KEY",
     ];
-    names
-        .iter()
-        .any(|n| std::env::var(n).map(|v| !v.trim().is_empty()).unwrap_or(false))
+    names.iter().any(|n| {
+        std::env::var(n)
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+    })
 }
 
 /// 建数据目录(memories/skills/sessions),不生成任何配置文件;
@@ -1107,7 +1196,10 @@ mod tests {
         let r = cfg
             .resolve(None, None, None, Some("dashscope".into()))
             .unwrap();
-        assert_eq!(r.base_url, "https://dashscope.aliyuncs.com/compatible-mode/v1");
+        assert_eq!(
+            r.base_url,
+            "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        );
         assert_eq!(r.model, "qwen-plus");
         // api_key 从 env 读不到时应为 None(不报错)
     }
@@ -1157,7 +1249,7 @@ mod tests {
         cfg.context_window = None;
         let r = cfg.resolve(None, None, None, None).unwrap();
         assert_eq!(r.effective_context_window(), Some(40960)); // ollama qwen3:8b
-        // 云端/闭源家族
+                                                               // 云端/闭源家族
         assert_eq!(model_context_window("qwen-plus"), Some(1_000_000));
         assert_eq!(model_context_window("claude-sonnet-4-5"), Some(200_000));
         assert_eq!(model_context_window("gpt-5"), Some(400_000));
@@ -1174,13 +1266,20 @@ mod tests {
     #[test]
     fn unknown_model_window_is_none_not_guess() {
         assert_eq!(model_context_window("my-custom-model"), None);
-        assert_eq!(model_context_window("deepseek-flash-v9-unknown"), Some(1_048_576)); // 命中别名
+        assert_eq!(
+            model_context_window("deepseek-flash-v9-unknown"),
+            Some(1_048_576)
+        ); // 命中别名
         let cfg = Config {
             model: Some("my-custom-model".into()),
             ..Default::default()
         };
         let r = cfg.resolve(None, None, None, None).unwrap();
-        assert_eq!(r.effective_context_window(), None, "查不到 = 未知,交给调用方只说绝对量");
+        assert_eq!(
+            r.effective_context_window(),
+            None,
+            "查不到 = 未知,交给调用方只说绝对量"
+        );
         // 面板/配置里写死就照写死(0 无效,当没填)
         let cfg2 = Config {
             model: Some("my-custom-model".into()),
@@ -1292,7 +1391,11 @@ mod tests {
         };
         let all = cfg.all_providers();
         let d = all.get("deepseek").expect("内置 deepseek 应在");
-        assert_eq!(d.base_url.as_deref(), Some("https://mirror.example.com/v1"), "用户写的覆盖");
+        assert_eq!(
+            d.base_url.as_deref(),
+            Some("https://mirror.example.com/v1"),
+            "用户写的覆盖"
+        );
         assert!(d.model.is_some(), "没写的 model 应保留内置值");
         assert!(d.api_key_env.is_some(), "没写的 api_key_env 应保留内置值");
         // 用户自定义的新 provider 照常加入
@@ -1330,14 +1433,18 @@ mod tests {
             context_window: Some(9_999_999), // 历史遗留的全局值:不该盖过 provider 自己的
             ..Default::default()
         };
-        let r = cfg.resolve(None, None, None, Some("ollama".into())).unwrap();
+        let r = cfg
+            .resolve(None, None, None, Some("ollama".into()))
+            .unwrap();
         assert_eq!(r.effective_context_window(), Some(40_960));
         // 没配 provider 窗口时,退回顶层,再退回模型表
         let cfg2 = Config {
             context_window: Some(65_536),
             ..Default::default()
         };
-        let r2 = cfg2.resolve(None, None, None, Some("ollama".into())).unwrap();
+        let r2 = cfg2
+            .resolve(None, None, None, Some("ollama".into()))
+            .unwrap();
         assert_eq!(r2.effective_context_window(), Some(65_536));
     }
 
@@ -1369,17 +1476,25 @@ mod tests {
         assert_eq!(d.model.as_deref(), Some("deepseek-chat"));
         assert_eq!(d.base_url.as_deref(), Some("https://api.deepseek.com/v1"));
         assert_eq!(d.api_key.as_deref(), Some("sk-1"));
-        assert_eq!(d.context_window, Some(131_072), "窗口也写进条目(多服务商各配各的)");
+        assert_eq!(
+            d.context_window,
+            Some(131_072),
+            "窗口也写进条目(多服务商各配各的)"
+        );
 
         // 落盘后再读,值仍在条目里 → 切 provider 时不会被顶层遮蔽
         let back = Config::load().unwrap();
         assert!(back.model.is_none() && back.base_url.is_none());
         assert_eq!(
-            back.all_providers().get("deepseek").and_then(|d| d.model.clone()),
+            back.all_providers()
+                .get("deepseek")
+                .and_then(|d| d.model.clone()),
             Some("deepseek-chat".to_string())
         );
         assert_eq!(
-            back.all_providers().get("deepseek").and_then(|d| d.context_window),
+            back.all_providers()
+                .get("deepseek")
+                .and_then(|d| d.context_window),
             Some(131_072)
         );
 
@@ -1393,9 +1508,16 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(cfg.providers.get("deepseek").and_then(|d| d.context_window), None);
         assert_eq!(
-            Config::load().unwrap().providers.get("deepseek").and_then(|d| d.context_window),
+            cfg.providers.get("deepseek").and_then(|d| d.context_window),
+            None
+        );
+        assert_eq!(
+            Config::load()
+                .unwrap()
+                .providers
+                .get("deepseek")
+                .and_then(|d| d.context_window),
             None
         );
 
@@ -1431,7 +1553,11 @@ mod tests {
         assert!(after.model.is_none() && after.base_url.is_none() && after.api_key.is_none());
         assert!(after.context_window.is_none(), "顶层窗口也该搬走");
         let d = after.providers.get("deepseek").unwrap();
-        assert_eq!(d.model.as_deref(), Some("deepseek-flash"), "顶层值生效过 → 覆盖条目");
+        assert_eq!(
+            d.model.as_deref(),
+            Some("deepseek-flash"),
+            "顶层值生效过 → 覆盖条目"
+        );
         assert_eq!(d.base_url.as_deref(), Some("https://api.deepseek.com/v1"));
         assert_eq!(d.context_window, Some(65_536));
         assert_eq!(
@@ -1450,7 +1576,9 @@ mod tests {
             eff_after.effective_context_window()
         );
         // 另一个 provider 不受影响,切过去仍好使(这正是本次修复的目的)
-        let other = after.resolve(None, None, None, Some("ollama".into())).unwrap();
+        let other = after
+            .resolve(None, None, None, Some("ollama".into()))
+            .unwrap();
         assert_eq!(other.model, "qwen3:8b");
         assert_eq!(other.base_url, "http://127.0.0.1:11434/v1");
 
@@ -1463,11 +1591,21 @@ mod tests {
         }"#;
         let mut b: Config = serde_json::from_str(raw_b).unwrap();
         let eff_b = b.resolve(None, None, None, None).unwrap();
-        assert_eq!(eff_b.api_key.as_deref(), Some("sk-top"), "顶层覆盖预设(三个字段口径一致)");
-        b.absorb_top_level_into_provider();
-        assert_eq!(b.providers.get("ollama").unwrap().api_key.as_deref(), Some("sk-top"));
         assert_eq!(
-            b.resolve(None, None, None, None).unwrap().api_key.as_deref(),
+            eff_b.api_key.as_deref(),
+            Some("sk-top"),
+            "顶层覆盖预设(三个字段口径一致)"
+        );
+        b.absorb_top_level_into_provider();
+        assert_eq!(
+            b.providers.get("ollama").unwrap().api_key.as_deref(),
+            Some("sk-top")
+        );
+        assert_eq!(
+            b.resolve(None, None, None, None)
+                .unwrap()
+                .api_key
+                .as_deref(),
             Some("sk-top"),
             "搬完生效 key 不变"
         );
@@ -1748,7 +1886,9 @@ mod tests {
     }
 
     fn hpairs(h: &EffectiveHeaders) -> Vec<(String, String)> {
-        h.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        h.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     /// 没配的人:一条头都不发,config.json 里也不该多出这两个键(零行为变化)
@@ -1763,7 +1903,10 @@ mod tests {
         assert!(notes.is_empty(), "{notes:?}");
 
         let text = serde_json::to_string(&cfg).unwrap();
-        assert!(!text.contains("extra_headers"), "默认配置不该写这两键:{text}");
+        assert!(
+            !text.contains("extra_headers"),
+            "默认配置不该写这两键:{text}"
+        );
     }
 
     /// 优先级:CLI > ZNAIDE_EXTRA_HEADERS > 配置文件(provider 表叠在顶层表之上)
@@ -1833,7 +1976,9 @@ mod tests {
         // ⑤ ZNAIDE_NO_EXTRA_HEADERS 同理:清配置层,但命令行还能再加
         std::env::remove_var("ZNAIDE_EXTRA_HEADERS");
         std::env::set_var("ZNAIDE_NO_EXTRA_HEADERS", "1");
-        let cleared = cfg.resolve_headers("openrouter", &HeaderOverride::default()).0;
+        let cleared = cfg
+            .resolve_headers("openrouter", &HeaderOverride::default())
+            .0;
         assert!(cleared.is_empty());
         let (h, _) = cfg.resolve_headers(
             "openrouter",
@@ -1846,7 +1991,9 @@ mod tests {
 
         // 开关写 0/false 视为"没开"
         std::env::set_var("ZNAIDE_NO_EXTRA_HEADERS", "0");
-        let back = cfg.resolve_headers("openrouter", &HeaderOverride::default()).0;
+        let back = cfg
+            .resolve_headers("openrouter", &HeaderOverride::default())
+            .0;
         assert!(!back.is_empty());
 
         clear_header_env();
@@ -1889,7 +2036,10 @@ mod tests {
         // 顶层总闸关掉:provider 自己那张表也不看(不是"provider 能拧开")
         cfg.providers.get_mut("g").unwrap().extra_headers_enabled = None;
         cfg.extra_headers_enabled = Some(false);
-        assert!(cfg.resolve_headers("g", &HeaderOverride::default()).0.is_empty());
+        assert!(cfg
+            .resolve_headers("g", &HeaderOverride::default())
+            .0
+            .is_empty());
         assert!(cfg
             .resolve_headers("other", &HeaderOverride::default())
             .0
@@ -1947,7 +2097,11 @@ mod tests {
         };
         assert_eq!(get("X-Tenant-Id"), "t-42");
         assert_eq!(get("X-Also"), "t-42");
-        assert_eq!(get("X-Missing"), "${ZNAIDE_TEST_NOPE}", "读不到就原样发,别静默丢");
+        assert_eq!(
+            get("X-Missing"),
+            "${ZNAIDE_TEST_NOPE}",
+            "读不到就原样发,别静默丢"
+        );
         assert_eq!(get("X-Literal"), "价格 $ 5");
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(notes[0].contains("ZNAIDE_TEST_NOPE"));

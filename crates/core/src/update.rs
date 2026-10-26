@@ -54,55 +54,77 @@ impl UpdateSource {
         }
     }
 
-    /// 探测该源的最新发布版本(不带 v 前缀,如 "1.1.0")
+    /// 探测该源的最新发布版本(不带 v 前缀,如 "1.1.0")。
+    ///
+    /// 走"按 tag 前缀扫发布列表"而不是 `/releases/latest`:同一仓库有两条发布线
+    /// (TUI `v*` 与桌面版 `gui-v*`),`latest` 只认最新建的那个 —— 桌面版一发就会
+    /// 把 TUI 的探测顶掉(`gui-v0.0.1` 解析不出数字)。按前缀过滤两头都不受影响。
     pub async fn check_latest(self, client: &reqwest::Client) -> anyhow::Result<String> {
-        match self {
-            UpdateSource::GitHub => {
-                let url = format!("https://github.com/{}/releases/latest", self.repo());
-                let resp = client.head(&url).send().await?;
-                if !resp.status().is_success() {
-                    anyhow::bail!("HTTP {}", resp.status());
-                }
-                let path = resp.url().path().to_string();
-                // 形如 /twowb/znaide/releases/tag/v1.2.3(旧格式 /releases/v1.2.3)
-                let tag = path
-                    .rsplit('/')
-                    .find(|seg| !seg.is_empty())
-                    .ok_or_else(|| anyhow::anyhow!("无法解析重定向地址: {path}"))?;
-                parse_version_from_tag(tag)
-            }
-            UpdateSource::Gitee => {
-                // API v5 releases/latest:公开仓库匿名可读,一次拿最新 tag
-                let url = format!(
-                    "https://gitee.com/api/v5/repos/{}/releases/latest",
-                    self.repo()
-                );
-                let resp = client.get(&url).send().await?;
-                if !resp.status().is_success() {
-                    anyhow::bail!("HTTP {} ({url})", resp.status());
-                }
-                let text = resp.text().await?;
-                let v: serde_json::Value = serde_json::from_str(&text)
-                    .map_err(|e| anyhow::anyhow!("Gitee 返回解析失败: {e}"))?;
-                let tag = v
-                    .get("tag_name")
-                    .and_then(|t| t.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Gitee 响应缺少 tag_name"))?;
-                parse_version_from_tag(tag)
-            }
+        self.check_latest_prefixed(client, "v").await
+    }
+
+    /// 只认指定 tag 前缀的最新版(GUI 用 `gui-v`,避免和 TUI 的 v1.x 混淆)
+    async fn check_latest_prefixed(
+        self,
+        client: &reqwest::Client,
+        tag_prefix: &str,
+    ) -> anyhow::Result<String> {
+        let url = match self {
+            UpdateSource::GitHub => format!(
+                "https://api.github.com/repos/{}/releases?per_page=30",
+                self.repo()
+            ),
+            UpdateSource::Gitee => format!(
+                "https://gitee.com/api/v5/repos/{}/releases?per_page=30&page=1",
+                self.repo()
+            ),
+        };
+        let resp = client
+            .get(&url)
+            .header("User-Agent", "znaide-updater")
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("HTTP {} ({url})", resp.status());
+        }
+        let text = resp.text().await?;
+        let arr: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("发布列表解析失败: {e}"))?;
+        let arr = arr
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("发布列表不是数组"))?;
+        match first_prefixed_tag(arr, tag_prefix) {
+            Some(tag) => parse_version_from_tag(tag),
+            None => anyhow::bail!("没有 {tag_prefix}* 的发布"),
         }
     }
 
-    /// 该源指定版本的资产直链(两端 URL 形态一致)
-    fn download_url(self, version: &str) -> anyhow::Result<String> {
-        let fname = release_asset_name(version)
+    /// 该源指定版本的资产直链(两端 URL 形态一致)。`prefix` 区分 TUI/GUI 资产。
+    fn download_url(
+        self,
+        prefix: &str,
+        tag_prefix: Option<&str>,
+        version: &str,
+    ) -> anyhow::Result<String> {
+        let fname = release_asset_name_for(prefix, version)
             .ok_or_else(|| anyhow::anyhow!("当前平台没有发布产物,无法自动更新"))?;
+        let tag = match tag_prefix {
+            Some(p) => format!("{p}{version}"),
+            None => format!("v{version}"),
+        };
         Ok(format!(
-            "https://{}/{}/releases/download/v{version}/{fname}",
+            "https://{}/{}/releases/download/{tag}/{fname}",
             self.download_host(),
             self.repo()
         ))
     }
+}
+
+/// 发布列表(按建仓时间倒序)里第一条 tag 以 `prefix` 开头的。
+fn first_prefixed_tag<'a>(arr: &'a [serde_json::Value], prefix: &str) -> Option<&'a str> {
+    arr.iter()
+        .filter_map(|rel| rel.get("tag_name").and_then(|t| t.as_str()))
+        .find(|tag| tag.starts_with(prefix))
 }
 
 /// 从 tag 段(v1.2.3 / 1.2.3)解析出版本号
@@ -123,24 +145,33 @@ pub fn current_version() -> String {
 /// 命名规范(与 Makefile 产物一致):平台段 linux-x64 / linux-arm64 /
 /// windows-x64 / macos-x64 / macos-arm64 / android-arm64,Windows 的
 /// .exe 在版本号**之后**(znaide-windows-x64-v1.0.1.exe)。
-pub fn release_asset_name(version: &str) -> Option<String> {
+pub const DEFAULT_ASSET_PREFIX: &str = "znaide";
+
+/// 按资产前缀拼当前平台的文件名。TUI 用 `znaide`,GUI 用 `znaide-gui`
+/// (两套客户端同期发布,更新时各拿各的资产)。
+pub fn release_asset_name_for(prefix: &str, version: &str) -> Option<String> {
     // 用 cfg! 而不是 #[cfg] 块:后者在当前 target 上会让前面的块提前 return,
     // 末尾的 None 被判"不可达"报警告(但它在未覆盖的架构上其实是要走的分支)。
     if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        Some(format!("znaide-linux-x64-v{version}"))
+        Some(format!("{prefix}-linux-x64-v{version}"))
     } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
-        Some(format!("znaide-linux-arm64-v{version}"))
+        Some(format!("{prefix}-linux-arm64-v{version}"))
     } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
-        Some(format!("znaide-windows-x64-v{version}.exe"))
+        Some(format!("{prefix}-windows-x64-v{version}.exe"))
     } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        Some(format!("znaide-macos-x64-v{version}"))
+        Some(format!("{prefix}-macos-x64-v{version}"))
     } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        Some(format!("znaide-macos-arm64-v{version}"))
+        Some(format!("{prefix}-macos-arm64-v{version}"))
     } else if cfg!(all(target_os = "android", target_arch = "aarch64")) {
-        Some(format!("znaide-android-arm64-v{version}"))
+        Some(format!("{prefix}-android-arm64-v{version}"))
     } else {
         None
     }
+}
+
+/// TUI 的资产名(向后兼容入口)。
+pub fn release_asset_name(version: &str) -> Option<String> {
+    release_asset_name_for(DEFAULT_ASSET_PREFIX, version)
 }
 
 /// 语义化版本 vX.Y.Z 比较:a > b?
@@ -176,9 +207,22 @@ pub fn http_client(proxy: &EffectiveProxy) -> anyhow::Result<reqwest::Client> {
 
 /// 依次探测各源,返回**第一个连通源**的最新版本。
 /// 全部失败才 Err(TUI 启动静默检查与展示层用)。
-pub async fn probe_latest(
+/// 按 tag 前缀探测最新版(GUI 用 `gui-v`)
+pub async fn probe_latest_prefixed(
     client: &reqwest::Client,
+    tag_prefix: &str,
 ) -> anyhow::Result<(UpdateSource, String)> {
+    let mut errs: Vec<String> = Vec::new();
+    for &src in UPDATE_SOURCES {
+        match src.check_latest_prefixed(client, tag_prefix).await {
+            Ok(v) => return Ok((src, v)),
+            Err(e) => errs.push(format!("{}: {e:#}", src.label())),
+        }
+    }
+    anyhow::bail!("所有更新源均不可达({})", errs.join("; "))
+}
+
+pub async fn probe_latest(client: &reqwest::Client) -> anyhow::Result<(UpdateSource, String)> {
     let mut errs: Vec<String> = Vec::new();
     for &src in UPDATE_SOURCES {
         match src.check_latest(client).await {
@@ -193,9 +237,11 @@ pub async fn probe_latest(
 pub async fn download_from(
     client: &reqwest::Client,
     src: UpdateSource,
+    prefix: &str,
+    tag_prefix: Option<&str>,
     version: &str,
 ) -> anyhow::Result<PathBuf> {
-    let url = src.download_url(version)?;
+    let url = src.download_url(prefix, tag_prefix, version)?;
     let resp = client.get(&url).send().await?;
     if !resp.status().is_success() {
         anyhow::bail!("下载失败: HTTP {} ({url})", resp.status());
@@ -205,7 +251,9 @@ pub async fn download_from(
         anyhow::bail!("下载产物过小({} 字节),疑似错误响应", bytes.len());
     }
     let exe = std::env::current_exe()?;
-    let dir = exe.parent().ok_or_else(|| anyhow::anyhow!("无法定位程序目录"))?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("无法定位程序目录"))?;
     let tmp = dir.join(format!(".znaide-update-{version}.tmp{}", exe_extra()));
     std::fs::write(&tmp, &bytes)?;
     make_executable(&tmp)?;
@@ -257,7 +305,9 @@ pub fn install_update(downloaded: &Path) -> anyhow::Result<InstallOutcome> {
     }
     #[cfg(windows)]
     {
-        let dir = exe.parent().ok_or_else(|| anyhow::anyhow!("无法定位程序目录"))?;
+        let dir = exe
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("无法定位程序目录"))?;
         let exe_name = exe
             .file_name()
             .and_then(|s| s.to_str())
@@ -280,9 +330,11 @@ pub fn install_update(downloaded: &Path) -> anyhow::Result<InstallOutcome> {
         );
         std::fs::write(&bat, script)?;
         // 脱离父进程执行(start /b),父进程(本程序)退出后批处理继续等锁释放
-        let _ = std::process::Command::new("cmd")
-            .args(["/c", "start", "", "/b", bat.to_str().unwrap_or_default()])
-            .spawn()?;
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/c", "start", "", "/b", bat.to_str().unwrap_or_default()]);
+        // GUI(无控制台)更新时别闪黑框
+        crate::winproc::hide_console_window(&mut cmd);
+        let _ = cmd.spawn()?;
         Ok(InstallOutcome::Deferred)
     }
 }
@@ -336,7 +388,32 @@ impl UpdateResult {
 /// - 全部源探测失败 → CheckFailed,按源列出原因(GitHub 失败附 HTTPS_PROXY 提示)。
 /// 不发网络请求的前提错误(代理构造失败)也并入 CheckFailed。
 pub async fn perform_update(proxy: &EffectiveProxy) -> UpdateResult {
+    perform_update_inner("znaide", None, &current_version(), proxy).await
+}
+
+/// GUI 用:资产前缀 + tag 前缀 + 自己的当前版本
+pub async fn perform_update_prefixed(
+    asset_prefix: &str,
+    tag_prefix: &str,
+    current: &str,
+    proxy: &EffectiveProxy,
+) -> UpdateResult {
+    perform_update_inner(asset_prefix, Some(tag_prefix), current, proxy).await
+}
+
+/// 指定资产前缀的完整更新(TUI 用 `znaide`,GUI 用 `znaide-gui`)。
+pub async fn perform_update_for(prefix: &str, proxy: &EffectiveProxy) -> UpdateResult {
     let cur = current_version();
+    perform_update_inner(prefix, None, &cur, proxy).await
+}
+
+async fn perform_update_inner(
+    prefix: &str,
+    tag_prefix: Option<&str>,
+    cur: &str,
+    proxy: &EffectiveProxy,
+) -> UpdateResult {
+    let cur = cur.to_string();
     let client = match http_client(proxy) {
         Ok(c) => c,
         Err(e) => return UpdateResult::CheckFailed(format!("客户端构造失败: {e:#}")),
@@ -345,7 +422,10 @@ pub async fn perform_update(proxy: &EffectiveProxy) -> UpdateResult {
     // 各源探测失败记录(全败时汇总给用户)
     let mut check_errs: Vec<String> = Vec::new();
     for &src in UPDATE_SOURCES {
-        let latest = match src.check_latest(&client).await {
+        let latest = match match tag_prefix {
+            Some(t) => src.check_latest_prefixed(&client, t).await,
+            None => src.check_latest(&client).await,
+        } {
             Ok(v) => v,
             Err(e) => {
                 check_errs.push(format!("{}: {e:#}", src.label()));
@@ -362,7 +442,7 @@ pub async fn perform_update(proxy: &EffectiveProxy) -> UpdateResult {
         dl_order.push(src);
         dl_order.extend(UPDATE_SOURCES.iter().copied().filter(|&s| s != src));
         for s2 in dl_order {
-            match download_from(&client, s2, &latest).await {
+            match download_from(&client, s2, prefix, tag_prefix, &latest).await {
                 Ok(tmp) => {
                     if let Err(e) = verify_download(&tmp, &latest) {
                         let _ = std::fs::remove_file(&tmp);
@@ -398,7 +478,10 @@ pub async fn perform_update(proxy: &EffectiveProxy) -> UpdateResult {
         .any(|e| e.starts_with("GitHub:"))
         .then(|| "\n提示:更新源含 GitHub,网络不通时可设置 HTTPS_PROXY 环境变量")
         .unwrap_or("");
-    UpdateResult::CheckFailed(format!("检查更新失败:\n{}{github_hint}", check_errs.join("\n")))
+    UpdateResult::CheckFailed(format!(
+        "检查更新失败:\n{}{github_hint}",
+        check_errs.join("\n")
+    ))
 }
 
 /// 自检下载产物:运行 `--version`,输出应包含目标版本
@@ -470,12 +553,41 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn gui_asset_prefix_is_distinct() {
+        let tui = release_asset_name("9.9.9").unwrap();
+        let gui = release_asset_name_for("znaide-gui", "9.9.9").unwrap();
+        assert!(gui.starts_with("znaide-gui-"), "{gui}");
+        assert!(
+            gui.ends_with("-v9.9.9") || gui.ends_with("-v9.9.9.exe"),
+            "{gui}"
+        );
+        assert_ne!(tui, gui);
+    }
+
+    #[test]
+    fn prefixed_tag_skips_the_other_product_line() {
+        // 桌面版比 TUI 新:按 "v" 过滤必须跳过 gui-v0.0.1
+        let arr: Vec<serde_json::Value> = ["gui-v0.0.1", "v1.1.0", "v1.0.9"]
+            .iter()
+            .map(|t| serde_json::json!({"tag_name": t}))
+            .collect();
+        assert_eq!(first_prefixed_tag(&arr, "v"), Some("v1.1.0"));
+        assert_eq!(first_prefixed_tag(&arr, "gui-v"), Some("gui-v0.0.1"));
+        assert_eq!(first_prefixed_tag(&arr, "gui-"), Some("gui-v0.0.1"));
+    }
+
+    #[test]
     fn download_url_matches_both_hosts() {
         // GitHub 与 Gitee 资产 URL 同构(实测 Gitee browser_download_url 即此形态),
         // 平台段与 .exe 位置决定成败(线上踩过 404 的坑)
-        let gh = UpdateSource::GitHub.download_url("1.0.2").unwrap();
+        let gh = UpdateSource::GitHub
+            .download_url("znaide", None, "1.0.2")
+            .unwrap();
         assert!(gh.starts_with("https://github.com/twowb/znaide/releases/download/v1.0.2/"));
-        let gi = UpdateSource::Gitee.download_url("1.0.2").unwrap();
+        let gi = UpdateSource::Gitee
+            .download_url("znaide", None, "1.0.2")
+            .unwrap();
         assert!(gi.starts_with("https://gitee.com/brother-ershui/znaide/releases/download/v1.0.2/"));
         // 资产名片段一致(两端发布同名资产)
         let fname = release_asset_name("1.0.2").unwrap();

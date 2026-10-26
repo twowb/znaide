@@ -30,7 +30,14 @@ pub enum AgentCmd {
     /// 运行时重配置(切换 provider/模型/端点/key,立即生效)
     Reconfigure(Resolved),
     /// 手动触发技能:/技能名 [参数](可能含入口脚本,由 agent 侧统一执行)
-    RunSkill { name: String, args: String },
+    RunSkill {
+        name: String,
+        args: String,
+    },
+    /// 切换工作目录(后续回合生效)
+    SetCwd(PathBuf),
+    /// 新建会话(换身份、清空消息;保留模型/人格/模式)
+    NewSession,
     /// 清空会话上下文与历史文件(经确认后发送)
     ClearContext,
     /// 压缩上下文(旧消息 → 摘要,腾出上下文空间)
@@ -101,10 +108,9 @@ impl AgentHandle {
     pub fn answer_permission(&self, allow: bool, always: bool) -> bool {
         let mut slot = self.pending.lock().unwrap();
         match slot.take() {
-            Some(Pending::Permission { tx, allow_always }) => {
-                tx.send(crate::ask::resolve_permission(allow, always, allow_always))
-                    .is_ok()
-            }
+            Some(Pending::Permission { tx, allow_always }) => tx
+                .send(crate::ask::resolve_permission(allow, always, allow_always))
+                .is_ok(),
             other => {
                 // 不是权限询问:原样放回,别把别人的 oneshot 吞掉
                 *slot = other;
@@ -252,6 +258,16 @@ pub fn spawn(cfg: AgentConfig, events: UnboundedSender<HostEvent>) -> Result<Age
                             Err(e) => {
                                 session.notify(format!("恢复历史失败: {e}"));
                             }
+                        }
+                    }
+                    Some(AgentCmd::SetCwd(cwd)) => {
+                        if let Err(e) = session.set_cwd(cwd) {
+                            session.notify(format!("切换目录失败: {e}"));
+                        }
+                    }
+                    Some(AgentCmd::NewSession) => {
+                        if let Err(e) = session.start_new() {
+                            session.notify(format!("新建会话失败: {e}"));
                         }
                     }
                     Some(AgentCmd::ClearContext) => {

@@ -31,7 +31,12 @@ pub struct EndpointStatus {
 
 impl std::fmt::Display for EndpointStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "模型端点返回 {}: {}", self.status, truncate(&self.body, 500))
+        write!(
+            f,
+            "模型端点返回 {}: {}",
+            self.status,
+            truncate(&self.body, 500)
+        )
     }
 }
 
@@ -77,7 +82,11 @@ pub enum StreamEvent {
 /// 从响应 JSON 顶层提取 usage(容错:缺字段/非数值一律归 0)
 fn extract_usage(parsed: &serde_json::Value) -> Usage {
     let u = parsed.get("usage");
-    let n = |k: &str| u.and_then(|v| v.get(k)).and_then(|v| v.as_u64()).unwrap_or(0);
+    let n = |k: &str| {
+        u.and_then(|v| v.get(k))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    };
     Usage {
         prompt_tokens: n("prompt_tokens"),
         completion_tokens: n("completion_tokens"),
@@ -299,7 +308,10 @@ impl OpenAiClient {
 
     /// 查该端点可用模型列表(GET /models,配置向导里自动补全模型名用)
     pub async fn list_models(&self) -> anyhow::Result<Vec<String>> {
-        let resp = self.prepare(self.http.get(self.models_url())).send().await?;
+        let resp = self
+            .prepare(self.http.get(self.models_url()))
+            .send()
+            .await?;
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
@@ -374,7 +386,11 @@ impl OpenAiClient {
         tools: Option<&[ToolDef]>,
     ) -> anyhow::Result<AssistantReply> {
         let body = self.build_body(messages, tools, false)?;
-        let resp = self.prepare(self.http.post(self.url())).json(&body).send().await?;
+        let resp = self
+            .prepare(self.http.post(self.url()))
+            .json(&body)
+            .send()
+            .await?;
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
@@ -417,21 +433,43 @@ impl OpenAiClient {
         'stream: while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             for line in sse.push(&chunk) {
-                if apply_stream_line(&line, &mut content, &mut reasoning, &mut usage, &mut acc, &mut on_event)? {
+                if apply_stream_line(
+                    &line,
+                    &mut content,
+                    &mut reasoning,
+                    &mut usage,
+                    &mut acc,
+                    &mut on_event,
+                )? {
                     break 'stream; // [DONE]
                 }
             }
         }
         // 流结束:冲刷残余(个别服务端不补最后的空行)
         for line in sse.finish() {
-            if apply_stream_line(&line, &mut content, &mut reasoning, &mut usage, &mut acc, &mut on_event)? {
+            if apply_stream_line(
+                &line,
+                &mut content,
+                &mut reasoning,
+                &mut usage,
+                &mut acc,
+                &mut on_event,
+            )? {
                 break;
             }
         }
 
         Ok(AssistantReply {
-            content: if content.is_empty() { None } else { Some(content) },
-            reasoning_content: if reasoning.is_empty() { None } else { Some(reasoning) },
+            content: if content.is_empty() {
+                None
+            } else {
+                Some(content)
+            },
+            reasoning_content: if reasoning.is_empty() {
+                None
+            } else {
+                Some(reasoning)
+            },
             tool_calls: acc.finish(),
             usage,
         })
@@ -517,7 +555,9 @@ impl SseParser {
     /// 事件以空行分隔;兼容 \n 与 \r\n。未闭合的部分留到下次。
     fn push(&mut self, chunk: &[u8]) -> Vec<String> {
         // 先把换行统一成 \n(兼容 \r\n / \r),跨 chunk 的 \r\n 也能被下次拼上
-        let text = String::from_utf8_lossy(chunk).replace("\r\n", "\n").replace('\r', "\n");
+        let text = String::from_utf8_lossy(chunk)
+            .replace("\r\n", "\n")
+            .replace('\r', "\n");
         self.buf.push_str(&text);
         let mut out = Vec::new();
         while let Some(pos) = self.buf.find("\n\n") {
@@ -672,7 +712,10 @@ mod tests {
         let calls = acc.finish();
         assert_eq!(calls.len(), 1);
         assert!(
-            calls[0].function.arguments.contains("\"command\":\"ls -la\""),
+            calls[0]
+                .function
+                .arguments
+                .contains("\"command\":\"ls -la\""),
             "got: {}",
             calls[0].function.arguments
         );
@@ -704,7 +747,10 @@ mod tests {
         let reply = parse_chat_response(text).unwrap();
         assert_eq!(reply.content.as_deref(), Some("好的,马上办"));
         assert_eq!(reply.tool_calls.len(), 1);
-        assert!(reply.tool_calls[0].function.arguments.contains("\"path\":\"a.txt\""));
+        assert!(reply.tool_calls[0]
+            .function
+            .arguments
+            .contains("\"path\":\"a.txt\""));
         assert_eq!(reply.tool_calls[0].id, "c1");
     }
 

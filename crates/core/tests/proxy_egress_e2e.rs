@@ -108,7 +108,10 @@ async fn manual_proxy_carries_the_model_request() {
 
     let (origin, _, origin_hits) = recorder().await;
     let (proxy, proxy_lines, proxy_hits) = recorder().await;
-    let cfg = resolved(&format!("{origin}/v1"), EffectiveProxy::Manual(proxy.clone()));
+    let cfg = resolved(
+        &format!("{origin}/v1"),
+        EffectiveProxy::Manual(proxy.clone()),
+    );
 
     let client = znaide_core::llm::OpenAiClient::new(&cfg).unwrap();
     let reply = client
@@ -120,7 +123,10 @@ async fn manual_proxy_carries_the_model_request() {
     assert_eq!(origin_hits.load(Ordering::SeqCst), 0, "不该直连端点");
     assert_eq!(proxy_hits.load(Ordering::SeqCst), 1, "应当经过代理");
     let first = proxy_lines.lock().unwrap()[0].clone();
-    assert!(first.starts_with("POST http://"), "代理收到的应是绝对 URI:{first}");
+    assert!(
+        first.starts_with("POST http://"),
+        "代理收到的应是绝对 URI:{first}"
+    );
     assert!(first.contains(&origin), "代理请求要指向端点:{first}");
 }
 
@@ -144,7 +150,11 @@ async fn direct_ignores_the_env_proxy() {
         .unwrap();
 
     assert_eq!(origin_hits.load(Ordering::SeqCst), 1, "直连才该命中端点");
-    assert_eq!(proxy_hits.load(Ordering::SeqCst), 0, "direct 档必须无视环境变量");
+    assert_eq!(
+        proxy_hits.load(Ordering::SeqCst),
+        0,
+        "direct 档必须无视环境变量"
+    );
 
     clear_proxy_env();
 }
@@ -167,7 +177,11 @@ async fn auto_follows_the_env_proxy() {
         .await
         .unwrap();
 
-    assert_eq!(proxy_hits.load(Ordering::SeqCst), 1, "auto 档要跟随环境变量");
+    assert_eq!(
+        proxy_hits.load(Ordering::SeqCst),
+        1,
+        "auto 档要跟随环境变量"
+    );
     assert_eq!(origin_hits.load(Ordering::SeqCst), 0);
 
     clear_proxy_env();
@@ -181,8 +195,9 @@ async fn web_fetch_uses_the_same_egress() {
 
     let (proxy, lines, _) = recorder().await;
     let eff = EffectiveProxy::Manual(proxy.clone());
-    let perm =
-        znaide_core::permissions::Permission::new(znaide_core::permissions::Mode::BypassPermissions);
+    let perm = znaide_core::permissions::Permission::new(
+        znaide_core::permissions::Mode::BypassPermissions,
+    );
     let ctx = znaide_core::tools::ToolContext {
         cwd: std::path::Path::new("/tmp"),
         permission: &perm,
@@ -215,8 +230,7 @@ async fn update_client_honours_the_proxy() {
     clear_proxy_env();
 
     let (proxy, _, hits) = recorder().await;
-    let client =
-        znaide_core::update::http_client(&EffectiveProxy::Manual(proxy.clone())).unwrap();
+    let client = znaide_core::update::http_client(&EffectiveProxy::Manual(proxy.clone())).unwrap();
     let r = client.get("http://127.0.0.1:1/dead").send().await;
     assert!(
         r.is_ok(),
@@ -237,8 +251,9 @@ async fn web_fetch_never_carries_extra_headers() {
 
     let (proxy, _lines, _hits, hdrs) = recorder_with_headers().await;
     let eff = EffectiveProxy::Manual(proxy.clone());
-    let perm =
-        znaide_core::permissions::Permission::new(znaide_core::permissions::Mode::BypassPermissions);
+    let perm = znaide_core::permissions::Permission::new(
+        znaide_core::permissions::Mode::BypassPermissions,
+    );
     let ctx = znaide_core::tools::ToolContext {
         cwd: std::path::Path::new("/tmp"),
         permission: &perm,

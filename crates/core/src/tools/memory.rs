@@ -103,8 +103,7 @@ pub async fn memory_write(ctx: &ToolContext<'_>, args: &Value) -> Result<ToolOut
     let a: WriteArgs = serde_json::from_value(args.clone())?;
     let scope = write_scope(&a.scope)?;
     let dir = dir_for(scope, ctx.cwd);
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| ToolError(format!("创建记忆目录失败: {e}")))?;
+    std::fs::create_dir_all(&dir).map_err(|e| ToolError(format!("创建记忆目录失败: {e}")))?;
 
     let filename = slugify(&a.name);
     let path = scoped_path(&dir, &filename)
@@ -124,8 +123,7 @@ pub async fn memory_write(ctx: &ToolContext<'_>, args: &Value) -> Result<ToolOut
         "---\nname: {}\ndescription: {}\ntype: {}\n---\n\n{}",
         a.name, description, mtype, a.content
     );
-    std::fs::write(&path, &body)
-        .map_err(|e| ToolError(format!("写入记忆失败: {e}")))?;
+    std::fs::write(&path, &body).map_err(|e| ToolError(format!("写入记忆失败: {e}")))?;
 
     // 更新该作用域自己的 MEMORY.md 索引(避免重复条目)
     update_index(&dir, &a.name, &description, &filename)?;
@@ -230,7 +228,11 @@ fn search_in(dir: &Path, query: &str) -> Vec<String> {
     let mut files: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
     files.sort();
     for f in files {
-        let fname = f.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let fname = f
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         if fname == "MEMORY.md" {
             continue;
         }
@@ -370,7 +372,11 @@ fn list_in(dir: &Path, source: Scope) -> Vec<MemoryEntry> {
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
             let p = e.path();
-            let fname = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let fname = p
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
             if !fname.ends_with(".md") || fname == "MEMORY.md" {
                 continue;
             }
@@ -415,8 +421,7 @@ pub fn delete_memory(filename: &str, scope: Scope, cwd: &Path) -> anyhow::Result
     if !path.exists() {
         return Ok(false);
     }
-    std::fs::remove_file(&path)
-        .map_err(|e| anyhow::anyhow!("删除记忆文件失败: {e}"))?;
+    std::fs::remove_file(&path).map_err(|e| anyhow::anyhow!("删除记忆文件失败: {e}"))?;
     // 同步清索引行(幂等:行不存在也照常写回)
     let index_path = dir.join("MEMORY.md");
     if index_path.exists() {
@@ -532,16 +537,28 @@ mod tests {
             .unwrap();
         assert!(out.contains("项目"), "{out}");
         assert!(project_dir(&cwd).join("接口约定.md").exists());
-        assert!(project_dir(&cwd).join("MEMORY.md").exists(), "项目级索引要建");
+        assert!(
+            project_dir(&cwd).join("MEMORY.md").exists(),
+            "项目级索引要建"
+        );
         // 两级索引各记各的
         let gidx = std::fs::read_to_string(global_dir().join("MEMORY.md")).unwrap();
-        assert!(gidx.contains("偏好") && !gidx.contains("接口约定"), "{gidx}");
+        assert!(
+            gidx.contains("偏好") && !gidx.contains("接口约定"),
+            "{gidx}"
+        );
         let pidx = std::fs::read_to_string(project_dir(&cwd).join("MEMORY.md")).unwrap();
-        assert!(pidx.contains("接口约定") && !pidx.contains("偏好"), "{pidx}");
+        assert!(
+            pidx.contains("接口约定") && !pidx.contains("偏好"),
+            "{pidx}"
+        );
 
         // 认不出的 scope:报错,不静默落一处
         let err = rt
-            .block_on(memory_write(&c, &json!({"name": "x", "content": "y", "scope": "weird"})))
+            .block_on(memory_write(
+                &c,
+                &json!({"name": "x", "content": "y", "scope": "weird"}),
+            ))
             .unwrap_err();
         assert!(err.0.contains("scope 只能是"), "{err:?}");
     }
@@ -552,26 +569,43 @@ mod tests {
         let (_g, cwd) = isolate("r");
         let perm = Permission::new(Mode::BypassPermissions);
         let c = ctx(&cwd, &perm);
-        write_mem(global_dir(), "常用命令", "---\nname: 常用命令\n---\n\n全局版");
-        write_mem(project_dir(&cwd), "常用命令", "---\nname: 常用命令\n---\n\n项目版");
+        write_mem(
+            global_dir(),
+            "常用命令",
+            "---\nname: 常用命令\n---\n\n全局版",
+        );
+        write_mem(
+            project_dir(&cwd),
+            "常用命令",
+            "---\nname: 常用命令\n---\n\n项目版",
+        );
         let rt = tokio::runtime::Runtime::new().unwrap();
 
         let both = rt
             .block_on(memory_read(&c, &json!({"name": "常用命令"})))
             .unwrap();
         assert!(both.contains("项目版") && both.contains("全局版"), "{both}");
-        assert!(both.contains("项目记忆") && both.contains("全局记忆"), "{both}");
+        assert!(
+            both.contains("项目记忆") && both.contains("全局记忆"),
+            "{both}"
+        );
         assert!(
             both.find("项目版").unwrap() < both.find("全局版").unwrap(),
             "项目在前:{both}"
         );
 
         let only_global = rt
-            .block_on(memory_read(&c, &json!({"name": "常用命令", "scope": "global"})))
+            .block_on(memory_read(
+                &c,
+                &json!({"name": "常用命令", "scope": "global"}),
+            ))
             .unwrap();
         assert!(only_global.contains("全局版"));
         assert!(!only_global.contains("项目版"));
-        assert!(!only_global.contains("###"), "只有一份时不加包装:{only_global}");
+        assert!(
+            !only_global.contains("###"),
+            "只有一份时不加包装:{only_global}"
+        );
 
         let err = rt
             .block_on(memory_read(&c, &json!({"name": "没有这条"})))
@@ -585,24 +619,41 @@ mod tests {
         let (_g, cwd) = isolate("s");
         let perm = Permission::new(Mode::BypassPermissions);
         let c = ctx(&cwd, &perm);
-        write_mem(global_dir(), "g", "---\nname: 构建\n---\n\n全局: cargo build");
-        write_mem(project_dir(&cwd), "p", "---\nname: 构建\n---\n\n项目: make build");
+        write_mem(
+            global_dir(),
+            "g",
+            "---\nname: 构建\n---\n\n全局: cargo build",
+        );
+        write_mem(
+            project_dir(&cwd),
+            "p",
+            "---\nname: 构建\n---\n\n项目: make build",
+        );
         let rt = tokio::runtime::Runtime::new().unwrap();
 
         let all = rt
             .block_on(memory_read(&c, &json!({"query": "build"})))
             .unwrap();
-        assert!(all.contains("## 项目记忆") && all.contains("## 全局记忆"), "{all}");
+        assert!(
+            all.contains("## 项目记忆") && all.contains("## 全局记忆"),
+            "{all}"
+        );
         assert!(all.starts_with("找到 2 条记忆"), "{all}");
 
         let only = rt
-            .block_on(memory_read(&c, &json!({"query": "build", "scope": "project"})))
+            .block_on(memory_read(
+                &c,
+                &json!({"query": "build", "scope": "project"}),
+            ))
             .unwrap();
         assert!(
             !only.contains("## 项目记忆") && !only.contains("## 全局记忆"),
             "只读一级不分组:{only}"
         );
-        assert!(only.contains("项目: make build") && !only.contains("cargo build"), "{only}");
+        assert!(
+            only.contains("项目: make build") && !only.contains("cargo build"),
+            "{only}"
+        );
 
         let none = rt
             .block_on(memory_read(&c, &json!({"query": "不存在的东西"})))
@@ -655,15 +706,31 @@ mod tests {
     #[test]
     fn delete_requires_scope_and_leaves_other_level_alone() {
         let (_g, cwd) = isolate("del");
-        write_mem(global_dir(), "keep", "---\nname: 保留\ntype: project\n---\nx");
-        write_mem(global_dir(), "same", "---\nname: 同名\ntype: user\n---\n全局");
-        write_mem(project_dir(&cwd), "same", "---\nname: 同名\ntype: user\n---\n项目");
+        write_mem(
+            global_dir(),
+            "keep",
+            "---\nname: 保留\ntype: project\n---\nx",
+        );
+        write_mem(
+            global_dir(),
+            "same",
+            "---\nname: 同名\ntype: user\n---\n全局",
+        );
+        write_mem(
+            project_dir(&cwd),
+            "same",
+            "---\nname: 同名\ntype: user\n---\n项目",
+        );
         std::fs::write(
             global_dir().join("MEMORY.md"),
             "- [保留](keep.md) — 1\n- [同名](same.md) — 2\n",
         )
         .unwrap();
-        std::fs::write(project_dir(&cwd).join("MEMORY.md"), "- [同名](same.md) — 2\n").unwrap();
+        std::fs::write(
+            project_dir(&cwd).join("MEMORY.md"),
+            "- [同名](same.md) — 2\n",
+        )
+        .unwrap();
 
         assert!(delete_memory("same", Scope::Project, &cwd).unwrap());
         assert!(!project_dir(&cwd).join("same.md").exists(), "项目那份应删");
@@ -677,7 +744,10 @@ mod tests {
         assert!(!global_dir().join("keep.md").exists());
         let gidx = std::fs::read_to_string(global_dir().join("MEMORY.md")).unwrap();
         assert!(!gidx.contains("keep") && gidx.contains("same"), "{gidx}");
-        assert!(!delete_memory("keep", Scope::Global, &cwd).unwrap(), "再删返回 false");
+        assert!(
+            !delete_memory("keep", Scope::Global, &cwd).unwrap(),
+            "再删返回 false"
+        );
 
         // 目录/文件不存在时列表为空、删除不崩
         let empty = std::env::temp_dir().join(format!("znaide_mem_none_{}", std::process::id()));

@@ -74,7 +74,11 @@ async fn endpoint(script: Vec<(u16, &'static str)>) -> (String, Arc<AtomicUsize>
     (format!("http://{addr}/v1"), hits)
 }
 
-async fn session_at(base_url: &str, events: bool, retry: usize) -> (Session, tokio::sync::mpsc::UnboundedReceiver<SessionEvent>) {
+async fn session_at(
+    base_url: &str,
+    events: bool,
+    retry: usize,
+) -> (Session, tokio::sync::mpsc::UnboundedReceiver<SessionEvent>) {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let cfg = Resolved {
         model: "m".into(),

@@ -34,7 +34,10 @@ pub fn env_proxy() -> Option<(&'static str, String)> {
 /// (socks5 需要给 reqwest 开 `socks` feature,暂时不支持;要加再说。)
 pub fn valid_proxy_url(url: &str) -> bool {
     let u = url.trim();
-    let rest = match u.strip_prefix("http://").or_else(|| u.strip_prefix("https://")) {
+    let rest = match u
+        .strip_prefix("http://")
+        .or_else(|| u.strip_prefix("https://"))
+    {
         Some(r) => r,
         None => return false,
     };
@@ -86,9 +89,8 @@ pub fn client_builder(proxy: &EffectiveProxy) -> anyhow::Result<reqwest::ClientB
         EffectiveProxy::Auto => b,
         EffectiveProxy::Direct => b.no_proxy(),
         EffectiveProxy::Manual(url) => {
-            let p = reqwest::Proxy::all(url).map_err(|e| {
-                anyhow::anyhow!("代理地址无法解析({}):{e}", mask_proxy_url(url))
-            })?;
+            let p = reqwest::Proxy::all(url)
+                .map_err(|e| anyhow::anyhow!("代理地址无法解析({}):{e}", mask_proxy_url(url)))?;
             b.proxy(p.no_proxy(reqwest::NoProxy::from_env()))
         }
     };

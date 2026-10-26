@@ -20,8 +20,46 @@ pub async fn check_notice(proxy: &EffectiveProxy) -> Option<String> {
     ))
 }
 
+/// 按 tag 前缀的静默探测(GUI 用 `gui-v`)
+pub async fn check_notice_for(
+    proxy: &EffectiveProxy,
+    current: &str,
+    tag_prefix: &str,
+) -> Option<String> {
+    let client = znaide_core::update::http_client(proxy).ok()?;
+    let (src, latest) = znaide_core::update::probe_latest_prefixed(&client, tag_prefix)
+        .await
+        .ok()?;
+    if !znaide_core::update::version_gt(&latest, current) {
+        return None;
+    }
+    Some(format!(
+        "发现新版本 V{latest}(来源 {})\n当前 V{current}:打开设置 → 关于与更新 升级。",
+        src.label()
+    ))
+}
+
 /// 检查并安装最新版,返回给用户的一句话(下载可能要一阵,调用方放后台任务里跑)。
 pub async fn install(proxy: &EffectiveProxy) -> String {
+    install_for("znaide", proxy).await
+}
+
+/// 指定资产前缀 + tag 前缀 + 当前版本的安装(GUI)
+pub async fn install_for_version(
+    asset_prefix: &str,
+    tag_prefix: &str,
+    current: &str,
+    proxy: &EffectiveProxy,
+) -> String {
+    znaide_core::update::perform_update_prefixed(asset_prefix, tag_prefix, current, proxy)
+        .await
+        .describe(current)
+}
+
+/// 指定资产前缀的安装(GUI 用 `znaide-gui`,别把 TUI 二进制换进来)。
+pub async fn install_for(prefix: &str, proxy: &EffectiveProxy) -> String {
     let cur = znaide_core::update::current_version();
-    znaide_core::update::perform_update(proxy).await.describe(&cur)
+    znaide_core::update::perform_update_for(prefix, proxy)
+        .await
+        .describe(&cur)
 }

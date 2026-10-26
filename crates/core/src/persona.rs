@@ -61,8 +61,7 @@ pub fn ensure_builtin_files() {
         }
         // 旧版注释头残留:正文仍是内置原样 → 清掉说明,只留正文
         if let Ok(cur) = std::fs::read_to_string(&path) {
-            if cur.trim_start().starts_with("# znaide 内置人格")
-                && strip_comments(&cur) == *text
+            if cur.trim_start().starts_with("# znaide 内置人格") && strip_comments(&cur) == *text
             {
                 let _ = std::fs::write(&path, format!("{text}\n"));
             }
