@@ -93,8 +93,8 @@ impl UpdateSource {
         let arr = arr
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("发布列表不是数组"))?;
-        match first_prefixed_tag(arr, tag_prefix) {
-            Some(tag) => parse_version_from_tag(tag),
+        match best_prefixed_version(arr, tag_prefix) {
+            Some(v) => Ok(v),
             None => anyhow::bail!("没有 {tag_prefix}* 的发布"),
         }
     }
@@ -120,11 +120,29 @@ impl UpdateSource {
     }
 }
 
-/// 发布列表(按建仓时间倒序)里第一条 tag 以 `prefix` 开头的。
-fn first_prefixed_tag<'a>(arr: &'a [serde_json::Value], prefix: &str) -> Option<&'a str> {
-    arr.iter()
-        .filter_map(|rel| rel.get("tag_name").and_then(|t| t.as_str()))
-        .find(|tag| tag.starts_with(prefix))
+/// 发布列表里 tag 以 `prefix` 开头的**最大版本**。
+///
+/// 不能取"第一条匹配":两个源的列表顺序不一样 —— GitHub 是新建在前,Gitee 是
+/// **旧的在前**(实测 created_at 升序),取第一条会让 Gitee 永远报最老的版本,
+/// 更新提示直接失效。按版本号取最大,与顺序无关。
+fn best_prefixed_version(arr: &[serde_json::Value], prefix: &str) -> Option<String> {
+    let mut best: Option<String> = None;
+    for rel in arr {
+        let Some(tag) = rel.get("tag_name").and_then(|t| t.as_str()) else {
+            continue;
+        };
+        // 先去掉产品线前缀(gui-v / v),剩下的才是版本号
+        let Some(rest) = tag.strip_prefix(prefix) else {
+            continue;
+        };
+        let Ok(v) = parse_version_from_tag(rest) else {
+            continue;
+        };
+        if best.as_deref().map_or(true, |b| version_gt(&v, b)) {
+            best = Some(v);
+        }
+    }
+    best
 }
 
 /// 从 tag 段(v1.2.3 / 1.2.3)解析出版本号
@@ -566,15 +584,30 @@ mod tests {
     }
 
     #[test]
-    fn prefixed_tag_skips_the_other_product_line() {
-        // 桌面版比 TUI 新:按 "v" 过滤必须跳过 gui-v0.0.1
-        let arr: Vec<serde_json::Value> = ["gui-v0.0.1", "v1.1.0", "v1.0.9"]
+    fn prefixed_tag_picks_max_regardless_of_order() {
+        // 桌面版比 TUI 新:按 "v" 过滤必须跳过 gui-v0.0.1;
+        // Gitee 的列表是升序(旧在前),所以不能取第一条匹配,要按版本取最大
+        let desc: Vec<serde_json::Value> = ["gui-v0.0.1", "v1.1.0", "v1.0.9"]
             .iter()
             .map(|t| serde_json::json!({"tag_name": t}))
             .collect();
-        assert_eq!(first_prefixed_tag(&arr, "v"), Some("v1.1.0"));
-        assert_eq!(first_prefixed_tag(&arr, "gui-v"), Some("gui-v0.0.1"));
-        assert_eq!(first_prefixed_tag(&arr, "gui-"), Some("gui-v0.0.1"));
+        let asc: Vec<serde_json::Value> = ["v1.0.9", "v1.1.0", "gui-v0.0.1"]
+            .iter()
+            .map(|t| serde_json::json!({"tag_name": t}))
+            .collect();
+        for arr in [&desc, &asc] {
+            assert_eq!(best_prefixed_version(arr, "v").as_deref(), Some("1.1.0"));
+            assert_eq!(
+                best_prefixed_version(arr, "gui-v").as_deref(),
+                Some("0.0.1")
+            );
+        }
+        // 版本号要按数字比,不是字典序(1.0.10 > 1.0.9)
+        let many: Vec<serde_json::Value> = ["v1.0.9", "v1.0.10"]
+            .iter()
+            .map(|t| serde_json::json!({"tag_name": t}))
+            .collect();
+        assert_eq!(best_prefixed_version(&many, "v").as_deref(), Some("1.0.10"));
     }
 
     #[test]
