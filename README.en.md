@@ -4,7 +4,7 @@
 
 Tell it what to do in plain language and it gets it done — edit files, run commands, browse the web, organize folders, write documents. Coding is just one use case. Written from scratch in Rust with a self-built agent loop: **one static binary, zero Node/zero runtime dependencies, Chinese-first UI, works with local models and cloud APIs alike**.
 
-> **Source & binaries**: This tool is open source under **AGPL-3.0** (repo: https://github.com/twowb/znaide). Free for personal use, learning, and open-source derivatives; **commercial or closed-source integration requires a commercial license** — see `COMMERCIAL.md`. Don't want to build? Grab a binary from [GitHub Releases](https://github.com/twowb/znaide/releases): pick `znaide-<platform>-v<version>` for Linux/macOS/Windows/Android-Termux; `--version` shows the build.
+> **Source & binaries**: This tool is open source under **AGPL-3.0** (repo: https://github.com/twowb/znaide). Free for personal use, learning, and open-source derivatives; **commercial or closed-source integration requires a commercial license** — see `COMMERCIAL.md`. Don't want to build? Grab a binary from [GitHub Releases](https://github.com/twowb/znaide/releases): pick `znaide-<platform>-v<version>` for Linux/macOS/Windows/Android-Termux; `--version` shows the build. Desktop-build assets (Xiufan AI Assistant) are listed under “Desktop client” below.
 
 ```
   znaide                                  # interactive mode (first run opens the setup wizard)
@@ -50,6 +50,31 @@ make build-all           # all six platforms (skips missing toolchains; android 
 All builds are `--release` minimal (opt-level=z + LTO + stripped symbols), output in `dist/`. Cross-build details: [Makefile](./Makefile).
 
 > First cross-compile may ask you to `rustup target add <triple>`; Linux musl static needs musl cross-gcc (Ubuntu: `sudo apt install musl-tools`); macOS uses **zig universal cross-compilation** (no osxcross/SDK), needing the `zig-cc-*-darwin` wrappers in `~/.cargo/bin` plus `~/.cargo/darwin-stubs/libiconv.tbd` (see Makefile and `.cargo/config.toml`).
+
+## Desktop client (Xiufan AI Assistant)
+
+Besides the terminal there is a desktop build: **Xiufan AI Assistant V0.0.1** (on the znaide engine V1.1.0). It shares the same `~/.znaide` — config, session history, memory, skills and personas are common to both, so a conversation started in the terminal can be resumed in the window. The window is a native system WebView (GTK/WebKitGTK, WebView2, WKWebView), not a terminal emulator.
+
+Grab it from the **`gui-v*`** tags on [Releases](https://github.com/twowb/znaide/releases); assets are named `xiufan-<platform>`:
+
+| Platform | Asset | Notes |
+|---|---|---|
+| Windows x64 | `xiufan-windows-x64-v<ver>-setup.exe` | **Installer**: installs to `%LOCALAPPDATA%\Programs\修凡AI全能助手` with **no admin rights and no UAC prompt**; start-menu/desktop shortcuts plus an uninstaller listed under "Apps & features". Uninstalling **keeps** `%USERPROFILE%\.znaide` (sessions, config, memory) by default |
+| Windows x64 | `xiufan-windows-x64-v<ver>.exe` | **Portable**: single file, just double-click, nothing written to the registry (also what the in-app updater downloads) |
+| Linux x64 | `...AppImage` / `...tar.gz` | needs `webkit2gtk-4.1`; `chmod +x` the AppImage (use `--appimage-extract-and-run` without FUSE) |
+| macOS x64 / arm64 | `...app.zip` / bare binary | unsigned; first launch needs right-click → Open |
+
+Windows needs the **WebView2 runtime** (bundled with Win10/11; the installer offers the official download page if it is missing). The desktop build has its **own version number and update channel** (`gui-v*` / `xiufan-*`), so "Check for updates" never swaps it for the terminal build.
+
+Build it yourself:
+
+```bash
+make package-gui                    # Linux: binary + tar.gz + AppImage
+make package-gui-windows            # Windows: single-file exe (MSVC static CRT, needs cargo-xwin)
+make package-gui-windows-installer  # Windows: setup.exe (NSIS, needs sudo apt install nsis)
+make package-gui-macos              # macOS: .app (must run on macOS)
+make package-gui-all                # Linux + Windows (incl. installer); macOS when on macOS
+```
 
 ## First-run setup wizard
 
@@ -265,9 +290,11 @@ On startup znaide connects and merges MCP tools into the toolbox as `mcp__<serve
 znaide/
 ├─ crates/
 │  ├─ core/     engine: agent loop, LLM client (OpenAI-compatible), tools, permissions, skills, memory, sessions, undo, MCP, config (pure logic, no terminal deps)
-│  ├─ tui/      interface (ratatui): conversation, input, wizard, confirm, tool cards, scrollbar & mouse
+│  ├─ host/     host layer: sessions + slash commands + update/policy, shared by TUI and GUI (no UI)
+│  ├─ tui/      terminal UI (ratatui): conversation, input, wizard, confirm, tool cards, scrollbar & mouse
+│  ├─ gui/      desktop client (Xiufan AI Assistant): local axum server + embedded page; GTK/WebKitGTK on Linux, wry on Windows/macOS
 │  └─ cli/      entry: interactive / -p headless / args
-├─ docs/        user manual (使用说明.md)
+├─ docs/        design notes (private, not committed)
 └─ Makefile     cross-platform builds
 ```
 

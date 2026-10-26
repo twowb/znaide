@@ -6,7 +6,7 @@
 
 用自然语言下达指令,znaide 自主完成:改文件、跑命令、查资料、整理数据、写文档……编程只是应用场景之一。它用 Rust 从零实现、自带 agent 循环:**单个静态二进制、零 Node 依赖、中文交互、本地模型与云 API 通吃**。
 
-> **源码与获取**:本工具**以 AGPL-3.0 开源**(仓库:[github.com/twowb/znaide](https://github.com/twowb/znaide)),自用/学习/开源衍生免费;**商用或闭源集成需商业授权**,见 `COMMERCIAL.md`。不想编译就直接下二进制:[GitHub Releases](https://github.com/twowb/znaide/releases) 按平台取 `znaide-<平台>-v<版本>`(Linux/macOS/Windows/Android-Termux),`--version` 可查看版本。
+> **源码与获取**:本工具**以 AGPL-3.0 开源**(仓库:[github.com/twowb/znaide](https://github.com/twowb/znaide)),自用/学习/开源衍生免费;**商用或闭源集成需商业授权**,见 `COMMERCIAL.md`。不想编译就直接下二进制:[GitHub Releases](https://github.com/twowb/znaide/releases) 按平台取 `znaide-<平台>-v<版本>`(Linux/macOS/Windows/Android-Termux),`--version` 可查看版本;桌面版(修凡AI全能助手)的资产见下文“桌面客户端”。
 
 ```
   znaide                              # 交互模式(推荐,首次运行会引导配置)
@@ -52,6 +52,31 @@ make build-all          # 六平台一次构建(缺工具链自动跳过;android
 所有构建均为 `--release` 最小化产物(opt-level=z + LTO + 剥符号),产物在 `dist/` 下。跨平台构建细节见 [Makefile](./Makefile)。
 
 > 首次交叉编译可能提示 `rustup target add <triple>`(联网下载);Linux musl 静态需要 musl 交叉 gcc(Ubuntu:`sudo apt install musl-tools`);macOS 走 **zig 万能交叉编译**(无需 osxcross/SDK),需要 `~/.cargo/bin` 下的 `zig-cc-*-darwin` wrapper 与 `~/.cargo/darwin-stubs/libiconv.tbd`(说明见 Makefile 与 `.cargo/config.toml`)。
+
+## 桌面客户端(修凡AI全能助手)
+
+终端之外还有一个桌面版:**修凡AI全能助手 V0.0.1**(基于 znaide 引擎 V1.1.0)。它和 TUI 共用同一份 `~/.znaide` —— 配置、会话历史、记忆、技能、人格两边通用,同一段对话可以在终端和窗口里接着聊。窗口是系统原生 WebView(GTK/WebKitGTK、WebView2、WKWebView),不是终端模拟器。
+
+从 [Releases](https://github.com/twowb/znaide/releases) 里 **`gui-v*`** 标签下载,资产名 `xiufan-<平台>`:
+
+| 平台 | 取哪个 | 说明 |
+|---|---|---|
+| Windows x64 | `xiufan-windows-x64-v<版本>-setup.exe` | **安装版**:装到 `%LOCALAPPDATA%\Programs\修凡AI全能助手`,不需要管理员权限、不弹 UAC;带开始菜单/桌面快捷方式和卸载程序,可在"设置 → 应用"里卸载。卸载默认**保留** `%USERPROFILE%\.znaide`(会话、配置、记忆),重装即接上 |
+| Windows x64 | `xiufan-windows-x64-v<版本>.exe` | **绿色版**:单文件,双击即用,不写注册表(应用内自动更新用的也是这一份) |
+| Linux x64 | `...AppImage` / `...tar.gz` | 系统需有 `webkit2gtk-4.1`;AppImage `chmod +x` 后直接运行(无 FUSE 时加 `--appimage-extract-and-run`) |
+| macOS x64 / arm64 | `...app.zip` / 单文件 | 未签名,首次打开需右键 → 打开 |
+
+Windows 需要 **WebView2 运行时**(Win10/11 一般自带;安装包检测不到会提示去官方页面装)。桌面版有**独立的版本号与更新通道**(`gui-v*` / `xiufan-*`),应用内"检查更新"不会把它换成终端版。
+
+自己打包:
+
+```bash
+make package-gui                    # Linux:二进制 + tar.gz + AppImage
+make package-gui-windows            # Windows:单文件 exe(MSVC 静态 CRT,需 cargo-xwin)
+make package-gui-windows-installer  # Windows:安装包 setup.exe(NSIS,需 sudo apt install nsis)
+make package-gui-macos              # macOS:.app(必须在 macOS 上跑)
+make package-gui-all                # Linux + Windows(含安装包),macOS 若在 macOS 上
+```
 
 ## 首次运行配置向导
 
@@ -299,10 +324,12 @@ API Key 也可以完全不进配置文件,用环境变量提供:`DASHSCOPE_API_K
 znaide/
 ├─ crates/
 │  ├─ core/     引擎:agent 循环、LLM 客户端(OpenAI 兼容)、工具、权限、技能(skills)、记忆、会话、undo、MCP、配置(纯逻辑,零终端依赖)
-│  ├─ tui/      交互界面(ratatui):对话区、输入、配置向导、确认框、工具卡片、滚动条与鼠标
+│  ├─ host/     宿主层:会话 + 斜杠命令 + 更新/策略,给 TUI 与 GUI 共用(不碰界面)
+│  ├─ tui/      终端界面(ratatui):对话区、输入、配置向导、确认框、工具卡片、滚动条与鼠标
+│  ├─ gui/      桌面客户端(修凡AI全能助手):本地 axum 服务 + 内嵌页面;Linux 走 GTK/WebKitGTK,Windows/macOS 走 wry
 │  └─ cli/      入口:交互 / -p 无头 / 参数解析
-├─ docs/         方案与设计文档(plan-v1.md、plan-skills.md)
-└─ Makefile      跨平台构建
+├─ docs/        方案与设计文档(私有,不入库)
+└─ Makefile     跨平台构建
 ```
 
 ## 开发
