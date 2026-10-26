@@ -8,11 +8,18 @@
 #   make build-macos-arm64 编译 macOS aarch64(zig 交叉编译)
 #   make build-android    编译 Android aarch64(NDK bionic 动态,Termux 用)
 #   make build-all        全部平台(缺工具链自动跳过)
+#   make build-gui        GUI 本机 release(glibc + WebKitGTK)
+#   make package-gui      GUI Linux 打包(二进制 + tar.gz + 可选 AppImage)
+#   make package-gui-windows-installer  GUI Windows 安装包(NSIS setup.exe)
+#   make dist             查看 dist/ 产物
 #   make dist             查看 dist/ 产物
 #   make clean            清理 target/ 与 dist/
 #
 # 所有构建均为 --release(体积最小化配置见 Cargo.toml [profile.release]),
 # Linux/Windows 为全静态,产物在 dist/。
+
+SHELL    := /bin/bash
+.ONESHELL:
 
 APP      := znaide
 PROFILE  := release
@@ -70,7 +77,7 @@ CC_WIN_X64      := x86_64-w64-mingw32-gcc
 CC_MAC_X64      := zig-cc-x86_64-darwin
 CC_MAC_ARM64    := zig-cc-aarch64-darwin
 
-.PHONY: all build build-linux build-linux-arm64 build-windows build-macos build-macos-arm64 build-android build-all dist clean help
+.PHONY: all build build-linux build-linux-arm64 build-windows build-macos build-macos-arm64 build-android build-all build-gui build-gui-windows package-gui package-gui-linux package-gui-windows package-gui-windows-installer package-gui-windows-gnu package-gui-macos package-gui-all dist clean help
 
 default: build
 
@@ -84,6 +91,13 @@ help:
 	@echo "  make build-macos-arm64    macOS aarch64 (zig 交叉编译)"
 	@echo "  make build-android        Android aarch64 (NDK bionic 动态;NDK_ROOT 可覆盖)"
 	@echo "  make build-all            全部平台(缺工具链自动跳过)"
+	@echo "  make build-gui            GUI 本机 release(GTK + WebKitGTK)"
+	@echo "  make package-gui          GUI Linux 打包(二进制 + tar.gz + 可选 AppImage)"
+	@echo "  make package-gui-windows  GUI Windows x64(MSVC 单文件 exe,需 cargo-xwin)"
+	@echo "  make package-gui-windows-installer  GUI Windows 安装包 setup.exe(NSIS,需 sudo apt install nsis)"
+	@echo "  make package-gui-windows-gnu  兜底:交叉编 GNU exe + WebView2Loader.dll"
+	@echo "  make package-gui-macos    GUI macOS .app(必须在 macOS 上运行)"
+	@echo "  make package-gui-all      Linux + Windows(+ 安装包,+ macOS 若在 macOS 上)"
 	@echo "  make dist                查看产物"
 	@echo "  make clean               清理构建产物"
 
@@ -212,3 +226,126 @@ clean:
 	@cargo clean
 	@rm -rf $(DIST)
 	@echo "已清理 target/ 与 $(DIST)/"
+
+# ---- GUI(桌面客户端;Linux 档是 glibc + 系统 WebKitGTK,不能 musl 静态)----
+build-gui:
+	cargo build -p znaide-gui --release
+
+# 打包逻辑直接写在这里:普通二进制(自动更新用) + tar.gz + 可选 AppImage。
+# 产物名 xiufan-linux-x64-v<版本> 与 update.rs 的资产命名一致。
+package-gui-linux:
+	set -euo pipefail
+	VERSION="$$(grep -m1 '^version' crates/gui/Cargo.toml | sed 's/.*"\([^"]*\)".*/\1/')"
+	DIST="$(DIST)"
+	PKG="$(CURDIR)/crates/gui/packaging"
+	ASSET="$$DIST/xiufan-linux-x64-v$$VERSION"
+	PROXY="$${PROXY:-http://127.0.0.1:7897}"
+	cargo build -p znaide-gui --release
+	mkdir -p "$$DIST"
+	install -m755 target/release/znaide-gui "$$ASSET"
+	APPDIR="$$DIST/xiufan.AppDir"
+	rm -rf "$$APPDIR"
+	mkdir -p "$$APPDIR/usr/bin" "$$APPDIR/usr/share/applications" "$$APPDIR/usr/share/icons/hicolor/256x256/apps"
+	install -m755 target/release/znaide-gui "$$APPDIR/usr/bin/xiufan"
+	install -m644 "$$PKG/xiufan.desktop" "$$APPDIR/xiufan.desktop"
+	install -m644 "$$PKG/xiufan.desktop" "$$APPDIR/usr/share/applications/xiufan.desktop"
+	install -m644 "$$PKG/icon-256.png" "$$APPDIR/xiufan.png"
+	install -m644 "$$PKG/icon-256.png" "$$APPDIR/usr/share/icons/hicolor/256x256/apps/xiufan.png"
+	install -m644 "$$PKG/xiufan.svg" "$$APPDIR/xiufan.svg"
+	{ echo '#!/bin/sh'; echo 'HERE=$$(dirname "$$(readlink -f "$$0")")'; echo 'exec "$$HERE/usr/bin/xiufan" "$$@"'; } > "$$APPDIR/AppRun"
+	chmod 755 "$$APPDIR/AppRun"
+	TOOL="$$(command -v appimagetool || true)"
+	if [ -z "$$TOOL" ]; then
+	  TOOL=/tmp/appimagetool-x86_64.AppImage
+	  if [ ! -x "$$TOOL" ]; then
+	    if curl -fsSL -x "$$PROXY" -o "$$TOOL" "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"; then chmod +x "$$TOOL"; else TOOL=""; fi
+	  fi
+	fi
+	if [ -n "$$TOOL" ] && [ -x "$$TOOL" ]; then
+	  rm -f "$$DIST/xiufan-linux-x64-v$$VERSION.AppImage"
+	  ARCH=x86_64 "$$TOOL" --appimage-extract-and-run "$$APPDIR" "$$DIST/xiufan-linux-x64-v$$VERSION.AppImage" || echo "⚠ AppImage 生成失败(保留 tar.gz)"
+	fi
+	tar -C "$$DIST" -czf "$$DIST/xiufan-linux-x64-v$$VERSION.tar.gz" "xiufan-linux-x64-v$$VERSION" -C "$$PKG" xiufan.desktop icon-256.png icon-512.png
+	"$$ASSET" --version
+	sha256sum "$$ASSET" "$$DIST/xiufan-linux-x64-v$$VERSION.tar.gz" | tee "$$DIST/SHA256SUMS-gui-linux.txt"
+	if [ -f "$$DIST/xiufan-linux-x64-v$$VERSION.AppImage" ]; then sha256sum "$$DIST/xiufan-linux-x64-v$$VERSION.AppImage" | tee -a "$$DIST/SHA256SUMS-gui-linux.txt"; fi
+
+package-gui: package-gui-linux
+
+build-gui-windows:
+	@command -v cargo-xwin >/dev/null 2>&1 || { echo "需要 cargo-xwin:cargo install cargo-xwin"; exit 1; }
+	cargo xwin build -p znaide-gui --release --target x86_64-pc-windows-msvc
+
+# Windows:MSVC 目标静态链接 WebView2Loader → 单文件 exe(带图标),不需要 DLL。
+package-gui-windows:
+	set -euo pipefail
+	VERSION="$$(grep -m1 '^version' crates/gui/Cargo.toml | sed 's/.*"\([^"]*\)".*/\1/')"
+	DIST="$(DIST)"
+	command -v cargo-xwin >/dev/null 2>&1 || { echo "需要 cargo-xwin:cargo install cargo-xwin"; exit 1; }
+	cargo xwin build -p znaide-gui --release --target x86_64-pc-windows-msvc
+	mkdir -p "$$DIST"
+	ASSET="$$DIST/xiufan-windows-x64-v$$VERSION.exe"
+	install -m755 target/x86_64-pc-windows-msvc/release/znaide-gui.exe "$$ASSET"
+	rm -f "$$DIST/WebView2Loader.dll" "$$DIST/xiufan-windows-x64-v$$VERSION.zip"
+	"$$ASSET" --version >/dev/null 2>&1 || echo "⚠ 交叉编的 exe 不能在 Linux 上直接运行,跳过自检"
+	sha256sum "$$ASSET" | tee "$$DIST/SHA256SUMS-gui-windows.txt"
+
+# Windows 安装包:NSIS 纯脚本,Linux 上直接出 setup.exe(需 sudo apt install nsis)。
+# 装到 %LOCALAPPDATA%\Programs(免管理员,应用内自更新才写得进去);卸载保留 .znaide 数据。
+package-gui-windows-installer: package-gui-windows
+	set -euo pipefail
+	command -v makensis >/dev/null 2>&1 || { echo "需要 NSIS:sudo apt install nsis"; exit 1; }
+	VERSION="$$(grep -m1 '^version' crates/gui/Cargo.toml | sed 's/.*"\([^"]*\)".*/\1/')"
+	DIST="$(CURDIR)/$(DIST)"
+	PKG="$(CURDIR)/crates/gui/packaging"
+	SETUP="$$DIST/xiufan-windows-x64-v$$VERSION-setup.exe"
+	makensis -INPUTCHARSET UTF8 -V2 \
+	  -DOUTFILE="$$SETUP" \
+	  -DVERSION="$$VERSION" \
+	  -DAPP_EXE="$$DIST/xiufan-windows-x64-v$$VERSION.exe" \
+	  -DICON="$$PKG/znaide-gui.ico" \
+	  -DLICENSE="$(CURDIR)/LICENSE" \
+	  "$$PKG/installer.nsi"
+	sha256sum "$$SETUP" | sed "s|$(CURDIR)/||" | tee -a "$(DIST)/SHA256SUMS-gui-windows.txt"
+
+# GNU 兜底(没有 cargo-xwin 时):exe 需要同目录 WebView2Loader.dll,打包成 zip。
+package-gui-windows-gnu:
+	set -euo pipefail
+	VERSION="$$(grep -m1 '^version' crates/gui/Cargo.toml | sed 's/.*"\([^"]*\)".*/\1/')"
+	DIST="$(DIST)"
+	cargo build -p znaide-gui --release --target x86_64-pc-windows-gnu
+	mkdir -p "$$DIST"
+	ASSET="$$DIST/xiufan-windows-x64-v$$VERSION.exe"
+	install -m755 target/x86_64-pc-windows-gnu/release/znaide-gui.exe "$$ASSET"
+	CARGO_HOME_DIR="$${CARGO_HOME:-$$HOME/.cargo}"
+	DLL="$$(find "$$CARGO_HOME_DIR/registry/src" -path "*/webview2-com-sys-*/x64/WebView2Loader.dll" 2>/dev/null | head -1)"
+	[ -n "$$DLL" ] && install -m644 "$$DLL" "$$DIST/WebView2Loader.dll"
+	sha256sum "$$ASSET" "$$DIST/WebView2Loader.dll" 2>/dev/null | tee "$$DIST/SHA256SUMS-gui-windows.txt"
+
+# macOS:必须在 macOS 上打包(.app 需要 SDK);原生架构。
+package-gui-macos:
+	set -euo pipefail
+	[ "$$(uname -s)" = "Darwin" ] || { echo "macOS 档必须在 macOS 上打包(需要 WKWebView SDK)"; exit 1; }
+	VERSION="$$(grep -m1 '^version' crates/gui/Cargo.toml | sed 's/.*"\([^"]*\)".*/\1/')"
+	DIST="$(DIST)"
+	case "$$(uname -m)" in arm64) TRIPLE=aarch64-apple-darwin; LABEL=arm64 ;; *) TRIPLE=x86_64-apple-darwin; LABEL=x64 ;; esac
+	cargo build -p znaide-gui --release --target "$$TRIPLE"
+	mkdir -p "$$DIST"
+	ASSET="$$DIST/xiufan-macos-$$LABEL-v$$VERSION"
+	install -m755 "target/$$TRIPLE/release/znaide-gui" "$$ASSET"
+	APP="$$DIST/xiufan.app"
+	rm -rf "$$APP"
+	mkdir -p "$$APP/Contents/MacOS" "$$APP/Contents/Resources"
+	install -m755 "target/$$TRIPLE/release/znaide-gui" "$$APP/Contents/MacOS/xiufan"
+	printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' '<plist version="1.0"><dict>' '  <key>CFBundleName</key><string>修凡AI全能助手</string>' '  <key>CFBundleIdentifier</key><string>com.znaide.gui</string>' "  <key>CFBundleShortVersionString</key><string>$$VERSION</string>" '  <key>CFBundleExecutable</key><string>xiufan</string>' '  <key>CFBundleDisplayName</key><string>修凡AI全能助手</string>' '  <key>CFBundleIconFile</key><string>icon.icns</string>' '  <key>CFBundlePackageType</key><string>APPL</string>' '  <key>NSHighResolutionCapable</key><true/>' '  <key>LSMinimumSystemVersion</key><string>11.0</string>' '</dict></plist>' > "$$APP/Contents/Info.plist"
+	if command -v iconutil >/dev/null 2>&1; then
+	  ICONSET="$$DIST/icon.iconset"; rm -rf "$$ICONSET"; mkdir -p "$$ICONSET"
+	  for sz in 16 32 64 128 256 512; do sips -z $$sz $$sz "$(CURDIR)/crates/gui/packaging/icon-512.png" --out "$$ICONSET/icon_$${sz}x$${sz}.png" >/dev/null; done
+	  iconutil -c icns "$$ICONSET" -o "$$APP/Contents/Resources/icon.icns" || true
+	  rm -rf "$$ICONSET"
+	fi
+	( cd "$$DIST" && zip -qry "xiufan-macos-$$LABEL-v$$VERSION.app.zip" "xiufan.app" )
+	sha256sum "$$ASSET" "$$DIST/xiufan-macos-$$LABEL-v$$VERSION.app.zip" | tee "$$DIST/SHA256SUMS-gui-macos-$$LABEL.txt"
+
+package-gui-all: package-gui-linux package-gui-windows package-gui-windows-installer
+	@if [ "$$(uname -s)" = "Darwin" ]; then $(MAKE) package-gui-macos; else echo "跳过 macOS(需在 macOS 上打包 .app)"; fi

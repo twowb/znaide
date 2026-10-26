@@ -18,6 +18,10 @@ rustflags = ["-C", "relocation-model=static"]
 linker = "x86_64-w64-mingw32-gcc"
 rustflags = ["-C", "target-feature=+crt-static"]
 
+# Windows MSVC:GUI 单文件(静态 CRT,不依赖 VCRUNTIME140.dll)
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
 # macOS:用 zig 交叉编译(无需 osxcross/SDK,zig 内置 Mach-O 链接与 darwin 存根)
 # linker 指向 wrapper(zig-cc-*-darwin,位于 ~/.cargo/bin):
 #   wrapper 以 `zig cc -target <triple>-macos-none` 调用,并丢弃 cc crate 附加的 clang 风格 --target

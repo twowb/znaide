@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=修凡AI全能助手
+Name[zh_CN]=修凡AI全能助手
+Comment=修凡AI全能助手（基于 znaide 引擎）
+Comment[zh_CN]=修凡AI全能助手（基于 znaide 引擎）
+Exec=xiufan
+Icon=xiufan
+Terminal=false
+Categories=Development;Utility;
+StartupWMClass=xiufan

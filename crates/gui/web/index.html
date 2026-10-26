@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>修凡AI全能助手</title>
+  <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/app.css">
+  <link rel="stylesheet" href="/assets/vendor/hljs-github-dark.min.css" id="hljs-dark">
+  <link rel="stylesheet" href="/assets/vendor/hljs-github.min.css" id="hljs-light" disabled>
+</head>
+<body>
+  <div class="app" id="app">
+    <header class="topbar">
+      <button class="icon" id="btn-sidebar" title="会话列表">☰</button>
+      <div class="brand"><span class="brand-dot"></span>修凡AI</div>
+      <div class="chips">
+        <button class="chip" id="chip-mode" title="权限档：决定写文件/执行命令前是否询问">询问</button>
+        <button class="chip mono" id="chip-model" title="当前模型/服务商：点开切换">—</button>
+        <button class="chip" id="chip-persona" title="全局人格：点开切换">人格：无</button>
+        <button class="chip mono dim" id="chip-cwd" title="工作目录">📁 —</button>
+        <button class="chip mono dim" id="chip-ctx" title="上下文占用：要等第一轮回复的 usage 才测得到">ctx ?</button>
+        <button class="icon sm" id="btn-compact" title="压缩上下文（旧对话收敛为摘要）">⇲</button>
+      </div>
+      <div class="spacer"></div>
+      <button class="chip warn" id="chip-update" title="发现新版本：点开设置 › 关于与更新" hidden>有新版本</button>
+      <span class="chip mono dim" id="chip-session" title="会话 ID（可用于 --resume）" hidden></span>
+      <button class="icon" id="btn-settings" title="设置">⚙</button>
+      <button class="icon" id="btn-more" title="更多（回滚/清空/帮助/退出）">⋯</button>
+      <button class="icon" id="btn-theme" title="切换深色/浅色">◐</button>
+    </header>
+
+    <aside class="sidebar" id="sidebar">
+      <div class="side-head">
+        <button class="btn primary side-new" id="btn-new-session">＋ 新建会话</button>
+        <input class="sess-search" id="sess-search" type="search" placeholder="搜索会话…" autocomplete="off">
+      </div>
+      <div class="sess-list" id="sess-list"></div>
+      <div class="side-foot">点击恢复 · ✎ 备注 · 🗑 删除</div>
+    </aside>
+
+    <main class="stream" id="stream" aria-live="polite">
+      <div class="empty" id="empty">
+        <h1>修凡AI全能助手</h1>
+        <p>把任务说清楚，它自己动手：改文件、跑命令、查资料。</p>
+        <p class="dim">Enter 发送 · Shift+Enter 换行 · Esc 中断</p>
+        <p class="dim">顶栏可直接切权限/模型/人格；斜杠命令仍可用（/help）</p>
+      </div>
+    </main>
+
+    <footer class="composer">
+      <div class="queue" id="queue" hidden>
+        <span class="queue-label">排队</span>
+        <div class="queue-items" id="queue-items"></div>
+      </div>
+      <div class="palette" id="palette" hidden></div>
+      <div class="box">
+        <textarea id="input" rows="1" placeholder="说点什么…（Enter 发送，Shift+Enter 换行）"></textarea>
+        <div class="actions">
+          <button class="btn ghost" id="btn-stop" hidden>中断</button>
+          <button class="btn primary" id="btn-send">发送</button>
+        </div>
+      </div>
+      <div class="foot">
+        <span class="conn" id="conn">连接中…</span>
+        <span class="dim mono" id="foot-round"></span>
+        <span class="dim mono" id="foot-tokens"></span>
+      </div>
+    </footer>
+  </div>
+
+  <section class="settings" id="settings" hidden>
+    <aside class="set-nav">
+      <div class="set-nav-title">设置</div>
+      <button class="set-tab active" data-sec="model">服务商与模型</button>
+      <button class="set-tab" data-sec="network">网络与请求</button>
+      <button class="set-tab" data-sec="persona">人格</button>
+      <button class="set-tab" data-sec="skills">技能</button>
+      <button class="set-tab" data-sec="memory">记忆</button>
+      <button class="set-tab" data-sec="mcp">MCP</button>
+      <button class="set-tab" data-sec="about">关于与更新</button>
+      <div class="spacer"></div>
+      <button class="set-tab back" id="set-close">← 返回对话</button>
+    </aside>
+    <div class="set-body" id="set-body"></div>
+  </section>
+
+  <div class="modal" id="modal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <h2 id="modal-title"></h2>
+      <pre class="modal-body" id="modal-body"></pre>
+      <input class="modal-input" id="modal-input" hidden autocomplete="off">
+      <div class="modal-list" id="modal-list" hidden></div>
+      <p class="modal-warning" id="modal-warning" hidden></p>
+      <p class="modal-hint dim" id="modal-hint" hidden></p>
+      <div class="modal-actions" id="modal-actions"></div>
+    </div>
+  </div>
+
+  <script src="/assets/vendor/marked.min.js"></script>
+  <script src="/assets/vendor/purify.min.js"></script>
+  <script src="/assets/vendor/highlight.min.js"></script>
+  <script type="module" src="/assets/app.js"></script>
+</body>
+</html>

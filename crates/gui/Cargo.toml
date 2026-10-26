@@ -1,0 +1,35 @@
+[package]
+name = "znaide-gui"
+description = "znaide 桌面客户端:本地服务 + 内嵌页面(wry 原生窗口待接)"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["window"]
+# 原生窗口(系统 WebView);关掉 = 纯浏览器模式,便于无 GUI 依赖的最小构建
+window = ["dep:wry", "dep:tao"]
+
+[dependencies]
+znaide-core = { path = "../core" }
+znaide-host = { path = "../host" }
+tokio = { workspace = true, features = ["net", "signal"] }
+axum = { version = "0.7", features = ["ws"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+futures-util = { workspace = true }
+getrandom = "0.2"
+dirs = { workspace = true }
+fs2 = "0.4"
+wry = { version = "0.57", optional = true }
+tao = { version = "0.37", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+webkit2gtk = "2.0"
+
+[dev-dependencies]
+tokio-tungstenite = "0.24"
+reqwest = { workspace = true }
